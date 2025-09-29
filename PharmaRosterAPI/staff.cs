@@ -103,6 +103,7 @@ namespace PharmaRosterAPI
                 List<Table> tables = new List<Table>();
                 tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<StaffClass>());
                 tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<StaffAttributesClass>());
+                tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<StaffScheduleHistoryClass>());
 
                 returnData.Code = 200;
                 returnData.Data = tables;
@@ -994,12 +995,13 @@ namespace PharmaRosterAPI
         public static async Task<List<StaffClass>> GetAllStaffsAsync(bool staffAttributes = true)
         {
             // 撈取所有資料表
-            var (allStaffs, allAttrs, _, _) = await LoadAllTablesAsync();
+            var (allStaffs, allAttrs, _, _, allstaffScheduleHistory) = await LoadAllTablesAsync();
 
             // 關聯 Staff 與 StaffAttributes
             foreach (var staff in allStaffs)
             {
                 if(staffAttributes) staff.staffAttributes = allAttrs.FirstOrDefault(a => a.staff_guid == staff.GUID);
+                staff.scheduleHistories = allstaffScheduleHistory.Where(g => g.staff_guid == staff.GUID).ToList();
 
             }
 
@@ -1008,17 +1010,19 @@ namespace PharmaRosterAPI
         /// <summary>
         /// 核心方法：載入所有表，並回傳整合資料
         /// </summary>
-        private static async Task<(List<StaffClass> staffs, List<StaffAttributesClass> attrs, List<LeaveRequestClass> leaves, List<ShiftGroupMemberClass> groupMembers)> LoadAllTablesAsync()
+        private static async Task<(List<StaffClass> staffs, List<StaffAttributesClass> attrs, List<LeaveRequestClass> leaves, List<ShiftGroupMemberClass> groupMembers, List<StaffScheduleHistoryClass> staffScheduleHistory)> LoadAllTablesAsync()
         {
             var sql_staff = MethodClass.GetSQLControl<StaffClass>();
             var sql_staffAttr = MethodClass.GetSQLControl<StaffAttributesClass>();
             var sql_leaveRequest = MethodClass.GetSQLControl<LeaveRequestClass>();
             var sql_groupMember = MethodClass.GetSQLControl<ShiftGroupMemberClass>();
+            var sql_scheduleHistory = MethodClass.GetSQLControl<StaffScheduleHistoryClass>();
 
             var staffTask = sql_staff.WtrteCommandAndExecuteReaderAsync($"SELECT * FROM {sql_staff.Database}.{sql_staff.TableName}");
             var attrTask = sql_staffAttr.WtrteCommandAndExecuteReaderAsync($"SELECT * FROM {sql_staffAttr.Database}.{sql_staffAttr.TableName}");
             var leaveTask = sql_leaveRequest.WtrteCommandAndExecuteReaderAsync($"SELECT * FROM {sql_leaveRequest.Database}.{sql_leaveRequest.TableName}");
             var groupTask = sql_groupMember.WtrteCommandAndExecuteReaderAsync($"SELECT * FROM {sql_groupMember.Database}.{sql_groupMember.TableName}");
+            var scheduleHistoryTask = sql_scheduleHistory.WtrteCommandAndExecuteReaderAsync($"SELECT * FROM {sql_scheduleHistory.Database}.{sql_scheduleHistory.TableName} WHERE status = '正常'");
 
             await Task.WhenAll(staffTask, attrTask, leaveTask, groupTask);
 
@@ -1026,8 +1030,9 @@ namespace PharmaRosterAPI
             var allAttrs = (attrTask.Result).DataTableToRowList().SQLToClass<StaffAttributesClass>() ?? new List<StaffAttributesClass>();
             var allLeaves = (leaveTask.Result).DataTableToRowList().SQLToClass<LeaveRequestClass>() ?? new List<LeaveRequestClass>();
             var allGroupMembers = (groupTask.Result).DataTableToRowList().SQLToClass<ShiftGroupMemberClass>() ?? new List<ShiftGroupMemberClass>();
+            var allscheduleHistorys = (scheduleHistoryTask.Result).DataTableToRowList().SQLToClass<StaffScheduleHistoryClass>() ?? new List<StaffScheduleHistoryClass>();
 
-            return (allStaffs, allAttrs, allLeaves, allGroupMembers);
+            return (allStaffs, allAttrs, allLeaves, allGroupMembers, allscheduleHistorys);
         }
    
         /// <summary>
@@ -1037,7 +1042,7 @@ namespace PharmaRosterAPI
         {
             if (guids == null || guids.Count == 0) return new List<StaffClass>();
 
-            var (allStaffs, allAttrs, allLeaves, allGroupMembers) = await LoadAllTablesAsync();
+            var (allStaffs, allAttrs, allLeaves, allGroupMembers, allscheduleHistorys) = await LoadAllTablesAsync();
 
             var staffs = allStaffs.Where(s => guids.Contains(s.GUID)).ToList();
 
@@ -1046,6 +1051,7 @@ namespace PharmaRosterAPI
                 staff.staffAttributes = allAttrs.FirstOrDefault(a => a.staff_guid == staff.GUID);
                 staff.leaveRequests = allLeaves.Where(l => l.staff_guid == staff.GUID).ToList();
                 staff.shiftGroupMembers = allGroupMembers.Where(g => g.staff_guid == staff.GUID).ToList();
+                staff.scheduleHistories = allscheduleHistorys.Where(g => g.staff_guid == staff.GUID).ToList();
             }
 
             return staffs;
@@ -1063,6 +1069,7 @@ namespace PharmaRosterAPI
             var sql_staffAttr = MethodClass.GetSQLControl<StaffAttributesClass>();
             var sql_leaveRequest = MethodClass.GetSQLControl<LeaveRequestClass>();
             var sql_groupMember = MethodClass.GetSQLControl<ShiftGroupMemberClass>();
+            var sql_scheduleHistory = MethodClass.GetSQLControl<StaffScheduleHistoryClass>();
 
             // 解析參數
             string GetVal(string key) =>
@@ -1118,12 +1125,19 @@ namespace PharmaRosterAPI
                     : sql_groupMember.WtrteCommandAndExecuteReader($"SELECT * FROM {sql_groupMember.Database}.{sql_groupMember.TableName}");
                 var allGroupMembers = dtGroupMembers.DataTableToRowList().SQLToClass<ShiftGroupMemberClass>() ?? new List<ShiftGroupMemberClass>();
 
+
+                var dtscheduleHistory = isAsync
+                 ? await sql_scheduleHistory.WtrteCommandAndExecuteReaderAsync($"SELECT * FROM {sql_scheduleHistory.Database}.{sql_scheduleHistory.TableName} WHERE status = '正常'" )
+                 : sql_scheduleHistory.WtrteCommandAndExecuteReader($"SELECT * FROM {sql_scheduleHistory.Database}.{sql_scheduleHistory.TableName} WHERE status = '正常'");
+                var allscheduleHistory = dtscheduleHistory.DataTableToRowList().SQLToClass<StaffScheduleHistoryClass>() ?? new List<StaffScheduleHistoryClass>();
+
                 // 關聯
                 foreach (var staff in allStaffs)
                 {
                     staff.staffAttributes = allAttrs.FirstOrDefault(x => x.staff_guid == staff.GUID);
                     staff.leaveRequests = allLeaves.Where(x => x.staff_guid == staff.GUID).ToList();
                     staff.shiftGroupMembers = allGroupMembers.Where(x => x.staff_guid == staff.GUID).ToList();
+                    staff.scheduleHistories = allscheduleHistory.Where(x => x.staff_guid == staff.GUID).ToList();
                 }
 
                 // 🔍 關鍵字搜尋 (記憶體篩選)
@@ -1202,11 +1216,22 @@ namespace PharmaRosterAPI
                         : sql_groupMember.WtrteCommandAndExecuteReader(groupSql);
                     var groups = dtGroups.DataTableToRowList().SQLToClass<ShiftGroupMemberClass>() ?? new List<ShiftGroupMemberClass>();
 
+
+                    // 群組成員
+                    string scheduleHistorySql = $@"SELECT * FROM {sql_scheduleHistory.Database}.{sql_scheduleHistory.TableName}
+                                 WHERE staff_guid IN ({string.Join(",", guids)})";
+                    var dtscheduleHistorys = isAsync
+                        ? await sql_scheduleHistory.WtrteCommandAndExecuteReaderAsync(groupSql)
+                        : sql_scheduleHistory.WtrteCommandAndExecuteReader(groupSql);
+                    var scheduleHistorys = dtscheduleHistorys.DataTableToRowList().SQLToClass<StaffScheduleHistoryClass>() ?? new List<StaffScheduleHistoryClass>();
+
+
                     foreach (var staff in staffs)
                     {
                         staff.staffAttributes = attrs.FirstOrDefault(a => a.staff_guid == staff.GUID);
                         staff.leaveRequests = leaves.Where(l => l.staff_guid == staff.GUID).ToList();
                         staff.shiftGroupMembers = groups.Where(g => g.staff_guid == staff.GUID).ToList();
+                        staff.scheduleHistories = scheduleHistorys.Where(g => g.staff_guid == staff.GUID).ToList();
                     }
                 }
             }

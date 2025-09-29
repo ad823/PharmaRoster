@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Basic;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
@@ -61,6 +62,31 @@ namespace PharmaRosterLib
 
         [JsonPropertyName("staff_info")]
         public StaffClass staff_info { get; set; } = new StaffClass();
-}
+    }
+    public static class ShiftGroupMemberExtensions
+    {
+        /// <summary>
+        /// 依照 <c>order_index</c> 排序 (轉 int，比較安全)
+        /// </summary>
+        public static List<ShiftGroupMemberClass> SortByOrderIndex(this List<ShiftGroupMemberClass> members)
+        {
+            return members
+                .OrderBy(m => m.order_index.StringToInt32())
+                .ToList();
+        }
+
+        /// <summary>
+        /// 先依 <c>weight</c> 排序，再依 <c>order_index</c> 排序  
+        /// - weight 越小 → 優先  
+        /// - 同 weight 時 → order_index 越小越優先
+        /// </summary>
+        public static List<ShiftGroupMemberClass> SortByWeightAndOrderIndex(this List<ShiftGroupMemberClass> members)
+        {
+            return members
+                .OrderBy(m => m.weight.StringToInt32())
+                .ThenBy(m => m.order_index.StringToInt32())
+                .ToList();
+        }
+    }
 
 }

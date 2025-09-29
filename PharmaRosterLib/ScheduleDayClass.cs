@@ -1,12 +1,9 @@
 ﻿using Basic;
-using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Threading.Tasks;
 
 namespace PharmaRosterLib
 {
@@ -23,7 +20,7 @@ namespace PharmaRosterLib
 
         /// <summary>日期 (yyyy-MM-dd)</summary>
         [JsonPropertyName("date")]
-        [Description("DATETIME,0,INDEX")]
+        [Description("DATETIME,0,UNIQUE")]
         public string date { get; set; }
 
         /// <summary>建立時間</summary>
@@ -89,7 +86,7 @@ namespace PharmaRosterLib
         public string shift_requirements { get; set; }
 
         /// <summary>已轉換的需求班次清單 (程式用，不寫回 DB)</summary>
-        [JsonIgnore]
+        [JsonPropertyName("workShiftRequirements")]
         public List<WorkShiftRequirementClass> workShiftRequirements
         {
             get
@@ -157,14 +154,13 @@ namespace PharmaRosterLib
     }
 
 
- 
-
     /// <summary>
     /// 已分派班次 (人員實際分配結果)
     /// </summary>
     [Description("assigned_shifts")]
     public class AssignedShiftClass
     {
+        /// <summary>唯一識別碼 (GUID)</summary>
         [JsonPropertyName("GUID")]
         [Description("VARCHAR,50,PRIMARY")]
         public string GUID { get; set; }
@@ -184,14 +180,16 @@ namespace PharmaRosterLib
         [Description("VARCHAR,50,INDEX")]
         public string req_shift_guid { get; set; }
 
-        /// <summary>需求班次明細索引 (對應 RequiredShiftClass.shift_requirements)</summary>
-        /// <remarks>
-        /// - 用來標識是該班次的哪個時段 (例如 08:00-16:00 / 09:00-17:00)  
-        /// - 可以存 index 或 GUID (若 shift_requirements 未來設計成獨立表)  
-        /// </remarks>
-        [JsonPropertyName("req_shift_detail_id")]
-        [Description("VARCHAR,50,NONE")]
-        public string req_shift_detail_id { get; set; }
+        /// <summary>
+        /// 需求班次明細 JSON (直接存 WorkShiftRequirementClass 的序列化字串)
+        /// </summary>
+        [JsonPropertyName("shift_requirement")]
+        [Description("VARCHAR,300,NONE")]
+        public string shift_requirement { get; set; }
+
+        /// <summary>來源 (自動排班/手動調整/臨時支援)</summary>
+        [JsonPropertyName("source")]
+        public string source { get; set; }
 
         /// <summary>狀態 (normal=正常, support=支援, exception=例外)</summary>
         [JsonPropertyName("status")]
@@ -210,18 +208,48 @@ namespace PharmaRosterLib
 
         // ===== 關聯物件 =====
 
-        /// <summary>對應人員資訊</summary>
+        /// <summary>對應人員資訊 (非資料表欄位)</summary>
         [JsonPropertyName("staff")]
         public StaffClass staff { get; set; }
 
-        /// <summary>對應需求班次</summary>
+        /// <summary>對應需求班次 (非資料表欄位)</summary>
         [JsonPropertyName("required_shift")]
         public RequiredShiftClass required_shift { get; set; }
 
-        /// <summary>對應需求班次明細 (時段需求)</summary>
-        [JsonPropertyName("shift_detail")]
-        public WorkShiftRequirementClass workShiftRequirement { get; set; }
+        /// <summary>
+        /// 對應需求班次明細 (正反序列化 JSON)  
+        /// - Getter: 將 <c>req_shift_detail_key</c> JSON 反序列化成物件。  
+        /// - Setter: 將物件序列化後存回 <c>req_shift_detail_key</c>。  
+        /// </summary>
+        [JsonPropertyName("workShiftRequirement")]
+        public WorkShiftRequirementClass workShiftRequirement
+        {
+            get
+            {
+                if (string.IsNullOrWhiteSpace(shift_requirement)) return null;
+                try
+                {
+                    return JsonSerializer.Deserialize<WorkShiftRequirementClass>(shift_requirement);
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+            set
+            {
+                if (value == null)
+                {
+                    shift_requirement = null;
+                }
+                else
+                {
+                    shift_requirement = JsonSerializer.Serialize(value);
+                }
+            }
+        }
     }
+
 
 
 
@@ -393,7 +421,23 @@ namespace PharmaRosterLib
             return new List<RequiredShiftClass>();
         }
 
-     
+
+        /// <summary>
+        /// 根據 shift_group.sort_order 排序 RequiredShifts
+        /// </summary>
+        /// <param name="requiredShifts">需求班次清單</param>
+        /// <returns>排序後的需求班次清單</returns>
+        public static List<RequiredShiftClass> SortRequiredShifts(this List<RequiredShiftClass> requiredShifts)
+        {
+            if (requiredShifts == null || requiredShifts.Count == 0)
+                return new List<RequiredShiftClass>();
+
+            return requiredShifts
+                .OrderBy(r => r.shift_group?.sort_order.StringToInt32() ?? 0) // 依群組排序號
+                .ThenBy(r => r.shift_group?.group_name ?? string.Empty)      // 次排序：群組名稱
+                .ToList();
+        }
+
     }
     public static class AssignedShiftMethod
     {
@@ -430,11 +474,12 @@ namespace PharmaRosterLib
         }
 
 
-        static public AssignedShiftClass SerchByStaffGUID(this List<AssignedShiftClass> assignedShifts ,string req_shift_guid, string staff_guid)
+        static public AssignedShiftClass SerchByStaffGUID(this List<AssignedShiftClass> assignedShifts, string req_shift_guid, string staff_guid , string shift_requirement)
         {
             var result = (from temp in assignedShifts
                           where temp.staff_guid == staff_guid
                           where temp.req_shift_guid == req_shift_guid
+                          where temp.shift_requirement == shift_requirement
                           select temp).FirstOrDefault();
             return result ?? null;
         }

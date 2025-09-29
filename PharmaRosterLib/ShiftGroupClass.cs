@@ -1,4 +1,5 @@
-﻿using PharmaRosterLib;
+﻿using Basic;
+using PharmaRosterLib;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -33,6 +34,12 @@ public class ShiftGroupClass
     [Description("VARCHAR,100,NONE")]
     public string group_name { get; set; }
 
+    /// <summary>
+    /// 排序號 (用於前端顯示/排序)
+    /// </summary>
+    [JsonPropertyName("sort_order")]
+    [Description("VARCHAR,11,NONE")]
+    public string sort_order { get; set; } = "0";
 
     /// <summary>群組描述 (用途/規則備註)</summary>
     [JsonPropertyName("description")]
@@ -42,10 +49,10 @@ public class ShiftGroupClass
     /// <summary>循環索引 (記錄上次排班位置)</summary>
     [JsonPropertyName("last_index")]
     [Description("VARCHAR,11,NONE")]
-    public string last_index { get; set; }
+    public string last_index { get; set; } = "0";
 
     /// <summary>
-    /// 班別屬性 (day=白班, night=夜班, holiday=假日班)
+    /// 班別屬性 (day=白班, swing=小夜, midnight=大夜, holiday=假日班)
     /// </summary>
     [JsonPropertyName("shift_type")]
     [Description("VARCHAR,20,NONE")]
@@ -69,7 +76,7 @@ public class ShiftGroupClass
     /// <summary>
     /// 解析後的上班需求時段清單 (程式用，不寫回 DB)
     /// </summary>
-    [JsonIgnore]
+    [JsonPropertyName("workShiftRequirements")]
     public List<WorkShiftRequirementClass> workShiftRanges
     {
         get
@@ -83,6 +90,17 @@ public class ShiftGroupClass
             catch
             {
                 return new List<WorkShiftRequirementClass>();
+            }
+        }
+        set
+        {
+            if (value == null)
+            {
+                work_shift_requirements = null;
+            }
+            else
+            {
+                work_shift_requirements = JsonSerializer.Serialize(value);
             }
         }
     }
@@ -123,7 +141,12 @@ public class WorkShiftRequirementClass
     [JsonPropertyName("required_count")]
     public string required_count { get; set; }
 
-
+    /// <summary>
+    /// 已加入人數 (已分派人員數)
+    /// </summary>
+    [JsonPropertyName("assigned_count")]
+    public string assigned_count { get; set; }
+    
     /// <summary>部門 / 科別 (例如: 門診, 急診, 兒科)</summary>
     [JsonPropertyName("department")]
     public string department { get; set; }
@@ -148,12 +171,27 @@ public class WorkShiftRequirementClass
         }
     }
 }
+
+
 /// <summary>
 /// ShiftGroup 相關擴充工具
 /// </summary>
 public static class ShiftGroupExtensions
 {
+    /// <summary>
+    /// 根據 sort_order 進行升冪排序
+    /// </summary>
+    /// <param name="groups">排班群組清單</param>
+    /// <returns>排序後的清單</returns>
+    public static List<ShiftGroupClass> SortByOrder(this List<ShiftGroupClass> groups)
+    {
+        if (groups == null || groups.Count == 0) return new List<ShiftGroupClass>();
 
+        return groups
+            .OrderBy(g => g.sort_order.StringToInt32()) // 字串轉數字排序
+            .ThenBy(g => g.group_name) // 若排序號相同，則依群組名稱排序
+            .ToList();
+    }
     public static StaffClass SerchStaff(this ShiftGroupClass group, string staff_guid)
     {
         List<StaffClass> staffClasses = new List<StaffClass>();
@@ -254,6 +292,33 @@ public static class ShiftGroupExtensions
 public static class WorkShiftRequirementExtensions
 {
     /// <summary>
+    /// 依照日期 → 時間區間排序 (由早到晚)
+    /// </summary>
+    /// <param name="requirements">班表需求清單</param>
+    /// <returns>排序後的清單</returns>
+    public static List<WorkShiftRequirementClass> SortByDayAndTime(this List<WorkShiftRequirementClass> requirements)
+    {
+        if (requirements == null || requirements.Count == 0) return new List<WorkShiftRequirementClass>();
+
+        // 定義星期順序
+        var dayOrder = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "Monday", 1 },
+            { "Tuesday", 2 },
+            { "Wednesday", 3 },
+            { "Thursday", 4 },
+            { "Friday", 5 },
+            { "Saturday", 6 },
+            { "Sunday", 7 }
+        };
+
+        return requirements
+            .OrderBy(r => dayOrder.ContainsKey(r.day) ? dayOrder[r.day] : int.MaxValue) // 依星期排序
+            .ThenBy(r => r.TimeRange.HasValue ? r.TimeRange.Value.start : TimeSpan.MaxValue) // 依開始時間排序
+            .ThenBy(r => r.TimeRange.HasValue ? r.TimeRange.Value.end : TimeSpan.MaxValue)   // 依結束時間排序
+            .ToList();
+    }
+    /// <summary>
     /// 比對兩個 WorkShiftRequirementClass 清單，以 original 為主更新需求人數
     /// </summary>
     /// <param name="original">原始清單</param>
@@ -277,8 +342,54 @@ public static class WorkShiftRequirementExtensions
                 day = ori.day,
                 time = ori.time,
                 department = ori.department,
-                required_count = match?.required_count ?? defaultCount
+                required_count = match?.required_count ?? ori.required_count ?? defaultCount
             };
         }).ToList();
+
+        
     }
+    /// <summary>
+    /// 檢查需求清單中是否有時段完整涵蓋指定的 WorkShiftRequirementClass，
+    /// 並且部門 (department) 必須相同
+    /// </summary>
+    /// <param name="requirements">需求清單</param>
+    /// <param name="requirementClas">要檢查的需求時段</param>
+    /// <returns>若有需求時段完整涵蓋 requirementClas，回傳 true，否則 false</returns>
+    public static bool ContainsTime(this List<WorkShiftRequirementClass> requirements, WorkShiftRequirementClass requirementClas)
+    {
+        if (requirements == null || requirements.Count == 0 || requirementClas == null) return false;
+
+        var checkRange = requirementClas.TimeRange;
+        if (!checkRange.HasValue) return false;
+
+        return requirements.Any(r =>
+        {
+            var range = r.TimeRange;
+            return range.HasValue &&
+                   string.Equals(r.department, requirementClas.department, StringComparison.OrdinalIgnoreCase) &&
+                   checkRange.Value.start >= range.Value.start &&
+                   checkRange.Value.end <= range.Value.end;
+        });
+    }
+    /// <summary>
+    /// 依據指定日期過濾需求清單，只保留符合星期的資料
+    /// </summary>
+    /// <param name="requirements">需求清單</param>
+    /// <param name="date">要比對的日期 (yyyy-MM-dd)</param>
+    /// <returns>符合指定日期星期的需求清單</returns>
+    public static List<WorkShiftRequirementClass> FilterByDate(this List<WorkShiftRequirementClass> requirements, string date)
+    {
+        if (requirements == null || requirements.Count == 0) return new List<WorkShiftRequirementClass>();
+        if (string.IsNullOrWhiteSpace(date)) return new List<WorkShiftRequirementClass>();
+
+        if (!DateTime.TryParse(date, out var parsedDate))
+            return new List<WorkShiftRequirementClass>();
+
+        string dayOfWeek = parsedDate.DayOfWeek.ToString(); // Monday, Tuesday, ...
+
+        return requirements
+            .Where(r => string.Equals(r.day, dayOfWeek, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+    }
+
 }

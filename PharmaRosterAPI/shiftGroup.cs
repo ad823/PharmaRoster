@@ -892,7 +892,7 @@ namespace PharmaRosterAPI
         public static async Task<ShiftGroupClass> GetShiftGroupsAsync(string GUID, bool staff_info = true)
         {
             List<string> valueAry = new List<string>();
-            valueAry.Add(GUID);
+            valueAry.Add($"GUID={GUID}");
             var result = await GetShiftGroupsAsync(valueAry, staff_info);
             return result.shiftGroups[0] ?? null;
         }
