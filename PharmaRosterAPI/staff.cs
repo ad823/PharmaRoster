@@ -1052,6 +1052,9 @@ namespace PharmaRosterAPI
                 staff.leaveRequests = allLeaves.Where(l => l.staff_guid == staff.GUID).ToList();
                 staff.shiftGroupMembers = allGroupMembers.Where(g => g.staff_guid == staff.GUID).ToList();
                 staff.scheduleHistories = allscheduleHistorys.Where(g => g.staff_guid == staff.GUID).ToList();
+
+                staff.RecalculateCounts();
+
             }
 
             return staffs;
@@ -1138,6 +1141,8 @@ namespace PharmaRosterAPI
                     staff.leaveRequests = allLeaves.Where(x => x.staff_guid == staff.GUID).ToList();
                     staff.shiftGroupMembers = allGroupMembers.Where(x => x.staff_guid == staff.GUID).ToList();
                     staff.scheduleHistories = allscheduleHistory.Where(x => x.staff_guid == staff.GUID).ToList();
+                    staff.RecalculateCounts();
+
                 }
 
                 // 🔍 關鍵字搜尋 (記憶體篩選)
@@ -1217,12 +1222,12 @@ namespace PharmaRosterAPI
                     var groups = dtGroups.DataTableToRowList().SQLToClass<ShiftGroupMemberClass>() ?? new List<ShiftGroupMemberClass>();
 
 
-                    // 群組成員
+                    // 歷史排班
                     string scheduleHistorySql = $@"SELECT * FROM {sql_scheduleHistory.Database}.{sql_scheduleHistory.TableName}
-                                 WHERE staff_guid IN ({string.Join(",", guids)})";
+                                 WHERE staff_guid IN ({string.Join(",", guids)}) and status = '正常'";
                     var dtscheduleHistorys = isAsync
-                        ? await sql_scheduleHistory.WtrteCommandAndExecuteReaderAsync(groupSql)
-                        : sql_scheduleHistory.WtrteCommandAndExecuteReader(groupSql);
+                        ? await sql_scheduleHistory.WtrteCommandAndExecuteReaderAsync(scheduleHistorySql)
+                        : sql_scheduleHistory.WtrteCommandAndExecuteReader(scheduleHistorySql);
                     var scheduleHistorys = dtscheduleHistorys.DataTableToRowList().SQLToClass<StaffScheduleHistoryClass>() ?? new List<StaffScheduleHistoryClass>();
 
 
@@ -1232,6 +1237,8 @@ namespace PharmaRosterAPI
                         staff.leaveRequests = leaves.Where(l => l.staff_guid == staff.GUID).ToList();
                         staff.shiftGroupMembers = groups.Where(g => g.staff_guid == staff.GUID).ToList();
                         staff.scheduleHistories = scheduleHistorys.Where(g => g.staff_guid == staff.GUID).ToList();
+                        staff.RecalculateCounts();
+
                     }
                 }
             }

@@ -89,6 +89,7 @@
     <Compile Include="ScheduleDayClass.cs" />
     <Compile Include="ShiftGroupClass.cs" />
     <Compile Include="ShiftGroupMemberClass.cs" />
+    <Compile Include="Slot.cs" />
     <Compile Include="SpecialDayClass.cs" />
     <Compile Include="StaffClass.cs" />
   </ItemGroup>

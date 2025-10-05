@@ -534,6 +534,15 @@ namespace PharmaRosterAPI
             }
         }
 
+
+       
+        public static List<LeaveRequestClass> GetLeaveRequests()
+        {
+            List<string> ValueAry = new List<string>();
+            ValueAry.Add("pageSize=20000");
+
+            return GetLeaveRequestsAsync(ValueAry).GetAwaiter().GetResult().leaveRequests;
+        }
         /// <summary>
         /// 查詢請假 / 特例 (LeaveRequest) 清單
         /// </summary>

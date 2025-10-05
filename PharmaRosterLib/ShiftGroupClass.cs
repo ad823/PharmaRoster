@@ -7,6 +7,28 @@ using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
+
+/// <summary>
+/// 班別類型列舉
+/// </summary>
+public enum ShiftTypeEnum
+{
+    [Description("dnoneay")]
+    none,
+    /// <summary>白班 (day)</summary>
+    [Description("day")]
+    day,
+    /// <summary>小夜班 (swing)</summary>
+    [Description("swing")]
+    swing,
+    /// <summary>大夜班 (midnight)</summary>
+    [Description("midnight")]
+    midnight,
+    /// <summary>假日班 (holiday)</summary>
+    [Description("holiday")]
+    holiday
+}
+
 /// <summary>
 /// 排班群組 (Shift Group)
 /// </summary>
@@ -84,8 +106,12 @@ public class ShiftGroupClass
             if (string.IsNullOrWhiteSpace(work_shift_requirements)) return new List<WorkShiftRequirementClass>();
             try
             {
-                return JsonSerializer.Deserialize<List<WorkShiftRequirementClass>>(work_shift_requirements)
-                       ?? new List<WorkShiftRequirementClass>();
+                var wr = JsonSerializer.Deserialize<List<WorkShiftRequirementClass>>(work_shift_requirements) ?? new List<WorkShiftRequirementClass>();
+                foreach( var item in wr)
+                {
+                    item.shift_type = shift_type;
+                }
+                return wr;
             }
             catch
             {
@@ -124,36 +150,48 @@ public class ShiftGroupClass
     /// </remarks>
     public List<ShiftGroupMemberClass> Members { get; set; }
 }
+
 /// <summary>
 /// 上班需求時段
 /// </summary>
 public class WorkShiftRequirementClass
 {
-    /// <summary>星期 (Monday, Tuesday, ...)</summary>
     [JsonPropertyName("day")]
     public string day { get; set; }
 
-    /// <summary>時間區間 (例如: 08:00-16:00)</summary>
     [JsonPropertyName("time")]
     public string time { get; set; }
 
-    /// <summary>需求人數</summary>
-    [JsonPropertyName("required_count")]
-    public string required_count { get; set; }
+    [JsonPropertyName("shift_type")]
+    public string shift_type { get; set; }
 
-    /// <summary>
-    /// 已加入人數 (已分派人員數)
-    /// </summary>
+    // 🔹 用來儲存原始值，不含 HDR 增加
+    [JsonIgnore]
+    public int RequiredCountBase { get; set; } = 0;
+
+    // 🔹 讓 JSON 仍能存取這個欄位
+    [JsonPropertyName("required_count")]
+    public string required_count
+    {
+        get
+        {
+            return RequiredCountBase.ToString();
+        }
+        set
+        {
+            RequiredCountBase = value.StringToInt32();
+        }
+    }
+
     [JsonPropertyName("assigned_count")]
     public string assigned_count { get; set; }
-    
-    /// <summary>部門 / 科別 (例如: 門診, 急診, 兒科)</summary>
+
     [JsonPropertyName("department")]
     public string department { get; set; }
 
-    /// <summary>
-    /// 程式用解析 (TimeSpan Start/End)
-    /// </summary>
+    [JsonPropertyName("hdr")]
+    public string hdr { get; set; }
+
     [JsonIgnore]
     public (TimeSpan start, TimeSpan end)? TimeRange
     {
@@ -164,13 +202,15 @@ public class WorkShiftRequirementClass
             if (parts.Length == 2 &&
                 TimeSpan.TryParse(parts[0], out var start) &&
                 TimeSpan.TryParse(parts[1], out var end))
-            {
                 return (start, end);
-            }
             return null;
         }
     }
+
+ 
 }
+
+
 
 
 /// <summary>
@@ -318,36 +358,53 @@ public static class WorkShiftRequirementExtensions
             .ThenBy(r => r.TimeRange.HasValue ? r.TimeRange.Value.end : TimeSpan.MaxValue)   // 依結束時間排序
             .ToList();
     }
-    /// <summary>
-    /// 比對兩個 WorkShiftRequirementClass 清單，以 original 為主更新需求人數
-    /// </summary>
-    /// <param name="original">原始清單</param>
-    /// <param name="target">待配對清單 (若無對應則忽略)</param>
-    /// <param name="defaultCount">預設需求人數</param>
-    /// <returns>更新後的新清單 (保持 original 的結構)</returns>
-    public static List<WorkShiftRequirementClass> UpdateRequirements(this List<WorkShiftRequirementClass> original, List<WorkShiftRequirementClass> target, string defaultCount = "0")
+  /// <summary>
+/// 比對兩個 WorkShiftRequirementClass 清單，以 original 為主更新需求人數，
+/// 並在 target 有 hdr 設定時優先帶入。
+/// </summary>
+public static List<WorkShiftRequirementClass> UpdateRequirements(
+    this List<WorkShiftRequirementClass> original,
+    List<WorkShiftRequirementClass> target,
+    string defaultCount = "0")
+{
+    if (original == null) return new List<WorkShiftRequirementClass>();
+    if (target == null) target = new List<WorkShiftRequirementClass>();
+
+    return original.Select(ori =>
     {
-        if (original == null) return new List<WorkShiftRequirementClass>();
-        if (target == null) target = new List<WorkShiftRequirementClass>();
+        var match = target.FirstOrDefault(t =>
+            string.Equals(t.day, ori.day, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(t.time, ori.time, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(t.department, ori.department, StringComparison.OrdinalIgnoreCase));
 
-        return original.Select(ori =>
+        // ✅ 如果 target 有設定 hdr（非空、非 null），則優先使用 target 的 hdr
+        string hdrValue = !string.IsNullOrWhiteSpace(match?.hdr)
+            ? match.hdr
+            : ori.hdr;
+        // 原始需求數（以 ori 為主）
+        string required = match?.required_count ?? ori.required_count ?? defaultCount;
+
+        // ✅ 判斷 HDR 變化後調整
+        // 原始 hdr 狀態
+        bool oldHdr = ori.hdr?.Trim().ToLower() == "true";
+        // 新 hdr 狀態（target 有設定才覆蓋）
+        bool newHdr = match?.hdr?.Trim().ToLower() == "true";
+        if (!oldHdr && newHdr) required = (required.StringToInt32() + 1).ToString();  // null/false → true
+        else if (oldHdr && !newHdr) required = (required.StringToInt32() - 1).ToString(); // true → false
+
+
+        return new WorkShiftRequirementClass
         {
-            var match = target.FirstOrDefault(t =>
-                string.Equals(t.day, ori.day, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(t.time, ori.time, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(t.department, ori.department, StringComparison.OrdinalIgnoreCase));
+            day = ori.day,
+            time = ori.time,
+            department = ori.department,
+            required_count = required,
+            shift_type = ori.shift_type,
+            hdr = hdrValue
+        };
+    }).ToList();
+}
 
-            return new WorkShiftRequirementClass
-            {
-                day = ori.day,
-                time = ori.time,
-                department = ori.department,
-                required_count = match?.required_count ?? ori.required_count ?? defaultCount
-            };
-        }).ToList();
-
-        
-    }
     /// <summary>
     /// 檢查需求清單中是否有時段完整涵蓋指定的 WorkShiftRequirementClass，
     /// 並且部門 (department) 必須相同

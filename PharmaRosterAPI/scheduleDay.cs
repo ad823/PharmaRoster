@@ -1,13 +1,19 @@
 ﻿using Basic;
 using Microsoft.AspNetCore.Mvc;
+using MyOffice;
+using Org.BouncyCastle.Bcpg.OpenPgp;
+using Org.BouncyCastle.Ocsp;
 using PharmaRosterLib;
 using SQLUI;
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Threading.Tasks;
+using static NPOI.HSSF.Util.HSSFColor;
+using static SQLUI.Table;
 
 namespace PharmaRosterAPI
 {
@@ -99,28 +105,27 @@ namespace PharmaRosterAPI
         }
 
         /// <summary>
-        /// 查詢行事曆日 (ScheduleDay)，並包含需求班次、已指派班次、排班日誌、特殊日與請假紀錄
+        /// 查詢排班日 (ScheduleDay) 資料
         /// </summary>
         /// <remarks>
         /// ## 📌 用途  
-        /// 本 API 用於查詢指定日期區間的行事曆資料 (ScheduleDayClass)。  
-        /// 系統會自動關聯以下資訊：  
-        /// - <c>RequiredShifts</c>：當日需求班次  
-        /// - <c>AssignedShifts</c>：當日已指派班次  
-        /// - <c>ScheduleLogs</c>：當日排班日誌  
-        /// - <c>SpecialDays</c>：當日是否為特殊日 (如國定假日)  
-        /// - <c>LeaveRequests</c>：落在該日範圍內的請假紀錄  
+        /// 本 API 用於查詢指定日期區間內的排班日資料。  
+        /// 系統會依據傳入的參數 `ValueAry` 取得對應日期範圍內的排班資訊，  
+        /// 並附加分頁資訊於回傳最外層欄位中。  
+        ///  
+        /// - 回傳每日的排班結構 (ScheduleDayClass)。  
+        /// - 支援分頁查詢。  
+        /// - 可用於顯示月曆、週檢視或明細列表等排班畫面。  
         ///
         /// ## 📥 Request JSON 範例
         /// ```json
         /// {
         ///   "Method": "get_schedule_days",
         ///   "ValueAry": [
-        ///     "date_start=2025-09-01",
-        ///     "date_end=2025-09-30",
+        ///     "date_start=2025-10-01",
+        ///     "date_end=2025-10-31",
         ///     "page=1",
-        ///     "pageSize=20",
-        ///     "sortOrder=asc"
+        ///     "page_size=10"
         ///   ]
         /// }
         /// ```
@@ -130,30 +135,37 @@ namespace PharmaRosterAPI
         /// {
         ///   "Code": 200,
         ///   "Method": "get_schedule_days",
-        ///   "Result": "共取得(2)筆資料",
-        ///   "TimeTaken": "53ms",
+        ///   "Result": "共取得(10)筆資料",
+        ///   "TimeTaken": "45ms",
         ///   "Data": [
         ///     {
-        ///       "GUID": "D111-2222-3333-4444",
-        ///       "date": "2025-09-01",
-        ///       "created_at": "2025-09-01 00:00:00",
-        ///       "updated_at": "2025-09-01 00:00:00",
-        ///       "RequiredShifts": [ { "GUID": "...", "shift_group_guid": "...", "required_count": "3" } ],
-        ///       "AssignedShifts": [ { "GUID": "...", "staff_guid": "...", "shift_group_guid": "...", "status": "confirmed" } ],
-        ///       "ScheduleLogs": [ { "GUID": "...", "action": "auto_schedule", "timestamp": "2025-09-01 01:23:45" } ],
-        ///       "SpecialDays": [ { "GUID": "...", "date": "2025-09-01", "override_required_count": "2" } ],
-        ///       "LeaveRequests": [ { "GUID": "...", "staff_guid": "S001", "start_date": "2025-09-01", "end_date": "2025-09-02", "reason": "休假" } ]
+        ///       "GUID": "DAY001",
+        ///       "date": "2025-10-01",
+        ///       "created_at": "2025-10-01 08:00:00",
+        ///       "updated_at": "2025-10-01 08:00:00",
+        ///       "required_shifts": [],
+        ///       "assigned_shifts": [],
+        ///       "schedule_logs": []
+        ///     },
+        ///     {
+        ///       "GUID": "DAY002",
+        ///       "date": "2025-10-02",
+        ///       "created_at": "2025-10-02 08:00:00",
+        ///       "updated_at": "2025-10-02 08:00:00",
+        ///       "required_shifts": [],
+        ///       "assigned_shifts": [],
+        ///       "schedule_logs": []
         ///     }
         ///   ],
-        ///   "TotalCount": 2,
-        ///   "TotalPages": 1,
-        ///   "CurrentPage": 1,
-        ///   "PageSize": 20
+        ///   "TotalCount": "10",
+        ///   "TotalPages": "1",
+        ///   "CurrentPage": "1",
+        ///   "PageSize": "10"
         /// }
         /// ```
         ///
         /// ## ❌ Response JSON 範例 (錯誤)
-        /// - 缺少必要參數：  
+        /// - 缺少查詢條件：  
         /// ```json
         /// {
         ///   "Code": -200,
@@ -162,7 +174,7 @@ namespace PharmaRosterAPI
         /// }
         /// ```
         ///
-        /// - 系統例外：  
+        /// - 系統例外錯誤：  
         /// ```json
         /// {
         ///   "Code": -200,
@@ -172,13 +184,17 @@ namespace PharmaRosterAPI
         /// ```
         ///
         /// ## 📑 注意事項
-        /// - <c>date_start</c> 與 <c>date_end</c> 必須為有效日期字串 (yyyy-MM-dd)，可只給其中一個。  
-        /// - 回傳資料會依據日期排序 (asc/desc)。  
-        /// - 預設 <c>pageSize</c> 為 50 筆。  
-        /// - 結果中會附帶分頁資訊 (TotalCount, TotalPages, CurrentPage, PageSize)。  
+        /// - `ValueAry` 需包含查詢條件：  
+        ///   - `date_start`：起始日期 (yyyy-MM-dd)。  
+        ///   - `date_end`：結束日期 (yyyy-MM-dd)。  
+        ///   - `page` (選填)：查詢頁次，預設為第 1 頁。  
+        ///   - `page_size` (選填)：每頁筆數，預設為系統設定值。  
+        /// - 回傳資料包含每日期的完整排班結構 (ScheduleDayClass)。  
+        /// - 分頁資訊 (`TotalCount`, `TotalPages`, `CurrentPage`, `PageSize`) 會直接附加在最外層。  
+        /// - 若查無資料，`Data` 會回傳空陣列。  
         /// </remarks>
-        /// <param name="returnData">統一封裝的請求與回應物件，需包含 <c>ValueAry</c> 條件</param>
-        /// <returns>JSON 格式的回應字串，包含行事曆日及其關聯資料</returns>
+        /// <param name="returnData">統一封裝的請求與回應物件，需包含 ValueAry 查詢條件 (日期區間與分頁設定)</param>
+        /// <returns>JSON 格式的回應字串，包含排班日資料與分頁資訊</returns>
         [HttpPost("get_schedule_days")]
         public string get_schedule_days([FromBody] returnData returnData)
         {
@@ -215,7 +231,410 @@ namespace PharmaRosterAPI
             }
         }
 
- 
+        /// <summary>
+        /// 查詢小夜班 (Swing Shift) 排班資料
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途  
+        /// 本 API 用於查詢特定日期區間內的小夜班 (Swing Shift) 排班資料。  
+        /// 系統會依據傳入的查詢條件 (`ValueAry`) 取得對應的 ScheduleDay 資料，  
+        /// 並篩選出班別屬性為 <c>shift_type = "swing"</c> 的排班結果。  
+        ///  
+        /// - 僅回傳「小夜班」班別的 AssignedShift。  
+        /// - 支援分頁回傳。  
+        /// - 附加分頁資訊於 Extra 欄位：`TotalCount`, `TotalPages`, `CurrentPage`, `PageSize`。  
+        ///
+        /// ## 📥 Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "get_swing_schedules",
+        ///   "ValueAry": [
+        ///     "date_start=2025-10-01",
+        ///     "date_end=2025-10-31",
+        ///     "page=1",
+        ///     "page_size=10"
+        ///   ]
+        /// }
+        /// ```
+        ///
+        /// ## 📤 Response JSON 範例 (成功)
+        /// ```json
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "get_swing_schedules",
+        ///   "Result": "共取得(3)筆資料",
+        ///   "TimeTaken": "58ms",
+        ///   "Data": [
+        ///     {
+        ///       "date": "2025-10-03",
+        ///       "AssignedShifts": [
+        ///         {
+        ///           "GUID": "AS001",
+        ///           "date": "2025-10-03",
+        ///           "staff_guid": "S001",
+        ///           "req_shift_guid": "RQ001",
+        ///           "status": "正常",
+        ///           "workShiftRequirement": {
+        ///             "day": "Friday",
+        ///             "time": "15:30-24:00",
+        ///             "department": "藥局",
+        ///             "shift_type": "swing"
+        ///           }
+        ///         }
+        ///       ]
+        ///     },
+        ///     {
+        ///       "date": "2025-10-04",
+        ///       "AssignedShifts": [
+        ///         {
+        ///           "GUID": "AS002",
+        ///           "date": "2025-10-04",
+        ///           "staff_guid": "S002",
+        ///           "req_shift_guid": "RQ002",
+        ///           "status": "正常",
+        ///           "workShiftRequirement": {
+        ///             "day": "Saturday",
+        ///             "time": "16:00-24:00",
+        ///             "department": "急診",
+        ///             "shift_type": "swing"
+        ///           }
+        ///         }
+        ///       ]
+        ///     }
+        ///   ],
+        ///   "Extra": {
+        ///     "TotalCount": "3",
+        ///     "TotalPages": "1",
+        ///     "CurrentPage": "1",
+        ///     "PageSize": "10"
+        ///   }
+        /// }
+        /// ```
+        ///
+        /// ## ❌ Response JSON 範例 (錯誤)
+        /// - 未提供 ValueAry：  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_swing_schedules",
+        ///   "Result": "ValueAry 不能為空"
+        /// }
+        /// ```
+        ///
+        /// - 系統例外錯誤：  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_swing_schedules",
+        ///   "Result": "Exception: 資料庫連線失敗"
+        /// }
+        /// ```
+        ///
+        /// ## 📑 注意事項
+        /// - 僅回傳班別類型為 <c>swing</c> (小夜班) 的排班資料。  
+        /// - 需於 `ValueAry` 中提供 `date_start` 與 `date_end` 作為查詢條件。  
+        /// - 若未指定 `page` 與 `page_size`，系統會套用預設值。  
+        /// - 回傳的 ScheduleDay 不包含 RequiredShifts、LeaveRequests 等其他關聯資料。  
+        /// - 所有分頁資訊皆附加於回傳物件的 Extra 欄位。  
+        /// </remarks>
+        /// <param name="returnData">封裝請求與回應資料的統一物件，需包含 ValueAry (日期與分頁參數)</param>
+        /// <returns>JSON 格式回應，包含小夜班排班資料與分頁資訊</returns>
+        [HttpPost("get_swing_schedules")]
+        public string get_swing_schedules([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "get_schedule_days";
+
+            try
+            {
+                // 驗證必填
+                if (returnData.ValueAry == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "ValueAry 不能為空";
+                    return returnData.JsonSerializationt();
+                }
+                var sql_staff = MethodClass.GetSQLControl<StaffClass>();
+
+                (List<ScheduleDayClass> scheduleDays, int totalCount, int totalPages, int pageSize, int currentPage) = GetScheduleDay(returnData.ValueAry);
+
+                var shift_groups = shiftGroup.GetShiftGroups(false);
+                var shift_groups_buf = new List<ShiftGroupClass>();
+                Dictionary<string, List<ShiftGroupClass>> keyValuePairs_shift_groups = shift_groups.CoverToDictionaryByGUID();
+                foreach (ScheduleDayClass scheduleDay in scheduleDays)
+                {
+                    scheduleDay.RequiredShifts = new List<RequiredShiftClass>();
+                    scheduleDay.ScheduleLogs = new List<ScheduleLogClass>();
+                    scheduleDay.SpecialDays = new List<SpecialDayClass>();
+                    scheduleDay.LeaveRequests = new List<LeaveRequestClass>();
+                    List<AssignedShiftClass> assignedShifts = new List<AssignedShiftClass>();
+                    foreach (var assignedShift in scheduleDay.AssignedShifts)
+                    {
+                        shift_groups_buf = keyValuePairs_shift_groups.SortDictionaryByGUID(assignedShift.req_shift_guid);
+                        if(shift_groups_buf.Count > 0)
+                        {
+                            assignedShift.workShiftRequirement.shift_type = shift_groups_buf[0].shift_type;
+                        }
+                        if (assignedShift.workShiftRequirement.shift_type == ShiftTypeEnum.swing.GetEnumName())
+                        {
+                            assignedShifts.Add(assignedShift);
+                        }
+                    }
+                    scheduleDay.AssignedShifts = assignedShifts; 
+                }
+
+                returnData.Code = 200;
+                returnData.Result = $"共取得({scheduleDays.Count})筆資料";
+                returnData.TimeTaken = $"{timer}";
+                returnData.Data = scheduleDays;
+                returnData.AddExtra("TotalCount", totalCount.ToString());
+                returnData.AddExtra("TotalPages", totalPages.ToString());
+                returnData.AddExtra("CurrentPage", currentPage.ToString());
+                returnData.AddExtra("PageSize", pageSize.ToString());
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 新增或更新假日需求班次 (Holiday RequiredShift)
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途  
+        /// 本 API 用於設定「假日排班需求」，針對指定日期及星期 (day_of_week)  
+        /// 建立或更新對應的 **每日需求班次 (RequiredShift)**。  
+        ///  
+        /// - 若該日期尚未建立行事曆 (ScheduleDay)，系統會自動建立。  
+        /// - 若該日期與班群 (ShiftGroup) 尚無需求班次 → 新增。  
+        /// - 若已存在相同日期與班群 → 更新。  
+        /// - 系統會自動將班群內的班別 (`workShiftRanges`) 套用為該日的 `workShiftRequirements`。  
+        ///
+        /// ## 📥 Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "add_and_update_holiday_requiredShift",
+        ///   "ValueAry": [ "day_of_week=Sunday" ],
+        ///   "Data": {
+        ///     "GUID": "",
+        ///     "date": "2025-10-12",
+        ///     "shift_group_guid": "G123-456B-789C",
+        ///     "workShiftRequirements": [
+        ///       {
+        ///         "day": "Sunday",
+        ///         "time": "08:00-16:00",
+        ///         "required_count": "2",
+        ///         "department": "門診"
+        ///       },
+        ///       {
+        ///         "day": "Sunday",
+        ///         "time": "16:00-24:00",
+        ///         "required_count": "1",
+        ///         "department": "急診"
+        ///       }
+        ///     ]
+        ///   }
+        /// }
+        /// ```
+        ///
+        /// ## 📤 Response JSON 範例 (成功)
+        /// ```json
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "add_and_update_holiday_requiredShift",
+        ///   "Result": "新增(1)筆資料,修改(0)筆資料",
+        ///   "TimeTaken": "42ms",
+        ///   "Data": [
+        ///     {
+        ///       "GUID": "R001",
+        ///       "date": "2025-10-12",
+        ///       "shift_group_guid": "G123-456B-789C",
+        ///       "workShiftRequirements": [
+        ///         {
+        ///           "day": "Sunday",
+        ///           "time": "08:00-16:00",
+        ///           "required_count": "2",
+        ///           "department": "門診"
+        ///         },
+        ///         {
+        ///           "day": "Sunday",
+        ///           "time": "16:00-24:00",
+        ///           "required_count": "1",
+        ///           "department": "急診"
+        ///         }
+        ///       ]
+        ///     }
+        ///   ]
+        /// }
+        /// ```
+        ///
+        /// ## ❌ Response JSON 範例 (錯誤)
+        /// - 缺少必要欄位：  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "add_and_update_holiday_requiredShift",
+        ///   "Result": "參數驗證失敗：date 格式錯誤"
+        /// }
+        /// ```
+        ///
+        /// - 班群不存在：  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "add_and_update_holiday_requiredShift",
+        ///   "Result": "參數驗證失敗：shift_group_guid 格式錯誤"
+        /// }
+        /// ```
+        ///
+        /// - 星期格式錯誤：  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "add_and_update_holiday_requiredShift",
+        ///   "Result": "參數驗證失敗：day_of_week 格式錯誤"
+        /// }
+        /// ```
+        ///
+        /// - 系統例外：  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "add_and_update_holiday_requiredShift",
+        ///   "Result": "Exception: 資料庫連線失敗"
+        /// }
+        /// ```
+        ///
+        /// ## 📑 注意事項
+        /// - <c>date</c> 為必填欄位，格式需為 yyyy-MM-dd。  
+        /// - <c>shift_group_guid</c> 必須為有效的班群 GUID。  
+        /// - <c>day_of_week</c> 可選填，若提供，需符合星期名稱 (Monday~Sunday)。  
+        /// - 系統會將班群內的 <c>workShiftRanges</c> 轉為當日需求班次 <c>workShiftRequirements</c>。  
+        /// - 若該日期已存在相同班群的 RequiredShift，則自動進行更新。  
+        /// - `required_count` 可省略，預設為 "1"。  
+        /// - 新增時由系統自動產生 GUID。  
+        /// </remarks>
+        /// <param name="returnData">統一封裝的請求與回應物件，需包含 Data (RequiredShiftClass) 與 ValueAry (day_of_week)</param>
+        /// <returns>JSON 格式的回應字串，包含新增或修改結果</returns>
+        [HttpPost("add_and_update_holiday_requiredShift")]
+        public string add_and_update_holiday_requiredShift([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "add_and_update_holiday_requiredShift";
+
+            try
+            {
+                // 解析參數
+                string GetVal(string key) =>
+                   returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string day_of_week = GetVal("day_of_week") ?? "";
+
+                // === 1. 基本檢核 ===
+                if (returnData.Data == null)
+                    return FailJson(returnData, -200, "Data 不能為空");
+
+                RequiredShiftClass input = returnData.Data.ObjToClass<RequiredShiftClass>();
+                if (input == null)
+                    return FailJson(returnData, -200, "Data 格式錯誤或無有效資料");
+
+                if (!string.IsNullOrWhiteSpace(day_of_week) && !day_of_week.Check_DayOfWeek_String())
+                    return FailJson(returnData, -200, "參數驗證失敗：day_of_week 格式錯誤");
+
+                var sql_RequiredShift = MethodClass.GetSQLControl<RequiredShiftClass>();
+                var sql_ScheduleDay = MethodClass.GetSQLControl<ScheduleDayClass>();
+                var sql_ShiftGroup = MethodClass.GetSQLControl<ShiftGroupClass>();
+                var datas_add = new List<RequiredShiftClass>();
+                var datas_update = new List<RequiredShiftClass>();
+
+                string date = input.date;
+                if (date.Check_Date_String() == false)
+                    return FailJson(returnData, -200, "參數驗證失敗：date 格式錯誤");
+
+                // === 2. 取得班群 ===
+                ShiftGroupClass shiftGroupClass = shiftGroup.GetShiftGroups(input.shift_group_guid);
+                if (shiftGroupClass == null)
+                    return FailJson(returnData, -200, "參數驗證失敗：shift_group_guid 格式錯誤");
+
+                // === 3. 檢查班群設定 ===
+                if (shiftGroupClass.workShiftRanges == null || shiftGroupClass.workShiftRanges.Count == 0)
+                    return FailJson(returnData, -200, $"該班群未設定任何班別，請先設定班表");
+
+                // ✅ (1) 確認班別中有資料 → 將其星期改成目前要加入的星期
+
+                shiftGroupClass.workShiftRanges = shiftGroupClass.workShiftRanges.Where(x => x.day.ToNormalizedWeekday() == day_of_week.ToNormalizedWeekday()).ToList();
+                var wsr = shiftGroupClass.workShiftRanges;
+                foreach (var range in wsr)
+                {
+                    range.day = date.StringToDateTime().DayOfWeek.ToString(); // 更新星期
+                }
+                shiftGroupClass.workShiftRanges = wsr;
+
+
+                // === 4. 確認 ScheduleDay 是否存在
+                date = date.StringToDateTime().ToDateString();
+                string sql = $"SELECT * FROM {sql_ScheduleDay.Database}.{sql_ScheduleDay.TableName} WHERE `date` = '{date}'";
+                DataTable dt = sql_ScheduleDay.WtrteCommandAndExecuteReader(sql);
+                if (dt.Rows.Count == 0)
+                {
+                    ScheduleDayClass scheduleDayClass = new ScheduleDayClass()
+                    {
+                        GUID = Guid.NewGuid().ToString(),
+                        date = date,
+                        created_at = DateTime.Now.ToDateTimeString_6(),
+                        updated_at = DateTime.Now.ToDateTimeString_6()
+                    };
+                    sql_ScheduleDay.AddRow(null, scheduleDayClass.ClassToSQL<ScheduleDayClass>());
+                }
+
+                // === 5. 新增或更新 RequiredShift ===
+                List<object[]> list_objects = sql_RequiredShift.GetRowsByDefult(null, new string[] { "shift_group_guid", "date" }, new string[] { input.shift_group_guid, date });
+
+                if (list_objects.Count == 0)
+                {
+                    // 新增
+                    input.GUID = Guid.NewGuid().ToString();
+                    input.created_at = DateTime.Now.ToDateTimeString_6();
+                    input.updated_at = DateTime.Now.ToDateTimeString_6();
+                    input.workShiftRequirements = shiftGroupClass.workShiftRanges.UpdateRequirements(new List<WorkShiftRequirementClass>());
+                    datas_add.Add(input);
+                }
+                else
+                {
+                    // 更新
+                    RequiredShiftClass requiredShift = list_objects[0].SQLToClass<RequiredShiftClass>();
+                    input.GUID = requiredShift.GUID;
+                    input.created_at = requiredShift.created_at;
+                    input.updated_at = DateTime.Now.ToDateTimeString_6();
+                    List<WorkShiftRequirementClass> workShiftRequirements = shiftGroupClass.workShiftRanges.UpdateRequirements(requiredShift.workShiftRequirements);
+                    workShiftRequirements = workShiftRequirements.UpdateRequirements(input.workShiftRequirements);
+                    input.workShiftRequirements = workShiftRequirements;
+                    datas_update.Add(input);
+                }
+
+                if (datas_add.Count > 0) sql_RequiredShift.AddRows(null, datas_add.ClassToSQL<RequiredShiftClass>());
+                if (datas_update.Count > 0) sql_RequiredShift.UpdateByDefulteExtra(null, datas_update.ClassToSQL<RequiredShiftClass>());
+
+                // === 6. 成功回傳 ===
+                returnData.Code = 200;
+                returnData.Result = $"新增({datas_add.Count})筆資料,修改({datas_update.Count})筆資料";
+                returnData.TimeTaken = $"{timer}";
+                returnData.Data = datas_add.Concat(datas_update).ToList();
+                return returnData.JsonSerializationt();
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
 
         /// <summary>
         /// 新增或更新每日需求班次 (RequiredShift)
@@ -828,7 +1247,7 @@ namespace PharmaRosterAPI
 
                     // ✅ 呼叫共用工具
                     ValidateAndAddOrUpdateAssignedShift(
-                        assignedShift, scheduleDay, staff, shift_group_guid,
+                        assignedShift, scheduleDay, staff, shiftGroups_buf[0],
                         assignedShifts_add, assignedShifts_update,
                         histories_add, histories_update,
                         output, validationErrors
@@ -1132,6 +1551,150 @@ namespace PharmaRosterAPI
             }
         }
 
+        
+        [HttpPost("download_monthly_shift_schedule_pdf")]
+        public IActionResult download_procurement_pdf([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "download_monthly_shift_schedule_pdf";
+
+            try
+            {
+                if (returnData.Data == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "Data 不能為空";
+                    return new JsonResult(returnData);
+                }
+
+                // 解析參數
+                string GetVal(string key) =>
+                   returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string year_month = GetVal("year_month") ?? "";
+                if(string.IsNullOrEmpty(year_month))
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "參數驗證失敗：year_month 為必填";
+                    return new JsonResult(returnData);
+                }
+                if (!Check_YearMonth_String(year_month))
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "參數驗證失敗：year_month 格式錯誤";
+                    return new JsonResult(returnData);
+                }
+
+
+                SheetClass sheet = monthly_shift_schedule_xlsx.xlsx.JsonDeserializet<SheetClass>();
+                
+
+
+
+                byte[] bytes_pdf = sheet.SaveToPDF(PdfSharp.PageSize.A4, PdfSharp.PageOrientation.Landscape);
+
+                Stream stream = new MemoryStream(bytes_pdf);
+
+
+                string contentType = "application/octet-stream";
+
+                // 原始檔名（可能有中文）
+                string originalName = $"123.pdf";
+
+
+
+                // UTF-8 檔名（正確編碼）
+                string utf8FileName = Uri.EscapeDataString(originalName);
+
+                // 設定 Content-Disposition header
+                Response.Headers.Add("Content-Disposition", $"attachment; filename=\"{originalName}\"; filename*=UTF-8''{utf8FileName}");
+
+                // 確保前端能讀到 header
+                Response.Headers.Add("Access-Control-Expose-Headers", "Content-Disposition, Content-Length, Content-Type");
+
+                return File(stream, contentType);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return new JsonResult(returnData);
+            }
+        }
+
+        /// <summary>
+        /// 檢查字串是否為合法的「yyyy-MM」格式，例如 "2025-10"
+        /// </summary>
+        /// <param name="input">輸入字串</param>
+        /// <returns>合法回傳 true，否則 false</returns>
+        public static bool Check_YearMonth_String(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input)) return false;
+
+            // 僅允許 "yyyy-MM" 格式
+            if (!System.Text.RegularExpressions.Regex.IsMatch(input, @"^\d{4}-(0[1-9]|1[0-2])$"))
+                return false;
+
+            try
+            {
+                // 嘗試轉換為 DateTime 確保有效
+                DateTime.ParseExact(input + "-01", "yyyy-MM-dd", null);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+
+        [HttpPost("auto_schedule")]
+        public async Task<string> auto_schedule([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "auto_schedule";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string shift_group_guid = GetVal("shift_group_guid") ?? "";
+
+                if (shift_group_guid == "")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "參數驗證失敗：shift_group_guid 為必填";
+                    return returnData.JsonSerializationt();
+                }
+
+                // 取得群組
+                ShiftGroupClass shiftGroupClass = shiftGroup.GetShiftGroups(shift_group_guid);
+                if (shiftGroupClass == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "參數驗證失敗：找不到對應的 shift_group_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                // === 🚩 如果是小夜班 → 直接切換呼叫 auto_schedule_swing ===
+                if (shiftGroupClass.shift_type == ShiftTypeEnum.swing.GetEnumName() && shiftGroupClass.group_name.Contains("中藥") == false)
+                {
+                    return await auto_schedule_lastswing(returnData);
+                }
+
+                // === 其它班別照舊 ===
+                return await auto_schedule_generic(returnData);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = $"Exception: {ex.Message}";
+                return returnData.JsonSerializationt();
+            }
+        }
 
 
         /// <summary>
@@ -1245,11 +1808,11 @@ namespace PharmaRosterAPI
         /// </remarks>
         /// <param name="returnData">統一封裝的請求物件，需包含 ValueAry (日期範圍、shift_group_guid、mode)</param>
         /// <returns>JSON 格式的回應字串，包含排班結果或錯誤訊息</returns>
-        [HttpPost("auto_schedule")]
-        public async Task<string> auto_schedule([FromBody] returnData returnData)
+        [HttpPost("auto_schedule_generic")]
+        public async Task<string> auto_schedule_generic([FromBody] returnData returnData)
         {
             var timer = new MyTimerBasic();
-            returnData.Method = "auto_schedule";
+            returnData.Method = "auto_schedule_generic";
 
             try
             {
@@ -1293,24 +1856,10 @@ namespace PharmaRosterAPI
                 // 3. 取得歷史紀錄
                 var dt_scheduleHistory = await sql_scheduleHistory.WtrteCommandAndExecuteReaderAsync(
                     $"SELECT * FROM {sql_scheduleHistory.Database}.{sql_scheduleHistory.TableName} WHERE status = '正常'");
-                var scheduleHistorys = dt_scheduleHistory.DataTableToRowList()
-                    .SQLToClass<StaffScheduleHistoryClass>() ?? new List<StaffScheduleHistoryClass>();
+                var scheduleHistorys = dt_scheduleHistory.DataTableToRowList().SQLToClass<StaffScheduleHistoryClass>() ?? new List<StaffScheduleHistoryClass>();
 
-                scheduleHistorys = scheduleHistorys
-                    .Where(x => x.shift_group_guid == shift_group_guid)
-                    .ToList();
-
-                // 4. 更新群組成員的 weight
-                var keypairs_scheduleHistorys = scheduleHistorys.CoverToDictionaryBy_staff_guid();
-                foreach (var member in shiftGroupClass.Members)
-                {
-                    var scheduleHistorys_buf = keypairs_scheduleHistorys.SortDictionaryBy_staff_guid(member.staff_guid);
-                    if (scheduleHistorys_buf.Count > 0)
-                    {
-                        member.weight = (member.weight.StringToUInt32() + scheduleHistorys_buf.Count).ToString();
-                    }
-                }
-                shiftGroupClass.Members = shiftGroupClass.Members.SortByWeightAndOrderIndex();
+                // 4. 取得請假紀錄
+                var leaveRequests = leaveRequest.GetLeaveRequests();
 
                 // 5. 準備輸出與 DB 批次集合
                 var assignedShifts_add = new List<AssignedShiftClass>();
@@ -1324,69 +1873,51 @@ namespace PharmaRosterAPI
                         .Where(x => x.shift_group_guid == shift_group_guid)
                         .ToList();
 
+                    if (day.RequiredShifts.Count == 0) continue;
+
                     foreach (var req in day.RequiredShifts)
                     {
                         req.shift_group = new ShiftGroupClass();
+                        req.date = req.date.StringToDateTime().ToDateString('-');
+
+                     
 
                         foreach (var wr in req.workShiftRequirements.OrderBy(x => x.TimeRange.Value.start))
                         {
-                            int requiredCount = wr.required_count.StringToInt32();
-                            int assignedCount = wr.assigned_count.StringToInt32();
+                            // 先處理成員排序
 
-                            while (assignedCount < requiredCount)
+                            if (shiftGroupClass.shift_type == ShiftTypeEnum.swing.GetEnumName())
                             {
-                                var candidate = shiftGroupClass.Members.FirstOrDefault();
-                                if (candidate == null) break;
 
-                                StaffClass staff = candidate.staff_info;
-                                if (staff == null) break;
+                                PrepareShiftGroupMembers(shiftGroupClass, scheduleHistorys);
 
-                                var newHistory = new StaffScheduleHistoryClass
-                                {
-                                    GUID = Guid.NewGuid().ToString(),
-                                    staff_guid = staff.GUID,
-                                    date = req.date,
-                                    time = wr.time,
-                                    department = wr.department,
-                                    req_shift_guid = req.GUID,
-                                    shift_group_guid = shift_group_guid,
-                                    created_at = DateTime.Now.ToDateTimeString_6(),
-                                    updated_at = DateTime.Now.ToDateTimeString_6(),
-                                    status = "正常",
-                                    source = "自動排班"
-                                };
+                                AssignSwingShift(shiftGroupClass, req, wr, scheduleHistorys,
+                                    assignedShifts_add, histories_add, validationErrors,
+                                    leaveRequests, shift_group_guid);
+                            }
+                            else if (shiftGroupClass.shift_type == ShiftTypeEnum.midnight.GetEnumName())
+                            {
+                                PrepareShiftGroupMembers(shiftGroupClass, scheduleHistorys);
 
-                                var validation = ScheduleValidator.ValidateSchedule(staff, newHistory);
-                                if (!validation.isValid)
-                                {
-                                    validationErrors.Add($"[{staff.staff_name}] {req.date} {wr.time} → {validation.message}");
-                                    shiftGroupClass.Members.Remove(candidate);
-                                    shiftGroupClass.Members.Add(candidate);
-                                    continue;
-                                }
+                                AssignMidnightShift(shiftGroupClass, req, wr, scheduleHistorys,
+                                    assignedShifts_add, histories_add, validationErrors,
+                                    leaveRequests, shift_group_guid);
+                            }
+                            else if (shiftGroupClass.shift_type == ShiftTypeEnum.day.GetEnumName())
+                            {
+                                PrepareShiftGroupMembers(shiftGroupClass, scheduleHistorys);
 
-                                var assignedShift = new AssignedShiftClass
-                                {
-                                    GUID = Guid.NewGuid().ToString(),
-                                    date = req.date,
-                                    staff_guid = staff.GUID,
-                                    req_shift_guid = req.GUID,
-                                    shift_requirement = JsonSerializer.Serialize(wr),
-                                    created_at = DateTime.Now.ToDateTimeString_6(),
-                                    updated_at = DateTime.Now.ToDateTimeString_6(),
-                                    status = "正常",
-                                    staff = staff
-                                };
-                                assignedShifts_add.Add(assignedShift);
+                                AssignHolidayShift(shiftGroupClass, req, wr, scheduleHistorys,
+                                    assignedShifts_add, histories_add, validationErrors,
+                                    leaveRequests, shift_group_guid);
+                            }
+                            else if (shiftGroupClass.shift_type == ShiftTypeEnum.holiday.GetEnumName())
+                            {
+                                PrepareShiftGroupMembers(shiftGroupClass, scheduleHistorys);
 
-                                newHistory.assigned_shift_guid = assignedShift.GUID;
-                                histories_add.Add(newHistory);
-
-                                assignedCount++;
-                                wr.assigned_count = assignedCount.ToString();
-
-                                shiftGroupClass.Members.Remove(candidate);
-                                shiftGroupClass.Members.Add(candidate);
+                                AssignHolidayShift(shiftGroupClass, req, wr, scheduleHistorys,
+                                    assignedShifts_add, histories_add, validationErrors,
+                                    leaveRequests, shift_group_guid);
                             }
                         }
                     }
@@ -1410,8 +1941,9 @@ namespace PharmaRosterAPI
 
                 if (validationErrors.Count > 0)
                 {
-                    returnData.Code = -200;
+                    returnData.Code = 200;
                     returnData.Result = "部分排班檢核失敗：\n" + string.Join("\n", validationErrors);
+                    returnData.AddExtra("validationErrors", validationErrors);
                 }
                 else
                 {
@@ -1430,6 +1962,1251 @@ namespace PharmaRosterAPI
                 return returnData.JsonSerializationt();
             }
         }
+
+
+
+        [HttpPost("auto_schedule_lastswing")]
+        public async Task<string> auto_schedule_lastswing([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "auto_schedule_lastswing";
+
+            try
+            {
+                var sql_scheduleHistory = MethodClass.GetSQLControl<StaffScheduleHistoryClass>();
+                var sql_assignedShift = MethodClass.GetSQLControl<AssignedShiftClass>();
+
+                string GetVal(string key) =>
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string date_start = GetVal("date_start") ?? "";
+                string date_end = GetVal("date_end") ?? "";
+                string shift_group_guid = GetVal("shift_group_guid") ?? "";
+                string mode = (GetVal("mode") ?? "preview").ToLower();
+
+                if (string.IsNullOrWhiteSpace(date_start) || string.IsNullOrWhiteSpace(date_end))
+                    return FailJson(returnData, -200, "參數驗證失敗：date_start, date_end 為必填");
+                if (string.IsNullOrWhiteSpace(shift_group_guid))
+                    return FailJson(returnData, -200, "參數驗證失敗：shift_group_guid 為必填");
+
+                var assignedShifts_add_result = new List<AssignedShiftClass>();
+                var histories_add_result = new List<StaffScheduleHistoryClass>();
+                for(int i = 0; i < new AssignType().GetLength(); i++)
+                {
+                    while (true)
+                    {
+                        // 1) 取得群組（必須是小夜）
+                        ShiftGroupClass shiftGroupClass = shiftGroup.GetShiftGroups(shift_group_guid);
+                        if (shiftGroupClass == null || shiftGroupClass.shift_type != ShiftTypeEnum.swing.GetEnumName())
+                            return FailJson(returnData, -200, "參數驗證失敗：shift_group_guid 不是小夜班群組");
+
+                        // 2) 取得排班日
+                        List<ScheduleDayClass> scheduleDays = await GetSchedulesDayAsync(date_start, date_end);
+
+                        // 3) 取得歷史
+                        var dt_scheduleHistory = await sql_scheduleHistory.WtrteCommandAndExecuteReaderAsync(
+                            $"SELECT * FROM {sql_scheduleHistory.Database}.{sql_scheduleHistory.TableName} WHERE status = '正常'");
+                        var scheduleHistorys = dt_scheduleHistory.DataTableToRowList().SQLToClass<StaffScheduleHistoryClass>()
+                                               ?? new List<StaffScheduleHistoryClass>();
+
+                        // 4) 請假
+                        var leaveRequests = leaveRequest.GetLeaveRequests();
+
+                        // 5) 輸出集合
+                        var assignedShifts_add = new List<AssignedShiftClass>();
+                        var histories_add = new List<StaffScheduleHistoryClass>();
+                        var validationErrors = new List<string>();
+
+                        // 1. 先抽出所有 slot
+                        var allSlots = ExtractAllSlots(scheduleDays, shift_group_guid);
+                        int totalBase = GetTotalRequiredCount(scheduleDays, shift_group_guid);
+
+                        AssignBaseShifts((AssignType)i, allSlots, totalBase, shiftGroupClass, scheduleHistorys, assignedShifts_add, histories_add, validationErrors, leaveRequests, shift_group_guid);
+
+                        if (assignedShifts_add.Count > 0) sql_assignedShift.AddRows(null, assignedShifts_add.ClassToSQL<AssignedShiftClass>());
+                        if (histories_add.Count > 0) sql_scheduleHistory.AddRows(null, histories_add.ClassToSQL<StaffScheduleHistoryClass>());
+
+                        assignedShifts_add_result.LockAdd(assignedShifts_add);
+                        histories_add_result.LockAdd(histories_add);
+
+                        if (assignedShifts_add.Count == 0) break;
+
+                    }
+                }
+             
+
+
+
+
+
+
+
+                returnData.Code = 200;
+                returnData.Result = $"小夜班自動排班完成，新增 {assignedShifts_add_result.Count} 筆排班，新增 {histories_add_result.Count} 筆歷程";
+                //returnData.Data = scheduleDays;
+                returnData.TimeTaken = $"{timer}";
+                return returnData.JsonSerializationt();
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = $"Exception: {ex.Message}";
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        private List<List<NightSlot>> WenToSat(List<NightSlot> baseSlots ,DateTime dt)
+        {
+            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
+            List<NightSlot> _baseSlots = new List<NightSlot>();
+            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
+
+            List<DateTime> dates_slots = new List<DateTime>();
+            List<string> times_slots = new List<string>();
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[1], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[1], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[1], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+
+      
+    
+    
+
+
+            return list_baseSlots;
+        }
+        private List<List<NightSlot>> SunToWen(List<NightSlot> baseSlots, DateTime dt)
+        {
+            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
+            List<NightSlot> _baseSlots = new List<NightSlot>();
+            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
+
+            List<DateTime> dates_slots = new List<DateTime>();
+            List<string> times_slots = new List<string>();
+
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[1], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[2], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[2], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[3], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[3], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[3], timeRamges[2] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[1], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[1], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[1], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+
+
+
+
+
+
+            return list_baseSlots;
+        }
+
+        private List<List<NightSlot>> Normal_4_Days(List<NightSlot> baseSlots, DateTime dt)
+        {
+            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
+            List<NightSlot> _baseSlots = new List<NightSlot>();
+            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
+
+            List<DateTime> dates_slots = new List<DateTime>();
+            List<string> times_slots = new List<string>();
+
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[1], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[2], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[2], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[3], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[3], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[3], timeRamges[2] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[1], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[2], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[2], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[3], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[3], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[3], timeRamges[2] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[1], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[1], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[1], timeRamges[0], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+
+
+
+
+
+
+            return list_baseSlots;
+        }
+        private List<List<NightSlot>> Normal_3_Days(List<NightSlot> baseSlots, DateTime dt)
+        {
+            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
+            List<NightSlot> _baseSlots = new List<NightSlot>();
+            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
+            List<DateTime> dates_slots = new List<DateTime>();
+            List<string> times_slots = new List<string>();
+
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[2] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[4] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[4] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[4] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[1], timeRamges[4] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[1], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+            return list_baseSlots;
+        }
+        private List<List<NightSlot>> Normal_2_Days(List<NightSlot> baseSlots, DateTime dt)
+        {
+            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
+            List<NightSlot> _baseSlots = new List<NightSlot>();
+            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
+            List<DateTime> dates_slots = new List<DateTime>();
+            List<string> times_slots = new List<string>();
+
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[2] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[4], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[1], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[2], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[2], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[2] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
+            times_slots = new List<string>() { timeRamges[3], timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            return list_baseSlots;
+        }
+        private List<List<NightSlot>> Normal_1_Days(List<NightSlot> baseSlots, DateTime dt)
+        {
+            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
+            List<NightSlot> _baseSlots = new List<NightSlot>();
+            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
+            List<DateTime> dates_slots = new List<DateTime>();
+            List<string> times_slots = new List<string>();
+
+
+            dates_slots = new List<DateTime>() { dt };
+            times_slots = new List<string>() { timeRamges[4] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt };
+            times_slots = new List<string>() { timeRamges[3] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt };
+            times_slots = new List<string>() { timeRamges[2] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt };
+            times_slots = new List<string>() { timeRamges[1] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            dates_slots = new List<DateTime>() { dt };
+            times_slots = new List<string>() { timeRamges[0] };
+            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
+            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
+            return list_baseSlots;
+        }
+
+        public enum AssignType
+        {
+            holiday,
+            continu_nor,
+            nor
+        }
+        /// <summary>
+        /// 基礎班分配：每人直接連續排到達到平均需求數量 (需符合驗證條件)
+        /// </summary>
+        private void AssignBaseShifts(AssignType assignType , List<NightSlot> allSlots,int totalBase,  ShiftGroupClass shiftGroupClass,  List<StaffScheduleHistoryClass> scheduleHistorys, List<AssignedShiftClass> assignedShifts_add,
+                                       List<StaffScheduleHistoryClass> histories_add, List<string> validationErrors, List<LeaveRequestClass> leaveRequests, string shift_group_guid)
+        {
+            List<AssignedShiftClass> assignedShifts_add_buf = new List<AssignedShiftClass>();
+            List<StaffScheduleHistoryClass> histories_add_buf = new List<StaffScheduleHistoryClass>();
+            var baseSlots = allSlots;
+            if (baseSlots == null || baseSlots.Count == 0) return;
+
+          
+            int staffCount = Math.Max(1, shiftGroupClass.Members.Count);
+            int avgLimit = (int)Math.Ceiling(totalBase / (double)staffCount);
+
+            // 紀錄每人已排數量
+            var baseCount = new Dictionary<string, int>();
+
+            // 照 weight / order_index 排人員
+            var orderedMembers = shiftGroupClass.Members
+                .OrderBy(m => m.weight.StringToInt32())
+                .ThenBy(m => m.order_index.StringToInt32())
+                .ToList();
+
+            baseSlots = baseSlots
+             .OrderBy(s => s.Date)
+             .ThenBy(s => GetShiftPriority(s.Start.ToString("HH:mm")))
+             .ToList();
+
+
+            var dates = baseSlots.GetDateStringsFromSlots();
+            foreach (var date in dates)
+            {
+                DateTime dt = date.StringToDateTime();
+                var slotsOnDate = baseSlots.Where(s => s.Date.StringToDateTime().ToDateString('-') == date).ToList();
+                PrepareShiftGroupMembers(shiftGroupClass, scheduleHistorys);
+
+
+
+                List<DateTime> dates_slots = new List<DateTime>();
+                List<string> times_slots = new List<string>();
+                List<List<NightSlot>> _baseSlots = new List<List<NightSlot>>();
+
+
+                while (true)
+                {
+                    if (dt.DayOfWeek == DayOfWeek.Wednesday)
+                    {
+                        if(assignType == AssignType.holiday)
+                        {
+                            _baseSlots.LockAdd(WenToSat(baseSlots, dt));
+                        }
+                        if(assignType == AssignType.continu_nor)
+                        {
+                            _baseSlots.LockAdd(Normal_3_Days(baseSlots, dt));
+                            _baseSlots.LockAdd(Normal_2_Days(baseSlots, dt));
+                        }
+                        if(assignType == AssignType.nor)
+                        {
+                            _baseSlots.LockAdd(Normal_1_Days(baseSlots, dt));
+                        }
+
+                        break;
+                    }
+                    else if (dt.DayOfWeek == DayOfWeek.Sunday)
+                    {
+                        if (assignType == AssignType.holiday)
+                        {
+                            _baseSlots.LockAdd(SunToWen(baseSlots, dt));
+                            _baseSlots.LockAdd(Normal_3_Days(baseSlots, dt));
+                            _baseSlots.LockAdd(Normal_2_Days(baseSlots, dt));
+                        }
+                   
+                        break;
+                    }
+                    else if (dt.DayOfWeek == DayOfWeek.Saturday)
+                    {
+                        if (assignType == AssignType.nor)
+                        {
+                            _baseSlots.LockAdd(Normal_1_Days(baseSlots, dt));
+                        }
+                        break;
+                    }
+                    else if (dt.DayOfWeek == DayOfWeek.Monday)
+                    {
+                        if (assignType == AssignType.continu_nor)
+                        {
+                            _baseSlots.LockAdd(Normal_4_Days(baseSlots, dt));
+                            _baseSlots.LockAdd(Normal_3_Days(baseSlots, dt));
+                            _baseSlots.LockAdd(Normal_2_Days(baseSlots, dt));
+                        }
+                        if (assignType == AssignType.nor)
+                        {
+                            _baseSlots.LockAdd(Normal_1_Days(baseSlots, dt));
+                        }
+                        break;
+                    }
+                    else if (dt.DayOfWeek == DayOfWeek.Tuesday)
+                    {
+                        if (assignType == AssignType.continu_nor)
+                        {
+                            _baseSlots.LockAdd(Normal_4_Days(baseSlots, dt));
+                            _baseSlots.LockAdd(Normal_3_Days(baseSlots, dt));
+                            _baseSlots.LockAdd(Normal_2_Days(baseSlots, dt));
+                        }
+
+                        if (assignType == AssignType.nor)
+                        {
+                            _baseSlots.LockAdd(Normal_1_Days(baseSlots, dt));
+                        }
+
+                        break;
+                    }
+                    else if (dt.DayOfWeek == DayOfWeek.Thursday)
+                    {
+                        if (assignType == AssignType.holiday)
+                        {
+                            _baseSlots.LockAdd(Normal_3_Days(baseSlots, dt));
+                            _baseSlots.LockAdd(Normal_2_Days(baseSlots, dt));
+                        }               
+                        if (assignType == AssignType.nor)
+                        {
+                            _baseSlots.LockAdd(Normal_1_Days(baseSlots, dt));
+                        }
+                        break;
+                    }
+                    else if (dt.DayOfWeek == DayOfWeek.Friday)
+                    {
+                        if (assignType == AssignType.holiday)
+                        {
+                            _baseSlots.LockAdd(Normal_2_Days(baseSlots, dt));
+                        }
+                        if (assignType == AssignType.nor)
+                        {
+                            _baseSlots.LockAdd(Normal_1_Days(baseSlots, dt));
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                foreach (var member in shiftGroupClass.Members)
+                {
+                    
+                    foreach (List<NightSlot> slotList in _baseSlots)
+                    {
+
+                        StaffClass staff = member.staff_info;
+
+                        List<StaffScheduleHistoryClass> historyClasses = staff.scheduleHistories.FindByMonthAndShiftType(dates[0].StringToDateTime().Year, dates[0].StringToDateTime().Month, ShiftTypeEnum.swing.GetEnumName());
+
+                        if (historyClasses.Count + slotList.Count > avgLimit)
+                        {
+                            continue;
+                        }
+                        if (staff == null) continue;
+
+                        if (slotList == null || slotList.Count == 0) continue;
+                        bool flag_canAssign = true;
+                        foreach (var slot in slotList)
+                        {
+                            var wr = slot.Wr;
+                            var req = slot.Req;
+                            if (slot.AssignedCount >= slot.RequiredCount) continue;
+
+
+                            var newHistory = new StaffScheduleHistoryClass
+                            {
+                                GUID = Guid.NewGuid().ToString(),
+                                staff_guid = staff.GUID,
+                                date = req.date,
+                                time = wr.time,
+                                department = wr.department,
+                                req_shift_guid = req.GUID,
+                                shift_group_guid = shift_group_guid,
+                                shift_type = shiftGroupClass.shift_type,
+                                created_at = DateTime.Now.ToDateTimeString_6(),
+                                updated_at = DateTime.Now.ToDateTimeString_6(),
+                                status = "正常",
+                                source = "自動排班"
+                            };
+
+                            var validation = ScheduleValidator.ValidateSchedule(staff, newHistory);
+                            if (!validation.isValid)
+                            {
+                                flag_canAssign = false;
+                                break;
+                            }
+                            if (leaveRequests.HasLeaveOnDate(staff.GUID, req.date))
+                            {
+                                flag_canAssign = false;
+                                break;
+                            }
+
+                            // 成功指派
+                            var assignedShift = new AssignedShiftClass
+                            {
+                                GUID = Guid.NewGuid().ToString(),
+                                date = req.date,
+                                staff_guid = staff.GUID,
+                                req_shift_guid = req.GUID,
+                                shift_requirement = JsonSerializer.Serialize(slot.Wr),
+                                created_at = DateTime.Now.ToDateTimeString_6(),
+                                updated_at = DateTime.Now.ToDateTimeString_6(),
+                                status = "正常",
+                                staff = staff
+                            };
+                         
+                            assignedShifts_add_buf.Add(assignedShift);
+                            newHistory.assigned_shift_guid = assignedShift.GUID;
+                            histories_add_buf.Add(newHistory);
+                            scheduleHistorys.Add(newHistory);
+                            staff.scheduleHistories.Add(newHistory);
+
+
+
+                        }
+                        if (flag_canAssign)
+                        {
+                            assignedShifts_add.LockAdd(assignedShifts_add_buf);
+                            histories_add.LockAdd(histories_add_buf);
+                            assignedShifts_add_buf.Clear();
+                            histories_add_buf.Clear();
+                            foreach (var slot in slotList)
+                            {
+                                slot.AssignedCount++;
+                                slot.Wr.assigned_count = slot.AssignedCount.ToString();
+                            }
+                            break;
+                        }
+                        else
+                        {
+                            assignedShifts_add_buf.Clear();
+                            histories_add_buf.Clear();
+
+                        }
+                    }
+
+
+                    continue;
+
+
+
+                }
+            }
+            return;
+
+        }
+        /// <summary>
+        /// 在基礎班分配完成後，幫同一個人接續排連續班
+        /// </summary>
+        private void AssignContinuousShifts(
+            List<NightSlot> allSlots,
+            List<AssignedShiftClass> assignedShifts_add,
+            List<StaffScheduleHistoryClass> histories_add,
+            List<StaffScheduleHistoryClass> scheduleHistorys,
+            List<string> validationErrors,
+            List<LeaveRequestClass> leaveRequests,
+            string shift_group_guid,
+            ShiftGroupClass shiftGroupClass)
+        {
+            // 只抓不是基礎班的 slot (14:30、13:30…)
+            var continuousSlots = allSlots
+                .Where(s => !s.IsBase)
+                .OrderBy(s => s.Date)
+                .ThenBy(s => GetShiftPriority(s.Start.ToString("HH:mm"))) // 用剛才的優先權函式
+                .ToList();
+
+            string[] staffs_guid = histories_add
+                .Where(h => h.shift_group_guid == shift_group_guid)
+                .Select(h => h.staff_guid)
+                .Distinct()
+                .ToArray();
+            foreach(var guid in staffs_guid)
+            {
+                List<StaffScheduleHistoryClass> historys = histories_add.Where(h => h.staff_guid == guid && h.shift_group_guid == shift_group_guid).Select(h => h).ToList();
+            }
+            foreach (var history in histories_add.Where(h => h.shift_group_guid == shift_group_guid))
+            {
+                var staffGuid = history.staff_guid;
+                var staff = shiftGroupClass.Members.FirstOrDefault(m => m.staff_guid == staffGuid)?.staff_info;
+                if (staff == null) continue;
+
+                // 從該基礎班的日期開始往後找連續班
+                var baseDate = history.date.StringToDateTime();
+
+                foreach (var slot in continuousSlots)
+                {
+                    if (slot.AssignedCount >= slot.RequiredCount) continue;
+
+                    // 必須是「比基礎班更早的時段」→ 例如 Day2:15:30, Day3:14:30…
+                    if (slot.Date <= baseDate) continue;
+
+                    // 已經在當日有班 → 跳過
+                    bool alreadyAssignedToday = histories_add.Any(h =>
+                        h.staff_guid == staffGuid && h.date == slot.Date.ToDateString('-'));
+                    if (alreadyAssignedToday) continue;
+
+                    // 檢查驗證條件
+                    var newHistory = new StaffScheduleHistoryClass
+                    {
+                        GUID = Guid.NewGuid().ToString(),
+                        staff_guid = staff.GUID,
+                        date = slot.Date.ToDateString('-'),
+                        time = slot.Wr.time,
+                        department = slot.Wr.department,
+                        req_shift_guid = slot.Req.GUID,
+                        shift_group_guid = shift_group_guid,
+                        shift_type = shiftGroupClass.shift_type,
+                        created_at = DateTime.Now.ToDateTimeString_6(),
+                        updated_at = DateTime.Now.ToDateTimeString_6(),
+                        status = "正常",
+                        source = "自動排班"
+                    };
+
+                    var validation = ScheduleValidator.ValidateSchedule(staff, newHistory);
+                    if (!validation.isValid)
+                    {
+                        validationErrors.Add($"[{staff.staff_name}] {slot.Date} {slot.Wr.time} → {validation.message}");
+                        continue;
+                    }
+
+                    if (leaveRequests.HasLeaveOnDate(staff.GUID, slot.Date.ToDateString('-')))
+                    {
+                        validationErrors.Add($"[{staff.staff_name}] {slot.Date} {slot.Wr.time} → 該日有請假紀錄");
+                        continue;
+                    }
+
+                    // 成功指派
+                    var assignedShift = new AssignedShiftClass
+                    {
+                        GUID = Guid.NewGuid().ToString(),
+                        date = slot.Date.ToDateString('-'),
+                        staff_guid = staff.GUID,
+                        req_shift_guid = slot.Req.GUID,
+                        shift_requirement = JsonSerializer.Serialize(slot.Wr),
+                        created_at = DateTime.Now.ToDateTimeString_6(),
+                        updated_at = DateTime.Now.ToDateTimeString_6(),
+                        status = "正常",
+                        staff = staff
+                    };
+
+                    assignedShifts_add.Add(assignedShift);
+                    newHistory.assigned_shift_guid = assignedShift.GUID;
+                    histories_add.Add(newHistory);
+                    scheduleHistorys.Add(newHistory);
+
+                    slot.AssignedCount++;
+                    slot.Wr.assigned_count = slot.AssignedCount.ToString();
+
+                    // 👉 每人只接一個連續班，然後停
+                    break;
+                }
+            }
+        }
+
+
+
+        private (List<DateTime> dateTimes , List<string> timeRanges) GetAllDateTimesAndTimeRanges(DateTime date_start)
+        {
+            var dates = new List<DateTime>();
+            var times = new List<string>();
+            
+
+            return (dates, times);
+        }
+
+
+        // ─────────────────────────────────────────────────────────────
+        // 2) 抽出所有小夜班 slot（人數攤平 + 跨日處理 + 判斷是否「最後班」）
+        //    只會抽出 shift_group_guid 相符的需求
+        // ─────────────────────────────────────────────────────────────
+        private List<NightSlot> ExtractAllNightSlots(List<ScheduleDayClass> scheduleDays, string shift_group_guid)
+        {
+            var slots = new List<NightSlot>();
+
+            if (scheduleDays == null) return slots;
+
+            foreach (var day in scheduleDays)
+            {
+                // day.RequiredShifts 可能包含不同群組，先過濾
+                foreach (var req in day.RequiredShifts.Where(r => r.shift_group_guid == shift_group_guid))
+                {
+                    // 以 req.date 為準建立日期
+                    var d = req.date.StringToDateTime();
+
+                    if (req.workShiftRequirements == null) continue;
+
+                    foreach (var wr in req.workShiftRequirements)
+                    {
+                        // 安全拿到 TimeRange，若為 null 則以 0:0 視為占位
+                        var tr = wr.TimeRange ?? default;
+                        var start = d.Add(tr.start);
+                        var end = d.Add(tr.end);
+
+                        // 跨日處理：如 00:00、或 end <= start，視為隔日
+                        if (wr.time != null && IsLastShiftOfDay(wr.time))
+                        {
+                            // 以文字定義的「最後班」優先判斷：結束時間應跨日
+                            if (end <= start) end = end.AddDays(1);
+                            if (end.TimeOfDay == TimeSpan.Zero) end = end.AddDays(1);
+                        }
+                        else
+                        {
+                            // 一般保護：若 end <= start，也視為跨日
+                            if (end <= start) end = end.AddDays(1);
+                        }
+
+                        // 需求攤平：RequiredCount 幾人就拆幾個 slot
+                        int need = wr.required_count.StringToInt32();
+                        if (need < 1) need = 1; // 保底
+
+                        bool isBase = IsLastShiftOfDay(wr.time)
+                                      || tr.end == TimeSpan.Zero
+                                      || tr.end >= new TimeSpan(23, 59, 0);
+
+                        for (int i = 0; i < need; i++)
+                        {
+                            slots.Add(new NightSlot
+                            {
+                                Date = d,
+                                Time = wr.time,
+                                RequiredCount = 1,       // 攤平為 1
+                                AssignedCount = 0,
+                                Req = req,
+                                Wr = wr,
+                                IsBase = isBase,
+                                Start = start,
+                                End = end
+                            });
+                        }
+                    }
+                }
+            }
+
+            return slots;
+        }
+        /// <summary>
+        /// 抽出所有班次 slot（人數攤平 + 跨日處理）
+        /// 不論是不是最後班都會取出
+        /// </summary>
+        /// <summary>
+        /// 抽出所有班次 slot（依據需求人數 - 已指派人數 攤平）
+        /// 只會抽出 shift_group_guid 相符的需求
+        /// </summary>
+        private List<NightSlot> ExtractAllSlots(List<ScheduleDayClass> scheduleDays, string shift_group_guid)
+        {
+            var slots = new List<NightSlot>();
+            if (scheduleDays == null) return slots;
+
+            foreach (var day in scheduleDays)
+            {
+                foreach (var req in day.RequiredShifts.Where(r => r.shift_group_guid == shift_group_guid))
+                {
+                    if (req.workShiftRequirements == null) continue;
+                    var d = req.date.StringToDateTime();
+
+                    foreach (var wr in req.workShiftRequirements)
+                    {
+                        // --- 安全取 TimeRange ---
+                        var tr = wr.TimeRange ?? default;
+                        var start = d.Add(tr.start);
+                        var end = d.Add(tr.end);
+
+                        // --- 處理跨日（結束時間 <= 開始時間 時）---
+                        if (end <= start)
+                            end = end.AddDays(1);
+
+                        // --- 計算剩餘可排人數 ---
+                        int requiredCount = wr.required_count.StringToInt32();
+                        int assignedCount = wr.assigned_count.StringToInt32();
+                        int remaining = Math.Max(0, requiredCount - assignedCount);
+
+                        // 沒有剩餘需求就跳過
+                        if (remaining == 0) continue;
+
+                        // --- 攤平剩餘需求 ---
+                        for (int i = 0; i < remaining; i++)
+                        {
+                            slots.Add(new NightSlot
+                            {
+                                Date = d,
+                                Time = wr.time,
+                                RequiredCount = 1,
+                                AssignedCount = 0,
+                                Req = req,
+                                Wr = wr,
+                                Start = start,
+                                End = end,
+                                IsBase = IsLastShiftOfDay(wr.time)
+                                          || tr.end == TimeSpan.Zero
+                                          || tr.end >= new TimeSpan(23, 59, 0)
+                            });
+                        }
+                    }
+                }
+            }
+
+            return slots;
+        }
+        /// <summary>
+        /// 計算指定班別群組 (shift_group_guid) 在整個日期範圍內的需求人數總和
+        /// </summary>
+        /// <param name="scheduleDays">排班日清單</param>
+        /// <param name="shift_group_guid">班別群組 GUID</param>
+        /// <returns>需求人數總和 (不扣已指派)</returns>
+        public static int GetTotalRequiredCount(
+            List<ScheduleDayClass> scheduleDays,
+            string shift_group_guid)
+        {
+            if (scheduleDays == null || scheduleDays.Count == 0) return 0;
+            if (string.IsNullOrWhiteSpace(shift_group_guid)) return 0;
+
+            return scheduleDays
+                .SelectMany(day => day.RequiredShifts
+                    .Where(req => req.shift_group_guid == shift_group_guid)
+                    .SelectMany(req => req.workShiftRequirements
+                        .Select(wr => wr.required_count.StringToInt32())))
+                .Sum();
+        }
+
+
+        // ─────────────────────────────────────────────────────────────
+        // 3) 判斷是否為「當日最後班」的字串判定
+        //    支援 "15:30-00:00","16:00-00:00","15:30-24:00","16:00-24:00","15:30-23:59","16:00-23:59"
+        //    也能容忍沒有冒號的 "1530-0000" 之類格式
+        // ─────────────────────────────────────────────────────────────
+        private bool IsLastShiftOfDay(string timeRange)
+        {
+            if (string.IsNullOrWhiteSpace(timeRange)) return false;
+
+            var parts = timeRange.Replace(" ", "")
+                                 .Split('-', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (parts.Length != 2) return false;
+
+            var endRaw = parts[1];
+            var end = endRaw.Replace(":", "");
+
+            // 正規化為 4 位數
+            if (end.Length == 3) end = "0" + end;
+            if (end.Length != 4) return false;
+
+            // 以文字判定：0000 / 2400 / 2359 → 視為最後班
+            return end == "0000" || end == "2400" || end == "2359";
+        }
+
+        /// <summary>
+        /// 取得班別優先權 (數字越小越優先)
+        /// 目前順序：15:30 → 16:00 → 14:30 → 13:30 → 12:30 → 其他
+        /// </summary>
+        private int GetShiftPriority(string hhmm)
+        {
+            switch (hhmm)
+            {
+                case "15:30": return 0;
+                case "16:00": return 1;
+                case "14:30": return 2;
+                case "13:30": return 3;
+                case "12:30": return 4;
+                default: return 99; // 其他班次最後
+            }
+        }
+
+
+
+        // 快速回傳失敗json
+        private string FailJson(returnData rd, int code, string msg)
+        {
+            rd.Code = code;
+            rd.Result = msg;
+            return rd.JsonSerializationt();
+        }
+
+        /// <summary>
+        /// 根據 weight 與歷史紀錄，重新計算並排序群組成員
+        /// </summary>
+        static private void PrepareShiftGroupMembers(ShiftGroupClass shiftGroupClass, List<StaffScheduleHistoryClass> scheduleHistorys)
+        {
+            if (shiftGroupClass == null || shiftGroupClass.Members == null || shiftGroupClass.Members.Count == 0)
+                return;
+
+            var filteredHistorys = scheduleHistorys
+                .Where(x => x.shift_type == shiftGroupClass.shift_type)
+                .ToList();
+
+            var keypairs_scheduleHistorys = filteredHistorys.CoverToDictionaryBy_staff_guid();
+
+            foreach (var member in shiftGroupClass.Members)
+            {
+                var scheduleHistorys_buf = keypairs_scheduleHistorys.SortDictionaryBy_staff_guid(member.staff_guid);
+                if (scheduleHistorys_buf.Count > 0)
+                {
+                    member.weight = (member.weight.StringToUInt32() + scheduleHistorys_buf.Count).ToString();
+                }
+            }
+
+            shiftGroupClass.Members = shiftGroupClass.Members.SortByWeightAndOrderIndex();
+        }
+        /// <summary>
+        /// 根據 weight、歷史紀錄，並考慮小夜連續性 (僅限 swing)，最多連續 4 天，>=5 天直接禁止分配
+        /// </summary>
+        private void PrepareSwingShiftGroupMembers(ShiftGroupClass shiftGroupClass, List<StaffScheduleHistoryClass> scheduleHistorys,
+            string currentDate, Dictionary<string, int> baseWeights, List<string> validationErrors = null)
+        {
+            if (shiftGroupClass?.Members == null || shiftGroupClass.Members.Count == 0) return;
+
+            var filteredHistorys = scheduleHistorys.Where(x => x.shift_type == shiftGroupClass.shift_type).ToList();
+            var keypairs = filteredHistorys.CoverToDictionaryBy_staff_guid();
+            DateTime d = string.IsNullOrEmpty(currentDate) ? DateTime.MinValue : currentDate.StringToDateTime();
+
+            foreach (var member in shiftGroupClass.Members)
+            {
+                int baseWeight = baseWeights.TryGetValue(member.staff_guid, out var bw) ? bw : member.weight.StringToInt32();
+                var buf = keypairs.SortDictionaryBy_staff_guid(member.staff_guid);
+                int historyCount = buf.Count;
+                int weightNow = baseWeight + historyCount;
+
+                if (!string.IsNullOrEmpty(currentDate))
+                {
+                    // 計算連續天數
+                    int continuousDays = 0;
+
+                    DateTime check = d.AddDays(-1);
+                    while (buf.Any(h => h.date.StringToDateTime() == check))
+                    {
+                        continuousDays++;
+                        check = check.AddDays(-1);
+                    }
+
+                    check = d.AddDays(1);
+                    while (buf.Any(h => h.date.StringToDateTime() == check))
+                    {
+                        continuousDays++;
+                        check = check.AddDays(1);
+                    }
+
+                    if (continuousDays >= 5)
+                    {
+                        weightNow = int.MaxValue; // 禁止
+                        validationErrors?.Add($"[錯誤] {member.staff_info?.staff_name ?? member.staff_guid} 已連續小夜 ≥ 5 天，禁止再分配！");
+                    }
+                    else if (continuousDays >= 2) // 3~4 天
+                    {
+                        weightNow -= 2;
+                    }
+                    else if (continuousDays == 1) // 2 天
+                    {
+                        weightNow -= 1;
+                    }
+                }
+
+                member.weight = weightNow.ToString();
+            }
+
+            shiftGroupClass.Members = shiftGroupClass.Members.SortByWeightAndOrderIndex();
+        }
+        static private void AssignSwingShift(ShiftGroupClass shiftGroupClass, RequiredShiftClass req, WorkShiftRequirementClass wr,
+            List<StaffScheduleHistoryClass> scheduleHistorys, List<AssignedShiftClass> assignedShifts_add,
+            List<StaffScheduleHistoryClass> histories_add, List<string> validationErrors,
+            List<LeaveRequestClass> leaveRequests, string shift_group_guid)
+        {
+            AssignShiftCore(shiftGroupClass, req, wr, scheduleHistorys, assignedShifts_add, histories_add, validationErrors, leaveRequests, shift_group_guid);
+        }
+
+        static private void AssignMidnightShift(ShiftGroupClass shiftGroupClass, RequiredShiftClass req, WorkShiftRequirementClass wr,
+            List<StaffScheduleHistoryClass> scheduleHistorys, List<AssignedShiftClass> assignedShifts_add,
+            List<StaffScheduleHistoryClass> histories_add, List<string> validationErrors,
+            List<LeaveRequestClass> leaveRequests, string shift_group_guid)
+        {
+            AssignShiftCore(shiftGroupClass, req, wr, scheduleHistorys, assignedShifts_add, histories_add, validationErrors, leaveRequests, shift_group_guid);
+        }
+
+        static private void AssignHolidayShift(ShiftGroupClass shiftGroupClass, RequiredShiftClass req, WorkShiftRequirementClass wr,
+            List<StaffScheduleHistoryClass> scheduleHistorys, List<AssignedShiftClass> assignedShifts_add,
+            List<StaffScheduleHistoryClass> histories_add, List<string> validationErrors,
+            List<LeaveRequestClass> leaveRequests, string shift_group_guid)
+        {
+            AssignShiftCore(shiftGroupClass, req, wr, scheduleHistorys, assignedShifts_add, histories_add, validationErrors, leaveRequests, shift_group_guid);
+        }
+
+
+
+        static private void AssignShiftCore(ShiftGroupClass shiftGroupClass, RequiredShiftClass req, WorkShiftRequirementClass wr,
+           List<StaffScheduleHistoryClass> scheduleHistorys, List<AssignedShiftClass> assignedShifts_add,
+           List<StaffScheduleHistoryClass> histories_add, List<string> validationErrors,
+           List<LeaveRequestClass> leaveRequests, string shift_group_guid)
+        {
+            int requiredCount = wr.required_count.StringToInt32();
+            int assignedCount = wr.assigned_count.StringToInt32();
+
+            for (int i = 0; i < shiftGroupClass.Members.Count && assignedCount < requiredCount; i++)
+            {
+                var candidate = shiftGroupClass.Members[i];
+                // ✅ 硬性跳過禁排
+                if (candidate.weight.StringToInt32() == int.MaxValue)
+                {
+                    continue;
+                }
+                StaffClass staff = candidate.staff_info;
+                if (staff == null) continue;
+
+                var newHistory = new StaffScheduleHistoryClass
+                {
+                    GUID = Guid.NewGuid().ToString(),
+                    staff_guid = staff.GUID,
+                    date = req.date,
+                    time = wr.time,
+                    department = wr.department,
+                    req_shift_guid = req.GUID,
+                    shift_group_guid = shift_group_guid,
+                    shift_type = shiftGroupClass.shift_type,
+                    created_at = DateTime.Now.ToDateTimeString_6(),
+                    updated_at = DateTime.Now.ToDateTimeString_6(),
+                    status = "正常",
+                    source = "自動排班"
+                };
+
+                var validation = ScheduleValidator.ValidateSchedule(staff, newHistory);
+                if (!validation.isValid)
+                {
+                    validationErrors.Add($"[{staff.staff_name}] {req.date} 「{wr.time}」 → {validation.message}");
+                    continue;
+                }
+
+                bool isHaveLeave = leaveRequests.HasLeaveOnDate(staff.GUID, req.date);
+                if (isHaveLeave)
+                {
+                    validationErrors.Add($"[{staff.staff_name}] {req.date} 「{wr.time}」 → 該日有請假紀錄");
+                    continue;
+                }
+
+                var assignedShift = new AssignedShiftClass
+                {
+                    GUID = Guid.NewGuid().ToString(),
+                    date = req.date,
+                    staff_guid = staff.GUID,
+                    req_shift_guid = req.GUID,
+                    shift_requirement = JsonSerializer.Serialize(wr),
+                    created_at = DateTime.Now.ToDateTimeString_6(),
+                    updated_at = DateTime.Now.ToDateTimeString_6(),
+                    status = "正常",
+                    staff = staff
+                };      
+                assignedShifts_add.Add(assignedShift);
+                
+
+
+                newHistory.assigned_shift_guid = assignedShift.GUID;
+                staff.scheduleHistories.Add(newHistory);
+                histories_add.Add(newHistory);
+                scheduleHistorys.Add(newHistory);
+
+                assignedCount++;
+                wr.assigned_count = assignedCount.ToString();
+            }
+        }
+
 
 
 
@@ -1740,7 +3517,7 @@ namespace PharmaRosterAPI
             AssignedShiftClass assignedShift,
             ScheduleDayClass scheduleDay,
             StaffClass staff,
-            string shift_group_guid,
+            ShiftGroupClass shift_group,
             List<AssignedShiftClass> assignedShifts_add,
             List<AssignedShiftClass> assignedShifts_update,
             List<StaffScheduleHistoryClass> histories_add,
@@ -1760,7 +3537,8 @@ namespace PharmaRosterAPI
                 created_at = DateTime.Now.ToDateTimeString_6(),
                 updated_at = DateTime.Now.ToDateTimeString_6(),
                 req_shift_guid = assignedShift.req_shift_guid,
-                shift_group_guid = shift_group_guid,
+                shift_type = shift_group.shift_type,
+                shift_group_guid = shift_group.GUID,
                 source = assignedShift.source == null ? "手動調整" : assignedShift.source,
                 status = "正常"
             };
@@ -1775,7 +3553,7 @@ namespace PharmaRosterAPI
 
             // ✅ 通過檢核 → 執行排班與歷史紀錄處理
             AddOrUpdateAssignedShift(
-                assignedShift, scheduleDay, staff, shift_group_guid,
+                assignedShift, scheduleDay, staff, shift_group,
                 sql_StaffHistory,
                 assignedShifts_add, assignedShifts_update,
                 histories_add, histories_update,
@@ -1789,7 +3567,7 @@ namespace PharmaRosterAPI
             AssignedShiftClass assignedShift,
             ScheduleDayClass scheduleDay,
             StaffClass staff,
-            string shift_group_guid,
+            ShiftGroupClass shift_group,
             SQLControl sql_StaffHistory,
             List<AssignedShiftClass> assignedShifts_add,
             List<AssignedShiftClass> assignedShifts_update,
@@ -1806,7 +3584,8 @@ namespace PharmaRosterAPI
                 created_at = DateTime.Now.ToDateTimeString_6(),
                 updated_at = DateTime.Now.ToDateTimeString_6(),
                 req_shift_guid = assignedShift.req_shift_guid,
-                shift_group_guid = shift_group_guid,
+                shift_type = shift_group.shift_type,
+                shift_group_guid = shift_group.GUID,
                 source = assignedShift.source == null ? "手動調整" : assignedShift.source,
                 status = "正常"
             };
@@ -1862,4 +3641,169 @@ namespace PharmaRosterAPI
         }
 
     }
+
+
+
+
+    /// <summary>
+    /// 小夜班需求槽位 (封裝 RequiredShift 與 WorkShiftRequirement)
+    /// </summary>
+    public class ShiftNeedSlot
+    {
+        public RequiredShiftClass req { get; set; }
+        public WorkShiftRequirementClass wr { get; set; }
+        public int order { get; set; }
+        public int need { get; set; }
+    }
+
+    public static class SmallNightScheduler
+    {
+        /// <summary>
+        /// 小夜班 — 連續四天排班 (梯隊模式)
+        /// </summary>
+        /// <param name="scheduleDays">排班日清單</param>
+        /// <param name="group">小夜班群組</param>
+        /// <param name="histories">既有的排班歷史 (會動態加入新的歷史)</param>
+        /// <param name="shift_group_guid">群組 GUID</param>
+        /// <param name="validationErrors">驗證錯誤訊息集合</param>
+        /// <param name="preferLatestOnDay4">第四天收尾優先第四班，若滿則塞第五班</param>
+        /// <returns>(assignedShifts, histories)</returns>
+        public static (List<AssignedShiftClass>, List<StaffScheduleHistoryClass>) Assign(
+            List<ScheduleDayClass> scheduleDays,
+            ShiftGroupClass group,
+            List<StaffScheduleHistoryClass> histories,
+            string shift_group_guid,
+            List<string> validationErrors,
+            bool preferLatestOnDay4 = true)
+        {
+            var results = new List<AssignedShiftClass>();
+            var newHistories = new List<StaffScheduleHistoryClass>();
+
+            if (group?.Members == null || group.Members.Count == 0)
+                return (results, newHistories);
+
+            Queue<ShiftGroupMemberClass> queue = new Queue<ShiftGroupMemberClass>(group.Members);
+
+            // 建立每日需求快取
+            var dayNeeds = scheduleDays.ToDictionary(
+                d => d.date,
+                d => d.RequiredShifts
+                    .Where(r => r.shift_group_guid == shift_group_guid)
+                    .SelectMany(r => r.workShiftRequirements.Select((wr, idx) => new ShiftNeedSlot
+                    {
+                        req = r,
+                        wr = wr,
+                        order = idx,
+                        need = wr.required_count.StringToInt32()
+                    }))
+                    .ToList()
+            );
+
+            // 每人要吃 4 天
+            for (int i = 0; i < scheduleDays.Count - 3; i++)
+            {
+                string d1 = scheduleDays[i].date;
+                string d2 = scheduleDays[i + 1].date;
+                string d3 = scheduleDays[i + 2].date;
+                string d4 = scheduleDays[i + 3].date;
+
+                while (queue.Count > 0)
+                {
+                    var member = queue.Dequeue();
+                    var staff = member.staff_info;
+                    if (staff == null) continue;
+
+                    // 嘗試 4 日班鏈
+                    var slot1 = PickSlot(dayNeeds, d1, 0);
+                    var slot2 = PickSlot(dayNeeds, d2, 1);
+                    var slot3 = PickSlot(dayNeeds, d3, 2);
+                    var slot4 = PickDay4Slot(dayNeeds, d4, preferLatestOnDay4);
+
+                    if (slot1.wr == null || slot2.wr == null || slot3.wr == null || slot4.wr == null)
+                    {
+                        // 無法排 → 放回隊列
+                        queue.Enqueue(member);
+                        break;
+                    }
+
+                    // 成功 → 填入四天
+                    foreach (var slot in new[] { slot1, slot2, slot3, slot4 })
+                    {
+                        slot.wr.assigned_count = (slot.wr.assigned_count.StringToInt32() + 1).ToString();
+
+                        var assigned = new AssignedShiftClass
+                        {
+                            GUID = Guid.NewGuid().ToString().ToUpper(),
+                            date = slot.date,
+                            staff_guid = staff.GUID,
+                            req_shift_guid = slot.req.GUID,
+                            shift_requirement = JsonSerializer.Serialize(slot.wr),
+                            created_at = DateTime.Now.ToDateTimeString_6(),
+                            updated_at = DateTime.Now.ToDateTimeString_6(),
+                            status = "正常",
+                            staff = staff
+                        };
+                        results.Add(assigned);
+
+                        var history = new StaffScheduleHistoryClass
+                        {
+                            GUID = Guid.NewGuid().ToString().ToUpper(),
+                            staff_guid = staff.GUID,
+                            date = slot.date,
+                            time = slot.wr.time,
+                            department = slot.wr.department,
+                            req_shift_guid = slot.req.GUID,
+                            shift_group_guid = shift_group_guid,
+                            created_at = DateTime.Now.ToDateTimeString_6(),
+                            updated_at = DateTime.Now.ToDateTimeString_6(),
+                            status = "正常",
+                            source = "自動排班",
+                            assigned_shift_guid = assigned.GUID
+                        };
+                        newHistories.Add(history);
+                    }
+
+                    // 一個人完成四天，不再放回 queue
+                }
+            }
+
+            return (results, newHistories);
+        }
+
+        /// <summary>挑指定日指定班別</summary>
+        private static (string date, RequiredShiftClass req, WorkShiftRequirementClass wr) PickSlot(
+            Dictionary<string, List<ShiftNeedSlot>> dayNeeds, string date, int order)
+        {
+            if (!dayNeeds.ContainsKey(date)) return (date, null, null);
+            var list = dayNeeds[date];
+            var slot = list.FirstOrDefault(x => x.order == order);
+            if (slot == null) return (date, null, null);
+            if (slot.wr.assigned_count.StringToInt32() >= slot.need) return (date, null, null);
+            return (date, slot.req, slot.wr);
+        }
+
+        /// <summary>第四天 → 優先第四班，若滿了用第五班</summary>
+        private static (string date, RequiredShiftClass req, WorkShiftRequirementClass wr) PickDay4Slot(
+            Dictionary<string, List<ShiftNeedSlot>> dayNeeds, string date, bool preferLatestOnDay4)
+        {
+            if (!dayNeeds.ContainsKey(date)) return (date, null, null);
+            var list = dayNeeds[date];
+
+            if (preferLatestOnDay4)
+            {
+                var slot4 = list.FirstOrDefault(x => x.order == 3);
+                if (slot4 != null && slot4.wr.assigned_count.StringToInt32() < slot4.need)
+                    return (date, slot4.req, slot4.wr);
+            }
+
+            var slot5 = list.FirstOrDefault(x => x.order == 4);
+            if (slot5 != null && slot5.wr.assigned_count.StringToInt32() < slot5.need)
+                return (date, slot5.req, slot5.wr);
+
+            return (date, null, null);
+        }
+    }
+
+
+
 }

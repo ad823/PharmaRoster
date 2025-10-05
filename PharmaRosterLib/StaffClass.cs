@@ -35,6 +35,20 @@ namespace PharmaRosterLib
         [Description("VARCHAR,50,NONE")]
         public string role { get; set; }
 
+        // ========== 累積次數 (字串形式，可重新計算) ==========
+        [JsonPropertyName("day_shift_count")]
+        public string DayShiftCount { get; set; } = "0";
+
+        [JsonPropertyName("swing_shift_count")]
+        public string SwingShiftCount { get; set; } = "0";
+
+        [JsonPropertyName("night_shift_count")]
+        public string NightShiftCount { get; set; } = "0";
+
+        [JsonPropertyName("holiday_shift_count")]
+        public string HolidayShiftCount { get; set; } = "0";
+
+
         /// <summary>建立時間</summary>
         [JsonPropertyName("created_at")]
         [Description("DATETIME,50,NONE")]
@@ -59,6 +73,26 @@ namespace PharmaRosterLib
         /// <summary>排班歷程 (僅程式用，不建立資料表欄位)</summary>
         [JsonPropertyName("scheduleHistories")]
         public List<StaffScheduleHistoryClass> scheduleHistories { get; set; } = new List<StaffScheduleHistoryClass>();
+
+
+        // ========== 新增：重新計算方法 ==========
+        /// <summary>
+        /// 重新計算各班別次數，更新到字串屬性
+        /// </summary>
+        public void RecalculateCounts()
+        {
+            DayShiftCount = scheduleHistories
+                .Count(s => s.shift_type == ShiftTypeEnum.day.GetEnumName()).ToString();
+
+            SwingShiftCount = scheduleHistories
+                .Count(s => s.shift_type == ShiftTypeEnum.swing.GetEnumName()).ToString();
+
+            NightShiftCount = scheduleHistories
+                .Count(s => s.shift_type == ShiftTypeEnum.midnight.GetEnumName()).ToString();
+
+            HolidayShiftCount = scheduleHistories
+                .Count(s => s.shift_type == ShiftTypeEnum.holiday.GetEnumName()).ToString();
+        }
     }
 
     /// <summary>
@@ -76,6 +110,11 @@ namespace PharmaRosterLib
         [JsonPropertyName("staff_guid")]
         [Description("VARCHAR,50,INDEX")]
         public string staff_guid { get; set; }
+
+        /// <summary>班別屬性</summary>
+        [JsonPropertyName("shift_type")]
+        [Description("VARCHAR,50,INDEX")]
+        public string shift_type { get; set; }
 
         /// <summary>日期 (yyyy-MM-dd)</summary>
         [JsonPropertyName("date")]
@@ -102,7 +141,7 @@ namespace PharmaRosterLib
         [Description("VARCHAR,50,NONE")]
         public string source { get; set; }
 
-        /// <summary>狀態 (正常/支援/例外/取消)</summary>
+        /// <summary>狀態 (正常/取消)</summary>
         [JsonPropertyName("status")]
         [Description("VARCHAR,20,INDEX")]
         public string status { get; set; }
@@ -232,85 +271,151 @@ namespace PharmaRosterLib
 
     public static class ScheduleValidator
     {
-        /// <summary>
-        /// 檢查新增班表是否符合規則
-        /// </summary>
-        /// <param name="staff">人員資訊 (含屬性)</param>
-        /// <param name="existingSchedules">既有排班歷程</param>
-        /// <param name="newSchedule">待新增的班表</param>
-        /// <returns>檢核結果 (true=通過, false=違反)</returns>
-        public static (bool isValid, string message) ValidateSchedule( StaffClass staff, StaffScheduleHistoryClass newSchedule)
+        public static (bool isValid, string message) ValidateSchedule(StaffClass staff, StaffScheduleHistoryClass newSchedule)
         {
-            List<StaffScheduleHistoryClass> existingSchedules = staff.scheduleHistories;
-            var newDate = newSchedule.date.StringToDateTime();
-            var newRange = newSchedule.TimeRange;
-
-            if (!newRange.HasValue)
-                return (false, "新增排班時間格式錯誤");
-
-            // === 規則 2: 上班間隔至少 11 小時 ===
-            var lastShift = existingSchedules
-                .OrderByDescending(s => s.date)
-                .ThenByDescending(s => s.TimeRange?.end)
-                .FirstOrDefault();
-
-            if (lastShift?.TimeRange != null)
+            List<StaffScheduleHistoryClass> list = staff.scheduleHistories ?? new List<StaffScheduleHistoryClass>();
+            DateTime dateTime = newSchedule.date.StringToDateTime();
+            (TimeSpan, TimeSpan)? timeRange = newSchedule.TimeRange;
+            if (!timeRange.HasValue)
             {
-                var lastEnd = lastShift.date.StringToDateTime().Add(lastShift.TimeRange.Value.end);
-                var newStart = newDate.Add(newRange.Value.start);
-
-                if ((newStart - lastEnd).TotalHours < 11)
-                    return (false, "班表間隔未滿 11 小時");
+                return (false, "新增排班時間格式錯誤");
             }
 
-            // === 規則 3: 連續上班 ≤ 12 天 ===
-            var ordered = existingSchedules
-                .OrderBy(s => s.date)
-                .Select(s => s.date.StringToDateTime().Date)
-                .Distinct()
-                .ToList();
+            DateTime dateTime2 = dateTime.Add(timeRange.Value.Item1);
+            DateTime dateTime3 = FixEndTime(dateTime2, timeRange.Value.Item2);
 
-            if (!ordered.Contains(newDate.Date))
-                ordered.Add(newDate.Date);
+            // ────────────────────────────────────────────────
+            // ✅ [新增檢查] 同一天只能排一個班
+            // ────────────────────────────────────────────────
+            bool alreadyHasShiftToday = list.Any(h =>
+                DateTime.TryParse(h.date, out DateTime d) && d.Date == dateTime.Date);
 
-            int maxStreak = 1, currentStreak = 1;
-            for (int i = 1; i < ordered.Count; i++)
+            if (alreadyHasShiftToday)
             {
-                if ((ordered[i] - ordered[i - 1]).TotalDays == 1)
+                return (false, $"同一天 ({dateTime:yyyy-MM-dd}) 已有其他班次，無法重複排班");
+            }
+
+            // ────────────────────────────────────────────────
+            // 既有班表衝突檢查 (重疊、間隔不足等)
+            // ────────────────────────────────────────────────
+            foreach (StaffScheduleHistoryClass item in list)
+            {
+                if (item.TimeRange.HasValue)
                 {
-                    currentStreak++;
-                    maxStreak = Math.Max(maxStreak, currentStreak);
+                    DateTime dateTime4 = item.date.StringToDateTime().Add(item.TimeRange.Value.start);
+                    DateTime dateTime5 = FixEndTime(dateTime4, item.TimeRange.Value.end);
+
+                    if (dateTime2 < dateTime5 && dateTime3 > dateTime4)
+                    {
+                        return (false, "班次重疊 (與 " + item.date + " 班次衝突)");
+                    }
+
+                    double totalHours = (dateTime2 - dateTime5).TotalHours;
+                    double totalHours2 = (dateTime4 - dateTime3).TotalHours;
+                    double num = Math.Min(Math.Abs(totalHours), Math.Abs(totalHours2));
+                    if (num < 11.0)
+                    {
+                        return (false, $"班表間隔未滿 11 小時 (與 {item.date} 班次衝突，實際 {num:F1} 小時)");
+                    }
+                }
+            }
+
+            // ────────────────────────────────────────────────
+            // 連續上班日數檢查
+            // ────────────────────────────────────────────────
+            List<DateTime> list2 = (from s in list
+                                    orderby s.date
+                                    select s.date.StringToDateTime().Date).Distinct().ToList();
+            if (!list2.Contains(dateTime.Date))
+            {
+                list2.Add(dateTime.Date);
+            }
+
+            int num2 = 1;
+            int num3 = 1;
+            for (int i = 1; i < list2.Count; i++)
+            {
+                if ((list2[i] - list2[i - 1]).TotalDays == 1.0)
+                {
+                    num3++;
+                    num2 = Math.Max(num2, num3);
                 }
                 else
                 {
-                    currentStreak = 1;
+                    num3 = 1;
                 }
             }
 
-            if (maxStreak > 12)
-                return (false, "連續上班超過 12 天");
-
-            // === 規則 1: 14 天內至少休 2 天 ===
-            var startOfWeek = newDate.AddDays(-(int)newDate.DayOfWeek).Date; // 固定週一開始
-            var endOfWeek = startOfWeek.AddDays(13);
-
-            var daysWorked = ordered.Where(d => d >= startOfWeek && d <= endOfWeek).Distinct().Count();
-            var daysOff = 14 - daysWorked;
-            if (daysOff < 2)
-                return (false, "14 天內休假不足 2 天");
-
-            if(staff.staffAttributes != null)
+            if (num2 > 12)
             {
-                // === 規則 4: 孕婦/哺乳限制 ===
-                if ((staff.staffAttributes.pregnant == "true" || staff.staffAttributes.breastfeeding == "true"))
-                {
-                    if (newRange.Value.end > new TimeSpan(22, 0, 0))
-                        return (false, "孕婦/哺乳不可排 22:00 以後的班");
-                }
+                return (false, "連續上班超過 12 天");
             }
-          
+
+            // ────────────────────────────────────────────────
+            // 14 天內至少 2 天休假
+            // ────────────────────────────────────────────────
+            DateTime startOfPeriod = dateTime.Date.AddDays(-13.0);
+            DateTime endOfPeriod = dateTime.Date;
+            int num4 = list2.Where((DateTime d) => d >= startOfPeriod && d <= endOfPeriod).Count();
+            int num5 = 14 - num4;
+            if (num5 < 2)
+            {
+                return (false, "14 天內休假不足 2 天");
+            }
+
+            // ────────────────────────────────────────────────
+            // 孕婦 / 哺乳班別檢核
+            // ────────────────────────────────────────────────
+            if (staff.staffAttributes != null &&
+                (staff.staffAttributes.pregnant == "true" || staff.staffAttributes.breastfeeding == "true") &&
+                timeRange.Value.Item2 > new TimeSpan(22, 0, 0))
+            {
+                return (false, "孕婦/哺乳不可排 22:00 以後的班");
+            }
 
             return (true, "檢核通過");
+        }
+
+
+
+
+        /// <summary>
+        /// 檢查兩個班次之間是否有滿足 11 小時休息間隔
+        /// （直接比較前班下班時間與後班上班時間）
+        /// </summary>
+        public static (bool, string) CheckShiftInterval(
+            DateTime prevShiftEnd, DateTime nextShiftStart)
+        {
+            double gap = (nextShiftStart - prevShiftEnd).TotalHours;
+
+            if (gap < 11.0)
+            {
+                return (false, $"班表間隔未滿 11 小時 (實際 {gap:F1} 小時)");
+            }
+
+            return (true, $"班表間隔符合規範 ({gap:F1} 小時 ≥ 11 小時)");
+        }
+
+        /// <summary>
+        /// 修正結束時間，避免 00:00 判斷錯亂
+        /// </summary>
+        private static DateTime FixEndTime(DateTime start, TimeSpan endTime)
+        {
+            var end = start.Date.Add(endTime);
+
+            // 如果結束時間是 00:00，就改成 23:59
+            if (end.TimeOfDay == TimeSpan.Zero)
+            {
+                end = end.Date.AddHours(23).AddMinutes(59);
+            }
+
+            // 如果結束時間 <= 開始時間，往後推一天（應對跨日）
+            if (end <= start)
+            {
+                end = end.AddDays(1);
+            }
+
+            return end;
         }
     }
 
@@ -437,6 +542,85 @@ namespace PharmaRosterLib
             }
             return new List<StaffScheduleHistoryClass>();
         }
+
+        /// <summary>
+        /// 從 StaffScheduleHistoryClass 清單中，找出指定日期範圍內、指定班別群組的紀錄
+        /// </summary>
+        /// <param name="histories">歷程清單</param>
+        /// <param name="dateStart">起始日期 (含)</param>
+        /// <param name="dateEnd">結束日期 (含)</param>
+        /// <param name="shift_group_guid">班別群組 GUID (可為 null 或空字串)</param>
+        /// <returns>符合條件的紀錄清單</returns>
+        public static List<StaffScheduleHistoryClass> FindByDateRange(
+            this List<StaffScheduleHistoryClass> histories,
+            DateTime dateStart,
+            DateTime dateEnd,
+            string shift_group_guid = null)
+        {
+            if (histories == null || histories.Count == 0)
+                return new List<StaffScheduleHistoryClass>();
+
+            return histories
+                .Where(h =>
+                {
+                    // 日期過濾
+                    if (!DateTime.TryParse(h.date, out DateTime d))
+                        return false;
+                    if (d.Date < dateStart.Date || d.Date > dateEnd.Date)
+                        return false;
+
+                    // 群組過濾 (如果 shift_group_guid 有傳入)
+                    if (!string.IsNullOrWhiteSpace(shift_group_guid) &&
+                        !string.Equals(h.shift_group_guid, shift_group_guid, StringComparison.OrdinalIgnoreCase))
+                        return false;
+
+                    return true;
+                })
+                .OrderBy(h => h.date)
+                .ThenBy(h => h.time)
+                .ToList();
+        }
+
+        /// <summary>
+        /// 從 StaffScheduleHistoryClass 清單中，找出指定月份內、指定班別類型的紀錄
+        /// </summary>
+        /// <param name="histories">歷程清單</param>
+        /// <param name="year">查詢年份 (例如 2025)</param>
+        /// <param name="month">查詢月份 (1–12)</param>
+        /// <param name="shiftType">班別類型 (可為 null 或空字串)</param>
+        /// <returns>符合條件的紀錄清單</returns>
+        public static List<StaffScheduleHistoryClass> FindByMonthAndShiftType(
+            this List<StaffScheduleHistoryClass> histories,
+            int year,
+            int month,
+            string shiftType = null)
+        {
+            if (histories == null || histories.Count == 0)
+                return new List<StaffScheduleHistoryClass>();
+
+            // 🗓️ 自動計算該月的起訖日期
+            DateTime dateStart = new DateTime(year, month, 1);
+            DateTime dateEnd = dateStart.AddMonths(1).AddDays(-1);
+
+            return histories
+                .Where(h =>
+                {
+                    if (!DateTime.TryParse(h.date, out DateTime d))
+                        return false;
+                    if (d.Date < dateStart.Date || d.Date > dateEnd.Date)
+                        return false;
+
+                    if (!string.IsNullOrWhiteSpace(shiftType) &&
+                        !string.Equals(h.shift_type, shiftType, StringComparison.OrdinalIgnoreCase))
+                        return false;
+
+                    return true;
+                })
+                .OrderBy(h => h.date)
+                .ThenBy(h => h.time)
+                .ToList();
+        }
+
     }
 
     public static class StaffClassMethod

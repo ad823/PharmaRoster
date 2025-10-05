@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Basic;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
@@ -46,6 +47,55 @@ namespace PharmaRosterLib
 
         [JsonPropertyName("staff_info")]
         public StaffClass staff_info { get; set; } = new StaffClass();
+    }
+    public static class LeaveRequestExtensions
+    {
+        /// <summary>
+        /// 取得指定員工在特定日期的假單清單
+        /// </summary>
+        /// <param name="leaves">假單清單</param>
+        /// <param name="staff_guid">員工 GUID</param>
+        /// <param name="date">指定日期 (yyyy-MM-dd)</param>
+        /// <returns>符合條件的假單清單 (若無則為空)</returns>
+        public static List<LeaveRequestClass> GetLeavesByStaffAndDate(this List<LeaveRequestClass> leaves, string staff_guid, string date)
+        {
+            if (leaves == null || leaves.Count == 0) return new List<LeaveRequestClass>();
+            if (string.IsNullOrWhiteSpace(staff_guid) || string.IsNullOrWhiteSpace(date)) return new List<LeaveRequestClass>();
+
+            DateTime targetDate;
+            if (!DateTime.TryParse(date, out targetDate)) return new List<LeaveRequestClass>();
+
+            return leaves.Where(l =>
+                l.staff_guid == staff_guid &&
+                DateTime.TryParse(l.start_date, out var startDate) &&
+                DateTime.TryParse(l.end_date, out var endDate) &&
+                targetDate.Date >= startDate.Date &&
+                targetDate.Date <= endDate.Date
+            ).ToList();
+        }
+        /// <summary>
+        /// 檢查指定員工在特定日期是否有請假
+        /// </summary>
+        /// <param name="leaves">假單清單</param>
+        /// <param name="staff_guid">員工 GUID</param>
+        /// <param name="date">指定日期 (yyyy-MM-dd)</param>
+        /// <returns>若該員工當天有請假，回傳 true；否則 false</returns>
+        public static bool HasLeaveOnDate(this List<LeaveRequestClass> leaves, string staff_guid, string date)
+        {
+            if (leaves == null || leaves.Count == 0) return false;
+            if (string.IsNullOrWhiteSpace(staff_guid) || string.IsNullOrWhiteSpace(date)) return false;
+
+            if (!DateTime.TryParse(date, out DateTime targetDate)) return false;
+
+            return leaves.Any(l =>
+                l.staff_guid == staff_guid &&
+                DateTime.TryParse(l.start_date, out var startDate) &&
+                DateTime.TryParse(l.end_date, out var endDate) &&
+                targetDate.Date >= startDate.Date &&
+                targetDate.Date <= endDate.Date
+            );
+        }
+
     }
 }
 

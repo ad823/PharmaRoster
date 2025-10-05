@@ -354,6 +354,7 @@ namespace PharmaRosterLib
                           select temp).FirstOrDefault();
             return result ?? null;
         }
+
     }
     public static class RequiredShiftMethod
     {
