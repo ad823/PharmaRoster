@@ -1551,8 +1551,91 @@ namespace PharmaRosterAPI
             }
         }
 
-        
-        [HttpPost("download_monthly_shift_schedule_pdf")]
+        [HttpGet("download_monthly_shift_schedule_pdf")]
+        public IActionResult get_download_procurement_pdf(string year_month)
+        {
+            returnData returnData = new returnData();
+            returnData.ValueAry.Add($"year_month={year_month}");
+            return download_procurement_pdf(returnData);
+        }
+
+        /// <summary>
+        /// 下載指定月份的排班表 PDF
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途  
+        /// 本 API 用於產生並下載指定年月的「排班月報表 (PDF)」。  
+        /// 系統會根據傳入的 `year_month` (格式：yyyy-MM)，讀取當月的排班資料，  
+        /// 自動產生對應格式的 PDF 排班表，以 A4 橫式輸出。  
+        ///
+        /// 報表內容包含：
+        /// - 每週的日期、星期對應位置。
+        /// - 小夜班、假日班、大夜班各班次人員姓名縮寫。
+        /// - HDR 標註、TPN、化療等特殊欄位。
+        ///
+        /// ## 📥 Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "download_monthly_shift_schedule_pdf",
+        ///   "ValueAry": [
+        ///     "year_month=2025-10"
+        ///   ],
+        ///   "Data": {}
+        /// }
+        /// ```
+        ///
+        /// ## 📤 Response 範例 (成功)
+        /// - 成功時回傳 **application/octet-stream** 檔案串流 (PDF)，  
+        ///   並於 Response Header 內附帶檔案下載資訊：
+        ///
+        /// ### 🔹 Response Header
+        /// ```
+        /// Content-Type: application/octet-stream
+        /// Content-Disposition: attachment; filename="2025-10月份值班表.pdf"; filename*=UTF-8''2025-10%E6%9C%88%E4%BB%BD%E5%80%BC%E7%8F%AD%E8%A1%A8.pdf
+        /// Access-Control-Expose-Headers: Content-Disposition, Content-Length, Content-Type
+        /// ```
+        ///
+        /// ### 🔹 檔案名稱  
+        /// `yyyy-MM月份值班表.pdf`
+        ///
+        /// ## ❌ Response JSON 範例 (錯誤)
+        /// - 缺少必要參數：  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "download_monthly_shift_schedule_pdf",
+        ///   "Result": "參數驗證失敗：year_month 為必填"
+        /// }
+        /// ```
+        ///
+        /// - year_month 格式錯誤：  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "download_monthly_shift_schedule_pdf",
+        ///   "Result": "參數驗證失敗：year_month 格式錯誤"
+        /// }
+        /// ```
+        ///
+        /// - 系統例外錯誤 (如排班資料缺失、PDF 生成失敗)：  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "download_monthly_shift_schedule_pdf",
+        ///   "Result": "Exception: 無法產生 PDF，資料來源異常"
+        /// }
+        /// ```
+        ///
+        /// ## 📑 注意事項
+        /// - `year_month` 必須為合法年月格式 (yyyy-MM)。  
+        /// - 若該月份無任何排班資料，產生的 PDF 會為空白模板。  
+        /// - PDF 採用 A4 橫向 (Landscape) 格式輸出。  
+        /// - 此 API 為「檔案下載」類型，非 JSON 回傳。  
+        /// - 若需在前端觸發下載，請確保 HTTP Response 能處理 `Content-Disposition` header。  
+        /// </remarks>
+        /// <param name="returnData">統一封裝的請求物件，需包含 ValueAry 內之 year_month 參數</param>
+        /// <returns>成功時回傳 PDF 檔案串流，失敗時回傳 JSON 錯誤訊息</returns>
+        [HttpPost("download_monthly_shift_schedule_pdf")]       
         public IActionResult download_procurement_pdf([FromBody] returnData returnData)
         {
             var timer = new MyTimerBasic();
@@ -1560,8 +1643,11 @@ namespace PharmaRosterAPI
 
             try
             {
+                Console.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] >>> API 開始執行 download_monthly_shift_schedule_pdf");
+
                 if (returnData.Data == null)
                 {
+                    Console.WriteLine("[警告] returnData.Data 為 null");
                     returnData.Code = -200;
                     returnData.Result = "Data 不能為空";
                     return new JsonResult(returnData);
@@ -1569,56 +1655,360 @@ namespace PharmaRosterAPI
 
                 // 解析參數
                 string GetVal(string key) =>
-                   returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
                     ?.Split('=')[1];
 
                 string year_month = GetVal("year_month") ?? "";
-                if(string.IsNullOrEmpty(year_month))
+                Console.WriteLine($"[DEBUG] year_month = {year_month}");
+
+                if (string.IsNullOrEmpty(year_month))
                 {
+                    Console.WriteLine("[錯誤] year_month 參數為空");
                     returnData.Code = -200;
                     returnData.Result = "參數驗證失敗：year_month 為必填";
                     return new JsonResult(returnData);
                 }
                 if (!Check_YearMonth_String(year_month))
                 {
+                    Console.WriteLine("[錯誤] year_month 格式錯誤");
                     returnData.Code = -200;
                     returnData.Result = "參數驗證失敗：year_month 格式錯誤";
                     return new JsonResult(returnData);
                 }
 
-
+                Console.WriteLine("[INFO] 開始反序列化 monthly_shift_schedule_xlsx");
                 SheetClass sheet = monthly_shift_schedule_xlsx.xlsx.JsonDeserializet<SheetClass>();
-                
+                Console.WriteLine("[INFO] 反序列化完成");
+
+                string[] date_strings = year_month.Split('-');
+                if (date_strings.Length != 2)
+                {
+                    Console.WriteLine("[錯誤] year_month 分割後長度錯誤");
+                    returnData.Code = -200;
+                    returnData.Result = "參數驗證失敗：year_month 格式錯誤";
+                    return new JsonResult(returnData);
+                }
+
+                int year = date_strings[0].StringToInt32();
+                int month = date_strings[1].StringToInt32();
+                Console.WriteLine($"[DEBUG] year={year}, month={month}");
+
+                if (year < 1900 || year > 2100 || month < 1 || month > 12)
+                {
+                    Console.WriteLine("[錯誤] year 或 month 超出範圍");
+                    returnData.Code = -200;
+                    returnData.Result = "參數驗證失敗：year_month 格式錯誤";
+                    return new JsonResult(returnData);
+                }
+
+                // 取得該月份的第一天與天數
+                DateTime firstDay = new DateTime(year, month, 1);
+                DateTime lastDay = new DateTime(year, month, DateTime.DaysInMonth(year, month));
+                Console.WriteLine($"[INFO] 期間：{firstDay:yyyy-MM-dd} ~ {lastDay:yyyy-MM-dd}");
+
+                List<ScheduleDayClass> scheduleDays = scheduleDay.GetScheduleDay(firstDay.ToDateString('-'), lastDay.ToDateString('-'));
+                List<StaffClass> staffs = staff.GetAllStaffs();
+
+                Console.WriteLine($"[INFO] scheduleDays.Count={scheduleDays?.Count}, staffs.Count={staffs?.Count}");
+
+                Dictionary<string, List<StaffClass>> keyValuePairs_staffs = staffs.CoverToDictionaryByGUID();
+
+                int daysInMonth = DateTime.DaysInMonth(year, month);
+                string title = $"{year}-{month}月份值班表";
+                sheet.Rows[0].Cell[0].Text = $"{title}";
+
+                DateTime firstDayOfMonth = new DateTime(year, month, 1);
+                DateTime lastDayOfMonth = new DateTime(year, month, daysInMonth);
+
+                int offsetToMonday = ((int)firstDayOfMonth.DayOfWeek + 6) % 7;
+                DateTime firstMonday = firstDayOfMonth.AddDays(-offsetToMonday);
+
+                int offsetToSunday = 7 - ((int)lastDayOfMonth.DayOfWeek + 6) % 7 - 1;
+                DateTime lastSunday = lastDayOfMonth.AddDays(offsetToSunday);
+
+                Console.WriteLine($"[INFO] 輪循範圍：{firstMonday:yyyy-MM-dd} ~ {lastSunday:yyyy-MM-dd}");
+
+                // === 輪循從星期一到星期日（涵蓋整個月）===
+                int weekIndex = 1;
+                for (DateTime d = firstMonday; d <= lastSunday; d = d.AddDays(1))
+                {
+                    int dayOfWeek = ((int)d.DayOfWeek + 6) % 7 + 1; // Monday=1...Sunday=7
+                    string dateStr = d.ToString("yyyy-MM-dd");
+
+                    // 判斷是否為新的一週
+                    if (dayOfWeek == 1 && d > firstMonday)
+                    {
+                        weekIndex++;
+                    }
+
+                    Console.WriteLine($"第{weekIndex}週 | {dateStr} | 星期{dayOfWeek}");
+
+                    // === 可放入生成 Excel / 班表邏輯 ===
+
+                    sheet.Rows[2 + (weekIndex-1) * 6].Cell[dayOfWeek - 1].Text = $"{d.Day}";
+
+                    //小夜班
+                    if (d.Month == month)
+                    {
+                        string text = "";
+                        bool flag_HDR = false;
+                        ScheduleDayClass schedule = scheduleDays.Where(x => x.date.StringToDateTime().ToDateString('-') == d.ToDateString('-')).ToList().FirstOrDefault();
+                        if (schedule == null) continue;
+                        List<AssignedShiftClass> assignedShiftClasses = new List<AssignedShiftClass>();
+
+                        text = "";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "12:30-21:00").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+
+                            if (asg.workShiftRequirement.department.Contains("中藥"))
+                            {
+                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                            }
+                            else
+                            {
+                                text += staff.staff_name.Substring(0, 1);
+                            }
+                            if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
+                        }
+                        sheet.Rows[3 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
 
 
+                        text = "";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "13:30-22:00").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
 
+                            if (asg.workShiftRequirement.department.Contains("中藥"))
+                            {
+                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                            }
+                            else
+                            {
+                                text += staff.staff_name.Substring(0, 1);
+                            }
+                            if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
+                        }
+                        sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+
+                        if(dateStr == "2025-11-05")
+                        {
+                            Console.WriteLine("[DEBUG] 2024-11-28 特殊處理測試點");
+                        }
+                        text = "";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "14:30-23:00").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+
+                            if (asg.workShiftRequirement.department.Contains("中藥"))
+                            {
+                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                            }
+                            else
+                            {
+                                text += staff.staff_name.Substring(0, 1);
+                            }
+                            if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
+                        }
+                        sheet.Rows[5 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+
+
+                        text = "";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "15:30-23:59").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+
+                            if (asg.workShiftRequirement.department.Contains("中藥"))
+                            {
+                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                            }
+                            else
+                            {
+                                text += staff.staff_name.Substring(0, 1);
+                            }
+                            if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
+                        }
+                        text += "--";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "16:00-23:59").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+
+                            if (asg.workShiftRequirement.department.Contains("中藥"))
+                            {
+                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                            }
+                            else
+                            {
+                                text += staff.staff_name.Substring(0, 1);
+                            }
+                            if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
+                        }
+                        sheet.Rows[6 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+
+                        if(flag_HDR)
+                        {
+                            sheet.Rows[2 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text += "(HDR)";
+                        }
+                    }
+
+                    //大夜班
+                    if (d.Month == month)
+                    {
+                        string text = "";
+                        ScheduleDayClass schedule = scheduleDays.Where(x => x.date.StringToDateTime().ToDateString('-') == d.ToDateString('-')).ToList().FirstOrDefault();
+                        if (schedule == null) continue;
+                        List<AssignedShiftClass> assignedShiftClasses = new List<AssignedShiftClass>();
+
+                        text = "";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "00:00-08:00"
+                        && x.workShiftRequirement.department == "門診").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+                            text += staff.staff_name.Substring(0, 1);
+                        }
+
+                        text += "--";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "00:00-08:00"
+                        && x.workShiftRequirement.department == "急診").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+                            text += staff.staff_name.Substring(0, 1);
+                        }
+                        sheet.Rows[7 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+
+                    }
+
+                    //假日班
+                    if (d.Month == month)
+                    {
+                        string text = "";
+                        ScheduleDayClass schedule = scheduleDays.Where(x => x.date.StringToDateTime().ToDateString('-') == d.ToDateString('-')).ToList().FirstOrDefault();
+                        if (schedule == null) continue;
+                        List<AssignedShiftClass> assignedShiftClasses = new List<AssignedShiftClass>();
+
+                        text = "";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "07:30-16:00" || x.workShiftRequirement.time == "08:00-16:00") 
+                        && x.workShiftRequirement.department == "門診").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+                            text += staff.staff_name.Substring(0, 1);
+                        }
+
+                     
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "07:30-16:00" || x.workShiftRequirement.time == "08:00-16:00")
+                        && x.workShiftRequirement.department == "急診").ToList();
+                        if (assignedShiftClasses.Count > 0) text += "--"; 
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+                            text += staff.staff_name.Substring(0, 1);
+                        }
+
+                        if (dayOfWeek == 6 || dayOfWeek == 7)
+                        {
+                            if (text.Replace("--", "").StringIsEmpty() == false)
+                            {
+                                sheet.Rows[3 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                            }
+                        }
+                        else
+                        {
+                            if (text.Replace("--", "").StringIsEmpty() == false)
+                            {
+                                sheet.Rows[2 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text += $"({text})";
+                            }
+                        }
+                        
+
+
+        
+                        text = "[TPN]";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "07:30-16:00" || x.workShiftRequirement.time == "08:00-16:00") && x.workShiftRequirement.shift_type == ShiftTypeEnum.holiday.GetEnumName()
+                        && x.workShiftRequirement.department == "TPN").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+                            text += staff.staff_name.Substring(0, 1);
+                        }
+                        if (text.Replace("[TPN]", "").StringIsEmpty() == false)
+                        {
+                            sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        }
+                        text = "[化療]";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "08:00-12:00") && x.workShiftRequirement.shift_type == ShiftTypeEnum.holiday.GetEnumName()
+                        && x.workShiftRequirement.department == "化療").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+                            text += staff.staff_name.Substring(0, 1);
+                        }
+                        if (text.Replace("[化療]", "").StringIsEmpty() == false)
+                        {
+                            sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        }
+                    }
+                }
+
+                Console.WriteLine("[INFO] 生成 PDF 中...");
                 byte[] bytes_pdf = sheet.SaveToPDF(PdfSharp.PageSize.A4, PdfSharp.PageOrientation.Landscape);
+                Console.WriteLine("[INFO] PDF 生成完成，大小：" + bytes_pdf.Length);
 
                 Stream stream = new MemoryStream(bytes_pdf);
-
-
                 string contentType = "application/octet-stream";
-
-                // 原始檔名（可能有中文）
-                string originalName = $"123.pdf";
-
-
-
-                // UTF-8 檔名（正確編碼）
+                string originalName = $"schedule_{month}.pdf";
                 string utf8FileName = Uri.EscapeDataString(originalName);
 
-                // 設定 Content-Disposition header
                 Response.Headers.Add("Content-Disposition", $"attachment; filename=\"{originalName}\"; filename*=UTF-8''{utf8FileName}");
-
-                // 確保前端能讀到 header
                 Response.Headers.Add("Access-Control-Expose-Headers", "Content-Disposition, Content-Length, Content-Type");
 
+                Console.WriteLine("[INFO] API 成功結束，準備回傳檔案");
                 return File(stream, contentType);
             }
             catch (Exception ex)
             {
+                Console.WriteLine("==== [例外發生] ====");
+                Console.WriteLine($"時間：{DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                Console.WriteLine($"訊息：{ex.Message}");
+                Console.WriteLine($"堆疊：{ex.StackTrace}");
+                if (ex.InnerException != null)
+                {
+                    Console.WriteLine($"內層例外：{ex.InnerException.Message}");
+                    Console.WriteLine($"內層堆疊：{ex.InnerException.StackTrace}");
+                }
+                Console.WriteLine("=====================");
+
                 returnData.Code = -200;
-                returnData.Result = ex.Message;
+                returnData.Result = $"例外：{ex.Message}";
                 return new JsonResult(returnData);
             }
         }
@@ -2020,7 +2410,7 @@ namespace PharmaRosterAPI
 
                         // 1. 先抽出所有 slot
                         var allSlots = ExtractAllSlots(scheduleDays, shift_group_guid);
-                        int totalBase = GetTotalRequiredCount(scheduleDays, shift_group_guid);
+                        int totalBase = GetTotalRequiredCount(date_start.StringToDateTime().Year, date_start.StringToDateTime().Month, shift_group_guid);
 
                         AssignBaseShifts((AssignType)i, allSlots, totalBase, shiftGroupClass, scheduleHistorys, assignedShifts_add, histories_add, validationErrors, leaveRequests, shift_group_guid);
 
@@ -2518,8 +2908,10 @@ namespace PharmaRosterAPI
                             _baseSlots.LockAdd(SunToWen(baseSlots, dt));
                             _baseSlots.LockAdd(Normal_3_Days(baseSlots, dt));
                             _baseSlots.LockAdd(Normal_2_Days(baseSlots, dt));
+                            _baseSlots.LockAdd(Normal_1_Days(baseSlots, dt));
+
                         }
-                   
+
                         break;
                     }
                     else if (dt.DayOfWeek == DayOfWeek.Saturday)
@@ -2956,10 +3348,11 @@ namespace PharmaRosterAPI
         /// <param name="scheduleDays">排班日清單</param>
         /// <param name="shift_group_guid">班別群組 GUID</param>
         /// <returns>需求人數總和 (不扣已指派)</returns>
-        public static int GetTotalRequiredCount(
-            List<ScheduleDayClass> scheduleDays,
-            string shift_group_guid)
+        public static int GetTotalRequiredCount(int year,int month ,string shift_group_guid)
         {
+            DateTime firstDay = new DateTime(year, month, 1);
+            DateTime lastDay = new DateTime(year, month, DateTime.DaysInMonth(year, month));
+            List<ScheduleDayClass> scheduleDays = scheduleDay.GetScheduleDay(firstDay.ToDateString('-'), lastDay.ToDateString('-'));
             if (scheduleDays == null || scheduleDays.Count == 0) return 0;
             if (string.IsNullOrWhiteSpace(shift_group_guid)) return 0;
 
@@ -3591,8 +3984,7 @@ namespace PharmaRosterAPI
             };
 
             // === 找舊的 AssignedShift ===
-            AssignedShiftClass assignedShiftClass = scheduleDay.AssignedShifts
-                .SerchByStaffGUID(assignedShift.req_shift_guid, assignedShift.staff_guid, assignedShift.shift_requirement);
+            AssignedShiftClass assignedShiftClass = scheduleDay.AssignedShifts.SerchByStaffGUID(assignedShift.req_shift_guid, assignedShift.staff_guid, assignedShift.shift_requirement);
 
             if (assignedShiftClass == null)
             {
@@ -3601,6 +3993,7 @@ namespace PharmaRosterAPI
                 assignedShift.updated_at = DateTime.Now.ToDateTimeString_6();
                 assignedShift.created_at = DateTime.Now.ToDateTimeString_6();
                 assignedShift.status = "正常";
+                assignedShift.workShiftRequirement.shift_type = shift_group.shift_type;
                 assignedShifts_add.Add(assignedShift);
                 output.Add(assignedShift);
 
@@ -3614,6 +4007,7 @@ namespace PharmaRosterAPI
                 // 更新 AssignedShift
                 assignedShiftClass.updated_at = DateTime.Now.ToDateTimeString_6();
                 assignedShiftClass.status = "正常";
+                assignedShift.workShiftRequirement.shift_type = shift_group.shift_type;
                 assignedShifts_update.Add(assignedShiftClass);
                 output.Add(assignedShiftClass);
 
