@@ -47,8 +47,8 @@ namespace PharmaRosterLib
         [JsonPropertyName("swing_shift_count")]
         public string SwingShiftCount { get; set; } = "0";
 
-        [JsonPropertyName("night_shift_count")]
-        public string NightShiftCount { get; set; } = "0";
+        [JsonPropertyName("midnight_shift_count")]
+        public string MidnightShiftCount { get; set; } = "0";
 
         [JsonPropertyName("holiday_shift_count")]
         public string HolidayShiftCount { get; set; } = "0";
@@ -92,7 +92,7 @@ namespace PharmaRosterLib
             SwingShiftCount = scheduleHistories
                 .Count(s => s.shift_type == ShiftTypeEnum.swing.GetEnumName()).ToString();
 
-            NightShiftCount = scheduleHistories
+            MidnightShiftCount = scheduleHistories
                 .Count(s => s.shift_type == ShiftTypeEnum.midnight.GetEnumName()).ToString();
 
             HolidayShiftCount = scheduleHistories

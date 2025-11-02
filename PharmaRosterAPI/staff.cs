@@ -482,12 +482,12 @@ namespace PharmaRosterAPI
             try
             {
                 // 驗證必填
-                if (returnData.ValueAry == null || returnData.ValueAry.Count == 0)
-                {
-                    returnData.Code = -200;
-                    returnData.Result = "ValueAry 不能為空";
-                    return returnData.JsonSerializationt();
-                }
+                //if (returnData.ValueAry == null || returnData.ValueAry.Count == 0)
+                //{
+                //    returnData.Code = -200;
+                //    returnData.Result = "ValueAry 不能為空";
+                //    return returnData.JsonSerializationt();
+                //}
                 var sql_staff = MethodClass.GetSQLControl<StaffClass>();
 
                 (List<StaffClass> staffs, int totalCount, int totalPages, int pageSize , int currentPage) = GetStaffs(returnData.ValueAry);
@@ -904,29 +904,46 @@ namespace PharmaRosterAPI
                 {
                     IWorkbook workbook = new XSSFWorkbook(stream);
                     ISheet sheet = workbook.GetSheetAt(0);
+                    DataTable dataTable = sheet.SheetToDataTable();
 
-                    // 假設第一列是欄位名稱，從第二列開始讀
-                    for (int row = 1; row <= sheet.LastRowNum; row++)
+                    for(int i = 0; i < dataTable.Rows.Count; i++)
                     {
-                        IRow currentRow = sheet.GetRow(row);
-                        if (currentRow == null) continue;
-
-
                         StaffClass staff = new StaffClass
                         {
                             GUID = Guid.NewGuid().ToString(),
-                            staff_id = currentRow.GetCell(0)?.ToString().Trim(),
-                            staff_name = currentRow.GetCell(1)?.ToString().Trim(),
-                            role = currentRow.GetCell(2)?.ToString().Trim(),
+                            staff_id = dataTable.Rows[i]["staff_id"]?.ToString().Trim(),
+                            staff_name = dataTable.Rows[i]["staff_name"]?.ToString().Trim(),
+                            role = dataTable.Rows[i]["role"]?.ToString().Trim(),
+                            staff_simple_name = dataTable.Rows[i]["staff_simple_name"]?.ToString().Trim(),
                             created_at = DateTime.Now.ToDateTimeString_6(),
                             updated_at = DateTime.Now.ToDateTimeString_6()
                         };
-
                         if (!string.IsNullOrEmpty(staff.staff_id) && !string.IsNullOrEmpty(staff.staff_name))
                         {
                             staffs.Add(staff);
                         }
                     }
+                    //// 假設第一列是欄位名稱，從第二列開始讀
+                    //for (int row = 1; row <= sheet.LastRowNum; row++)
+                    //{
+                    //    IRow currentRow = sheet.GetRow(row);
+                    //    if (currentRow == null) continue;
+
+                    //    StaffClass staff = new StaffClass
+                    //    {
+                    //        GUID = Guid.NewGuid().ToString(),
+                    //        staff_id = currentRow.GetCell(0)?.ToString().Trim(),
+                    //        staff_name = currentRow.GetCell(1)?.ToString().Trim(),
+                    //        role = currentRow.GetCell(2)?.ToString().Trim(),
+                    //        created_at = DateTime.Now.ToDateTimeString_6(),
+                    //        updated_at = DateTime.Now.ToDateTimeString_6()
+                    //    };
+
+                    //    if (!string.IsNullOrEmpty(staff.staff_id) && !string.IsNullOrEmpty(staff.staff_name))
+                    //    {
+                    //        staffs.Add(staff);
+                    //    }
+                    //}
                 }
               
                 if (staffs.Count == 0)

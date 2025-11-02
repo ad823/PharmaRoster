@@ -1766,11 +1766,11 @@ namespace PharmaRosterAPI
 
                             if (asg.workShiftRequirement.department.Contains("中藥"))
                             {
-                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                                text += $"[{staff.staff_simple_name.Substring(0, 1)}]";
                             }
                             else
                             {
-                                text += staff.staff_name.Substring(0, 1);
+                                text += staff.staff_simple_name.Substring(0, 1);
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
@@ -1787,11 +1787,11 @@ namespace PharmaRosterAPI
 
                             if (asg.workShiftRequirement.department.Contains("中藥"))
                             {
-                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                                text += $"[{staff.staff_simple_name.Substring(0, 1)}]";
                             }
                             else
                             {
-                                text += staff.staff_name.Substring(0, 1);
+                                text += staff.staff_simple_name.Substring(0, 1);
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
@@ -1811,11 +1811,11 @@ namespace PharmaRosterAPI
 
                             if (asg.workShiftRequirement.department.Contains("中藥"))
                             {
-                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                                text += $"[{staff.staff_simple_name.Substring(0, 1)}]";
                             }
                             else
                             {
-                                text += staff.staff_name.Substring(0, 1);
+                                text += staff.staff_simple_name.Substring(0, 1);
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
@@ -1832,11 +1832,11 @@ namespace PharmaRosterAPI
 
                             if (asg.workShiftRequirement.department.Contains("中藥"))
                             {
-                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                                text += $"[{staff.staff_simple_name.Substring(0, 1)}]";
                             }
                             else
                             {
-                                text += staff.staff_name.Substring(0, 1);
+                                text += staff.staff_simple_name.Substring(0, 1);
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
@@ -1850,11 +1850,11 @@ namespace PharmaRosterAPI
 
                             if (asg.workShiftRequirement.department.Contains("中藥"))
                             {
-                                text += $"[{staff.staff_name.Substring(0, 1)}]";
+                                text += $"[{staff.staff_simple_name.Substring(0, 1)}]";
                             }
                             else
                             {
-                                text += staff.staff_name.Substring(0, 1);
+                                text += staff.staff_simple_name.Substring(0, 1);
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
@@ -1882,7 +1882,7 @@ namespace PharmaRosterAPI
                             AssignedShiftClass asg = assignedShiftClasses[i];
                             StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
                             if (staff == null) { continue; }
-                            text += staff.staff_name.Substring(0, 1);
+                            text += staff.staff_simple_name.Substring(0, 1);
                         }
 
                         text += "--";
@@ -1893,7 +1893,7 @@ namespace PharmaRosterAPI
                             AssignedShiftClass asg = assignedShiftClasses[i];
                             StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
                             if (staff == null) { continue; }
-                            text += staff.staff_name.Substring(0, 1);
+                            text += staff.staff_simple_name.Substring(0, 1);
                         }
                         sheet.Rows[7 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
 
@@ -1915,7 +1915,7 @@ namespace PharmaRosterAPI
                             AssignedShiftClass asg = assignedShiftClasses[i];
                             StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
                             if (staff == null) { continue; }
-                            text += staff.staff_name.Substring(0, 1);
+                            text += staff.staff_simple_name.Substring(0, 1);
                         }
 
                      
@@ -1927,7 +1927,7 @@ namespace PharmaRosterAPI
                             AssignedShiftClass asg = assignedShiftClasses[i];
                             StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
                             if (staff == null) { continue; }
-                            text += staff.staff_name.Substring(0, 1);
+                            text += staff.staff_simple_name.Substring(0, 1);
                         }
 
                         if (dayOfWeek == 6 || dayOfWeek == 7)
@@ -1956,7 +1956,7 @@ namespace PharmaRosterAPI
                             AssignedShiftClass asg = assignedShiftClasses[i];
                             StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
                             if (staff == null) { continue; }
-                            text += staff.staff_name.Substring(0, 1);
+                            text += staff.staff_simple_name.Substring(0, 1);
                         }
                         if (text.Replace("[TPN]", "").StringIsEmpty() == false)
                         {
@@ -1970,7 +1970,7 @@ namespace PharmaRosterAPI
                             AssignedShiftClass asg = assignedShiftClasses[i];
                             StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
                             if (staff == null) { continue; }
-                            text += staff.staff_name.Substring(0, 1);
+                            text += staff.staff_simple_name.Substring(0, 1);
                         }
                         if (text.Replace("[化療]", "").StringIsEmpty() == false)
                         {
