@@ -382,8 +382,8 @@ public static List<WorkShiftRequirementClass> UpdateRequirements(
             ? match.hdr
             : ori.hdr;
         // 原始需求數（以 ori 為主）
-        string required = match?.required_count ?? ori.required_count ?? defaultCount;
-
+        string required  = match?.required_count ?? ori.required_count ?? defaultCount;
+     
         // ✅ 判斷 HDR 變化後調整
         // 原始 hdr 狀態
         bool oldHdr = ori.hdr?.Trim().ToLower() == "true";

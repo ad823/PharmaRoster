@@ -575,6 +575,12 @@ namespace PharmaRosterAPI
                 }
                 shiftGroupClass.workShiftRanges = wsr;
 
+                var input_wsr = input.workShiftRequirements;
+                foreach (var range in input_wsr)
+                {
+                    range.day = date.StringToDateTime().DayOfWeek.ToString(); // 更新星期
+                }
+                input.workShiftRequirements = input_wsr;
 
                 // === 4. 確認 ScheduleDay 是否存在
                 date = date.StringToDateTime().ToDateString();
@@ -625,7 +631,7 @@ namespace PharmaRosterAPI
                 returnData.Result = $"新增({datas_add.Count})筆資料,修改({datas_update.Count})筆資料";
                 returnData.TimeTaken = $"{timer}";
                 returnData.Data = datas_add.Concat(datas_update).ToList();
-                return returnData.JsonSerializationt();
+                return returnData.JsonSerializationt(true);
             }
             catch (Exception ex)
             {
@@ -1774,7 +1780,7 @@ namespace PharmaRosterAPI
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
-                        sheet.Rows[3 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
 
 
                         text = "";
@@ -1795,12 +1801,9 @@ namespace PharmaRosterAPI
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
-                        sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[5 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
 
-                        if(dateStr == "2025-11-05")
-                        {
-                            Console.WriteLine("[DEBUG] 2024-11-28 特殊處理測試點");
-                        }
+                  
                         text = "";
                         assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "14:30-23:00").ToList();
                         for (int i = 0; i < assignedShiftClasses.Count; i++)
@@ -1819,7 +1822,7 @@ namespace PharmaRosterAPI
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
-                        sheet.Rows[5 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[6 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
 
 
                         text = "";
@@ -1858,7 +1861,7 @@ namespace PharmaRosterAPI
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
-                        sheet.Rows[6 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[7 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
 
                         if(flag_HDR)
                         {
@@ -1895,7 +1898,7 @@ namespace PharmaRosterAPI
                             if (staff == null) { continue; }
                             text += staff.staff_simple_name.Substring(0, 1);
                         }
-                        sheet.Rows[7 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[3 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
 
                     }
 
@@ -1934,7 +1937,7 @@ namespace PharmaRosterAPI
                         {
                             if (text.Replace("--", "").StringIsEmpty() == false)
                             {
-                                sheet.Rows[3 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                                sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
                             }
                         }
                         else
@@ -1960,7 +1963,7 @@ namespace PharmaRosterAPI
                         }
                         if (text.Replace("[TPN]", "").StringIsEmpty() == false)
                         {
-                            sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                            sheet.Rows[5 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
                         }
                         text = "[化療]";
                         assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "08:00-12:00") && x.workShiftRequirement.shift_type == ShiftTypeEnum.holiday.GetEnumName()
@@ -1974,7 +1977,7 @@ namespace PharmaRosterAPI
                         }
                         if (text.Replace("[化療]", "").StringIsEmpty() == false)
                         {
-                            sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                            sheet.Rows[5 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
                         }
                     }
                 }
@@ -3090,115 +3093,7 @@ namespace PharmaRosterAPI
             return;
 
         }
-        /// <summary>
-        /// 在基礎班分配完成後，幫同一個人接續排連續班
-        /// </summary>
-        private void AssignContinuousShifts(
-            List<NightSlot> allSlots,
-            List<AssignedShiftClass> assignedShifts_add,
-            List<StaffScheduleHistoryClass> histories_add,
-            List<StaffScheduleHistoryClass> scheduleHistorys,
-            List<string> validationErrors,
-            List<LeaveRequestClass> leaveRequests,
-            string shift_group_guid,
-            ShiftGroupClass shiftGroupClass)
-        {
-            // 只抓不是基礎班的 slot (14:30、13:30…)
-            var continuousSlots = allSlots
-                .Where(s => !s.IsBase)
-                .OrderBy(s => s.Date)
-                .ThenBy(s => GetShiftPriority(s.Start.ToString("HH:mm"))) // 用剛才的優先權函式
-                .ToList();
-
-            string[] staffs_guid = histories_add
-                .Where(h => h.shift_group_guid == shift_group_guid)
-                .Select(h => h.staff_guid)
-                .Distinct()
-                .ToArray();
-            foreach(var guid in staffs_guid)
-            {
-                List<StaffScheduleHistoryClass> historys = histories_add.Where(h => h.staff_guid == guid && h.shift_group_guid == shift_group_guid).Select(h => h).ToList();
-            }
-            foreach (var history in histories_add.Where(h => h.shift_group_guid == shift_group_guid))
-            {
-                var staffGuid = history.staff_guid;
-                var staff = shiftGroupClass.Members.FirstOrDefault(m => m.staff_guid == staffGuid)?.staff_info;
-                if (staff == null) continue;
-
-                // 從該基礎班的日期開始往後找連續班
-                var baseDate = history.date.StringToDateTime();
-
-                foreach (var slot in continuousSlots)
-                {
-                    if (slot.AssignedCount >= slot.RequiredCount) continue;
-
-                    // 必須是「比基礎班更早的時段」→ 例如 Day2:15:30, Day3:14:30…
-                    if (slot.Date <= baseDate) continue;
-
-                    // 已經在當日有班 → 跳過
-                    bool alreadyAssignedToday = histories_add.Any(h =>
-                        h.staff_guid == staffGuid && h.date == slot.Date.ToDateString('-'));
-                    if (alreadyAssignedToday) continue;
-
-                    // 檢查驗證條件
-                    var newHistory = new StaffScheduleHistoryClass
-                    {
-                        GUID = Guid.NewGuid().ToString(),
-                        staff_guid = staff.GUID,
-                        date = slot.Date.ToDateString('-'),
-                        time = slot.Wr.time,
-                        department = slot.Wr.department,
-                        req_shift_guid = slot.Req.GUID,
-                        shift_group_guid = shift_group_guid,
-                        shift_type = shiftGroupClass.shift_type,
-                        created_at = DateTime.Now.ToDateTimeString_6(),
-                        updated_at = DateTime.Now.ToDateTimeString_6(),
-                        status = "正常",
-                        source = "自動排班"
-                    };
-
-                    var validation = ScheduleValidator.ValidateSchedule(staff, newHistory);
-                    if (!validation.isValid)
-                    {
-                        validationErrors.Add($"[{staff.staff_name}] {slot.Date} {slot.Wr.time} → {validation.message}");
-                        continue;
-                    }
-
-                    if (leaveRequests.HasLeaveOnDate(staff.GUID, slot.Date.ToDateString('-')))
-                    {
-                        validationErrors.Add($"[{staff.staff_name}] {slot.Date} {slot.Wr.time} → 該日有請假紀錄");
-                        continue;
-                    }
-
-                    // 成功指派
-                    var assignedShift = new AssignedShiftClass
-                    {
-                        GUID = Guid.NewGuid().ToString(),
-                        date = slot.Date.ToDateString('-'),
-                        staff_guid = staff.GUID,
-                        req_shift_guid = slot.Req.GUID,
-                        shift_requirement = JsonSerializer.Serialize(slot.Wr),
-                        created_at = DateTime.Now.ToDateTimeString_6(),
-                        updated_at = DateTime.Now.ToDateTimeString_6(),
-                        status = "正常",
-                        staff = staff
-                    };
-
-                    assignedShifts_add.Add(assignedShift);
-                    newHistory.assigned_shift_guid = assignedShift.GUID;
-                    histories_add.Add(newHistory);
-                    scheduleHistorys.Add(newHistory);
-
-                    slot.AssignedCount++;
-                    slot.Wr.assigned_count = slot.AssignedCount.ToString();
-
-                    // 👉 每人只接一個連續班，然後停
-                    break;
-                }
-            }
-        }
-
-
+       
 
         private (List<DateTime> dateTimes , List<string> timeRanges) GetAllDateTimesAndTimeRanges(DateTime date_start)
         {
@@ -3210,75 +3105,7 @@ namespace PharmaRosterAPI
         }
 
 
-        // ─────────────────────────────────────────────────────────────
-        // 2) 抽出所有小夜班 slot（人數攤平 + 跨日處理 + 判斷是否「最後班」）
-        //    只會抽出 shift_group_guid 相符的需求
-        // ─────────────────────────────────────────────────────────────
-        private List<NightSlot> ExtractAllNightSlots(List<ScheduleDayClass> scheduleDays, string shift_group_guid)
-        {
-            var slots = new List<NightSlot>();
-
-            if (scheduleDays == null) return slots;
-
-            foreach (var day in scheduleDays)
-            {
-                // day.RequiredShifts 可能包含不同群組，先過濾
-                foreach (var req in day.RequiredShifts.Where(r => r.shift_group_guid == shift_group_guid))
-                {
-                    // 以 req.date 為準建立日期
-                    var d = req.date.StringToDateTime();
-
-                    if (req.workShiftRequirements == null) continue;
-
-                    foreach (var wr in req.workShiftRequirements)
-                    {
-                        // 安全拿到 TimeRange，若為 null 則以 0:0 視為占位
-                        var tr = wr.TimeRange ?? default;
-                        var start = d.Add(tr.start);
-                        var end = d.Add(tr.end);
-
-                        // 跨日處理：如 00:00、或 end <= start，視為隔日
-                        if (wr.time != null && IsLastShiftOfDay(wr.time))
-                        {
-                            // 以文字定義的「最後班」優先判斷：結束時間應跨日
-                            if (end <= start) end = end.AddDays(1);
-                            if (end.TimeOfDay == TimeSpan.Zero) end = end.AddDays(1);
-                        }
-                        else
-                        {
-                            // 一般保護：若 end <= start，也視為跨日
-                            if (end <= start) end = end.AddDays(1);
-                        }
-
-                        // 需求攤平：RequiredCount 幾人就拆幾個 slot
-                        int need = wr.required_count.StringToInt32();
-                        if (need < 1) need = 1; // 保底
-
-                        bool isBase = IsLastShiftOfDay(wr.time)
-                                      || tr.end == TimeSpan.Zero
-                                      || tr.end >= new TimeSpan(23, 59, 0);
-
-                        for (int i = 0; i < need; i++)
-                        {
-                            slots.Add(new NightSlot
-                            {
-                                Date = d,
-                                Time = wr.time,
-                                RequiredCount = 1,       // 攤平為 1
-                                AssignedCount = 0,
-                                Req = req,
-                                Wr = wr,
-                                IsBase = isBase,
-                                Start = start,
-                                End = end
-                            });
-                        }
-                    }
-                }
-            }
-
-            return slots;
-        }
+     
         /// <summary>
         /// 抽出所有班次 slot（人數攤平 + 跨日處理）
         /// 不論是不是最後班都會取出
@@ -3421,13 +3248,24 @@ namespace PharmaRosterAPI
         /// </summary>
         static private void PrepareShiftGroupMembers(ShiftGroupClass shiftGroupClass, List<StaffScheduleHistoryClass> scheduleHistorys)
         {
-            if (shiftGroupClass == null || shiftGroupClass.Members == null || shiftGroupClass.Members.Count == 0)
-                return;
+            if (shiftGroupClass == null || shiftGroupClass.Members == null || shiftGroupClass.Members.Count == 0) return;
 
-            var filteredHistorys = scheduleHistorys
-                .Where(x => x.shift_type == shiftGroupClass.shift_type)
-                .ToList();
+            List<StaffScheduleHistoryClass> filteredHistorys = null;
 
+            if (shiftGroupClass.shift_type == "holiday")
+            {
+                filteredHistorys = scheduleHistorys
+                                   .Where(x => x.shift_type == shiftGroupClass.shift_type)
+                                   .Where(x => x.shift_group_guid == shiftGroupClass.GUID)
+                                   .ToList();
+            }
+            else
+            {
+                filteredHistorys = scheduleHistorys
+                                   .Where(x => x.shift_type == shiftGroupClass.shift_type)
+                                   .ToList();
+            }
+       
             var keypairs_scheduleHistorys = filteredHistorys.CoverToDictionaryBy_staff_guid();
 
             foreach (var member in shiftGroupClass.Members)
@@ -3435,70 +3273,17 @@ namespace PharmaRosterAPI
                 var scheduleHistorys_buf = keypairs_scheduleHistorys.SortDictionaryBy_staff_guid(member.staff_guid);
                 if (scheduleHistorys_buf.Count > 0)
                 {
-                    member.weight = (member.weight.StringToUInt32() + scheduleHistorys_buf.Count).ToString();
+                    member.weight = (scheduleHistorys_buf.Count).ToString();
                 }
-            }
-
-            shiftGroupClass.Members = shiftGroupClass.Members.SortByWeightAndOrderIndex();
-        }
-        /// <summary>
-        /// 根據 weight、歷史紀錄，並考慮小夜連續性 (僅限 swing)，最多連續 4 天，>=5 天直接禁止分配
-        /// </summary>
-        private void PrepareSwingShiftGroupMembers(ShiftGroupClass shiftGroupClass, List<StaffScheduleHistoryClass> scheduleHistorys,
-            string currentDate, Dictionary<string, int> baseWeights, List<string> validationErrors = null)
-        {
-            if (shiftGroupClass?.Members == null || shiftGroupClass.Members.Count == 0) return;
-
-            var filteredHistorys = scheduleHistorys.Where(x => x.shift_type == shiftGroupClass.shift_type).ToList();
-            var keypairs = filteredHistorys.CoverToDictionaryBy_staff_guid();
-            DateTime d = string.IsNullOrEmpty(currentDate) ? DateTime.MinValue : currentDate.StringToDateTime();
-
-            foreach (var member in shiftGroupClass.Members)
-            {
-                int baseWeight = baseWeights.TryGetValue(member.staff_guid, out var bw) ? bw : member.weight.StringToInt32();
-                var buf = keypairs.SortDictionaryBy_staff_guid(member.staff_guid);
-                int historyCount = buf.Count;
-                int weightNow = baseWeight + historyCount;
-
-                if (!string.IsNullOrEmpty(currentDate))
+                else
                 {
-                    // 計算連續天數
-                    int continuousDays = 0;
-
-                    DateTime check = d.AddDays(-1);
-                    while (buf.Any(h => h.date.StringToDateTime() == check))
-                    {
-                        continuousDays++;
-                        check = check.AddDays(-1);
-                    }
-
-                    check = d.AddDays(1);
-                    while (buf.Any(h => h.date.StringToDateTime() == check))
-                    {
-                        continuousDays++;
-                        check = check.AddDays(1);
-                    }
-
-                    if (continuousDays >= 5)
-                    {
-                        weightNow = int.MaxValue; // 禁止
-                        validationErrors?.Add($"[錯誤] {member.staff_info?.staff_name ?? member.staff_guid} 已連續小夜 ≥ 5 天，禁止再分配！");
-                    }
-                    else if (continuousDays >= 2) // 3~4 天
-                    {
-                        weightNow -= 2;
-                    }
-                    else if (continuousDays == 1) // 2 天
-                    {
-                        weightNow -= 1;
-                    }
+                    member.weight = "0";
                 }
-
-                member.weight = weightNow.ToString();
             }
 
             shiftGroupClass.Members = shiftGroupClass.Members.SortByWeightAndOrderIndex();
         }
+     
         static private void AssignSwingShift(ShiftGroupClass shiftGroupClass, RequiredShiftClass req, WorkShiftRequirementClass wr,
             List<StaffScheduleHistoryClass> scheduleHistorys, List<AssignedShiftClass> assignedShifts_add,
             List<StaffScheduleHistoryClass> histories_add, List<string> validationErrors,
