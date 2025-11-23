@@ -192,6 +192,12 @@ public class WorkShiftRequirementClass
     [JsonPropertyName("hdr")]
     public string hdr { get; set; }
 
+    /// <summary>
+    /// 是否禁止自動排班（true = 不自動排班）
+    /// </summary>
+    [JsonPropertyName("disabled")]
+    public bool disabled { get; set; } = false;
+
     [JsonIgnore]
     public (TimeSpan start, TimeSpan end)? TimeRange
     {

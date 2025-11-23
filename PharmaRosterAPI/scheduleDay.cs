@@ -1933,27 +1933,26 @@ namespace PharmaRosterAPI
                             text += staff.staff_simple_name.Substring(0, 1);
                         }
 
-                        if (dayOfWeek == 6 || dayOfWeek == 7)
+                        if (dayOfWeek == 6 || dayOfWeek == 7 || true)
                         {
                             if (text.Replace("--", "").StringIsEmpty() == false)
                             {
                                 sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
                             }
                         }
-                        else
-                        {
-                            if (text.Replace("--", "").StringIsEmpty() == false)
-                            {
-                                sheet.Rows[2 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text += $"({text})";
-                            }
-                        }
+                        //else
+                        //{
+                        //    if (text.Replace("--", "").StringIsEmpty() == false)
+                        //    {
+                        //        sheet.Rows[2 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text += $"({text})";
+                        //    }
+                        //}
                         
 
 
         
                         text = "[TPN]";
-                        assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "07:30-16:00" || x.workShiftRequirement.time == "08:00-16:00") && x.workShiftRequirement.shift_type == ShiftTypeEnum.holiday.GetEnumName()
-                        && x.workShiftRequirement.department == "TPN").ToList();
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "07:30-16:00" || x.workShiftRequirement.time == "08:00-16:00")  && x.workShiftRequirement.department == "TPN").ToList();
                         for (int i = 0; i < assignedShiftClasses.Count; i++)
                         {
                             AssignedShiftClass asg = assignedShiftClasses[i];
@@ -1966,8 +1965,8 @@ namespace PharmaRosterAPI
                             sheet.Rows[5 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
                         }
                         text = "[化療]";
-                        assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "08:00-12:00") && x.workShiftRequirement.shift_type == ShiftTypeEnum.holiday.GetEnumName()
-                        && x.workShiftRequirement.department == "化療").ToList();
+                 
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "08:00-12:00")  && x.workShiftRequirement.department == "化療").ToList();
                         for (int i = 0; i < assignedShiftClasses.Count; i++)
                         {
                             AssignedShiftClass asg = assignedShiftClasses[i];
@@ -3278,6 +3277,20 @@ namespace PharmaRosterAPI
                 else
                 {
                     member.weight = "0";
+                }
+
+                if (shiftGroupClass.shift_type == "swing")
+                {
+                    member.weight = (member.weight.StringToInt32() + member.staff_info.SwingShiftWeightBase.StringToInt32()).ToString();
+                }
+                else if (shiftGroupClass.shift_type == "midnight")
+                {
+                    member.weight = (member.weight.StringToInt32() + member.staff_info.MidnightShiftCount.StringToInt32()).ToString();
+                }
+                else if (shiftGroupClass.shift_type == "holiday")
+                {
+                    member.weight = (member.weight.StringToInt32() + member.staff_info.HolidayShiftWeightBase.StringToInt32()).ToString();
+
                 }
             }
 

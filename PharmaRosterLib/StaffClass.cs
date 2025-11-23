@@ -40,6 +40,27 @@ namespace PharmaRosterLib
         [Description("VARCHAR,50,NONE")]
         public string role { get; set; }
 
+        /// <summary>日班基礎權重</summary>
+        [JsonPropertyName("day_shift_weight_base")]
+        [Description("VARCHAR,10,NONE")]
+        public string DayShiftWeightBase { get; set; } = "0";
+
+        /// <summary>小夜班基礎權重</summary>
+        [JsonPropertyName("swing_shift_weight_base")]
+        [Description("VARCHAR,10,NONE")]
+        public string SwingShiftWeightBase { get; set; } = "0";
+
+        /// <summary>大夜班基礎權重</summary>
+        [JsonPropertyName("midnight_shift_weight_base")]
+        [Description("VARCHAR,10,NONE")]
+        public string MidnightShiftWeightBase { get; set; } = "0";
+
+        /// <summary>假日班基礎權重</summary>
+        [JsonPropertyName("holiday_shift_weight_base")]
+        [Description("VARCHAR,10,NONE")]
+        public string HolidayShiftWeightBase { get; set; } = "0";
+
+
         // ========== 累積次數 (字串形式，可重新計算) ==========
         [JsonPropertyName("day_shift_count")]
         public string DayShiftCount { get; set; } = "0";
@@ -86,17 +107,21 @@ namespace PharmaRosterLib
         /// </summary>
         public void RecalculateCounts()
         {
-            DayShiftCount = scheduleHistories
-                .Count(s => s.shift_type == ShiftTypeEnum.day.GetEnumName()).ToString();
+            if (DayShiftWeightBase.StringIsEmpty()) DayShiftWeightBase = "0";
+            if (SwingShiftWeightBase.StringIsEmpty()) SwingShiftWeightBase = "0";
+            if (MidnightShiftWeightBase.StringIsEmpty()) MidnightShiftWeightBase = "0";
+            if (HolidayShiftWeightBase.StringIsEmpty()) HolidayShiftWeightBase = "0";
+            DayShiftCount = (scheduleHistories
+                .Count(s => s.shift_type == ShiftTypeEnum.day.GetEnumName()) + DayShiftWeightBase?.StringToInt32()).ToString();
 
-            SwingShiftCount = scheduleHistories
-                .Count(s => s.shift_type == ShiftTypeEnum.swing.GetEnumName()).ToString();
+            SwingShiftCount = (scheduleHistories
+                .Count(s => s.shift_type == ShiftTypeEnum.swing.GetEnumName()) + SwingShiftWeightBase?.StringToInt32()).ToString();
 
-            MidnightShiftCount = scheduleHistories
-                .Count(s => s.shift_type == ShiftTypeEnum.midnight.GetEnumName()).ToString();
+            MidnightShiftCount = (scheduleHistories
+                .Count(s => s.shift_type == ShiftTypeEnum.midnight.GetEnumName()) + MidnightShiftWeightBase?.StringToInt32()).ToString();
 
-            HolidayShiftCount = scheduleHistories
-                .Count(s => s.shift_type == ShiftTypeEnum.holiday.GetEnumName()).ToString();
+            HolidayShiftCount = (scheduleHistories
+                .Count(s => s.shift_type == ShiftTypeEnum.holiday.GetEnumName()) + HolidayShiftWeightBase?.StringToInt32()).ToString();
         }
     }
 
