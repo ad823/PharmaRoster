@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using System.Text;
 using Google.Protobuf.WellKnownTypes;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -15,6 +16,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi.Models;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.IdentityModel.Tokens;
 
 namespace PharmaRosterAPI
 {
@@ -61,6 +64,36 @@ namespace PharmaRosterAPI
                 c.OrderActionsBy(s => s.RelativePath);
 
             });
+
+            // JWT 驗證（只有 [Authorize] 才會啟用）
+            services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+                .AddJwtBearer(options =>
+                {
+                    options.TokenValidationParameters = new TokenValidationParameters
+                    {
+                        // 驗證簽發者
+                        ValidateIssuer = true,
+                        ValidIssuer = JwtHelper.Issuer,
+
+                        // 驗證接收者
+                        ValidateAudience = true,
+                        ValidAudience = JwtHelper.Audience,
+
+                        // 驗證過期時間
+                        ValidateLifetime = true,
+
+                        // 驗證簽章
+                        ValidateIssuerSigningKey = true,
+                        IssuerSigningKey = new SymmetricSecurityKey(
+                            Encoding.UTF8.GetBytes(
+                               JwtHelper.SecretKey
+                            )
+                        ),
+
+                        // 醫療系統建議縮短時間誤差
+                        ClockSkew = TimeSpan.FromMinutes(1)
+                    };
+                });
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.
@@ -69,17 +102,26 @@ namespace PharmaRosterAPI
             if (env.IsDevelopment())
             {
                 app.UseDeveloperExceptionPage();
-
             }
+
             app.UseForwardedHeaders();
+
+            app.UseHttpsRedirection();
+
+            app.UseRouting();
+
             app.UseCors(builder =>
             {
-                builder.AllowAnyHeader().AllowAnyMethod().SetIsOriginAllowed(_ => true).AllowCredentials();
+                builder
+                    .AllowAnyHeader()
+                    .AllowAnyMethod()
+                    .SetIsOriginAllowed(_ => true)
+                    .AllowCredentials();
             });
-            app.UseHttpsRedirection();
-            app.UseRouting();
-            app.UseCors(); // 啟用CORS
+
+            app.UseAuthentication();
             app.UseAuthorization();
+
             app.UseDefaultFiles();
             app.UseStaticFiles();
             app.UseWebSockets();
@@ -92,5 +134,6 @@ namespace PharmaRosterAPI
             app.UseSwagger();
             app.UseSwaggerUI();
         }
+
     }
 }

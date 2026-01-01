@@ -2562,276 +2562,121 @@ namespace PharmaRosterAPI
             return list_baseSlots;
         }
 
+        private static readonly string[] TimeRanges =
+        {
+            "12:00-20:00",
+            "12:30-21:00",
+            "13:30-22:00",
+            "14:30-23:00",
+            "15:30-23:59",
+            "16:00-23:59"
+        };
+        private List<List<NightSlot>> BuildNormalDays(
+            List<NightSlot> baseSlots,
+            DateTime startDate,
+            int dayCount)
+        {
+            if (dayCount < 1 || dayCount > TimeRanges.Length)
+                throw new ArgumentOutOfRangeException(
+                    nameof(dayCount),
+                    $"dayCount 必須為 1~{TimeRanges.Length}"
+                );
+
+            // 建立連續日期
+            List<DateTime> dates = new List<DateTime>();
+            for (int i = 0; i < dayCount; i++)
+                dates.Add(startDate.AddDays(i));
+
+            // 🔥 P(6, dayCount)
+            var permutations = BuildPermutations(TimeRanges, dayCount);
+
+            // ⭐ 排序：從早到晚優先
+            var orderedPermutations = permutations
+                .OrderBy(p => CountInversions(p.Select(ParseStartMinutes).ToList()))
+                .ThenBy(p => p.Sum(ParseStartMinutes))
+                .ToList();
+
+            var result = new List<List<NightSlot>>();
+
+            foreach (var times in orderedPermutations)
+            {
+                var slots = baseSlots.FindSlotsByDatesAndTimeRanges(dates, times);
+
+                // 規則：每一天都必須對應到
+                if (slots != null && slots.Count == dayCount)
+                {
+                    result.Add(slots);
+                }
+            }
+
+            return result;
+        }
+        private List<List<string>> BuildPermutations( string[] source, int pickCount)
+        {
+            var results = new List<List<string>>();
+            var used = new bool[source.Length];
+            var current = new List<string>(pickCount);
+
+            void Dfs()
+            {
+                if (current.Count == pickCount)
+                {
+                    results.Add(new List<string>(current));
+                    return;
+                }
+
+                for (int i = 0; i < source.Length; i++)
+                {
+                    if (used[i]) continue;
+
+                    used[i] = true;
+                    current.Add(source[i]);
+
+                    Dfs();
+
+                    current.RemoveAt(current.Count - 1);
+                    used[i] = false;
+                }
+            }
+
+            Dfs();
+            return results;
+        }
+        private int ParseStartMinutes(string timeRange)
+        {
+            // "HH:mm-HH:mm"
+            var start = timeRange.Split('-')[0];
+            var parts = start.Split(':');
+            return int.Parse(parts[0]) * 60 + int.Parse(parts[1]);
+        }
+        private int CountInversions(List<int> values)
+        {
+            int count = 0;
+            for (int i = 0; i < values.Count; i++)
+                for (int j = i + 1; j < values.Count; j++)
+                    if (values[i] > values[j]) count++;
+            return count;
+        }
+
         private List<List<NightSlot>> Normal_4_Days(List<NightSlot> baseSlots, DateTime dt)
         {
-            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
-            List<NightSlot> _baseSlots = new List<NightSlot>();
-            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
-
-            List<DateTime> dates_slots = new List<DateTime>();
-            List<string> times_slots = new List<string>();
-
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[1], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[2], timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[2], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[3], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[3], timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[3], timeRamges[2] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[1], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[2], timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[2], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[3], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[3], timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[4], timeRamges[3], timeRamges[2] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[1], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[0], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[0], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[1], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[0], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2), dt.AddDays(3) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[1], timeRamges[0], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-
-
-
-
-
-
-
-            return list_baseSlots;
+            return BuildNormalDays(baseSlots, dt, 4);
         }
+
         private List<List<NightSlot>> Normal_3_Days(List<NightSlot> baseSlots, DateTime dt)
         {
-            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
-            List<NightSlot> _baseSlots = new List<NightSlot>();
-            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
-            List<DateTime> dates_slots = new List<DateTime>();
-            List<string> times_slots = new List<string>();
-
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[3], timeRamges[2] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[4] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[4] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[4] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[1], timeRamges[4] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[2], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[1], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[2], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1), dt.AddDays(2) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[1], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-
-            return list_baseSlots;
+            return BuildNormalDays(baseSlots, dt, 3);
         }
         private List<List<NightSlot>> Normal_2_Days(List<NightSlot> baseSlots, DateTime dt)
         {
-            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
-            List<NightSlot> _baseSlots = new List<NightSlot>();
-            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
-            List<DateTime> dates_slots = new List<DateTime>();
-            List<string> times_slots = new List<string>();
-
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[2] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[4], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[2] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[1], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[2], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[2], timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[2] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt, dt.AddDays(1) };
-            times_slots = new List<string>() { timeRamges[3], timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            return list_baseSlots;
+            return BuildNormalDays(baseSlots, dt, 2);
         }
         private List<List<NightSlot>> Normal_1_Days(List<NightSlot> baseSlots, DateTime dt)
         {
-            string[] timeRamges = new string[] { "12:30-21:00", "13:30-22:00", "14:30-23:00", "15:30-23:59", "16:00-23:59", };
-            List<NightSlot> _baseSlots = new List<NightSlot>();
-            List<List<NightSlot>> list_baseSlots = new List<List<NightSlot>>();
-            List<DateTime> dates_slots = new List<DateTime>();
-            List<string> times_slots = new List<string>();
-
-
-            dates_slots = new List<DateTime>() { dt };
-            times_slots = new List<string>() { timeRamges[4] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt };
-            times_slots = new List<string>() { timeRamges[3] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt };
-            times_slots = new List<string>() { timeRamges[2] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt };
-            times_slots = new List<string>() { timeRamges[1] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            dates_slots = new List<DateTime>() { dt };
-            times_slots = new List<string>() { timeRamges[0] };
-            _baseSlots = baseSlots.FindSlotsByDatesAndTimeRanges(dates_slots, times_slots);
-            if (_baseSlots.Count > 0) list_baseSlots.Add(_baseSlots);
-            return list_baseSlots;
+            return BuildNormalDays(baseSlots, dt, 1);
         }
+
+     
 
         public enum AssignType
         {
@@ -3269,6 +3114,7 @@ namespace PharmaRosterAPI
 
             foreach (var member in shiftGroupClass.Members)
             {
+          
                 var scheduleHistorys_buf = keypairs_scheduleHistorys.SortDictionaryBy_staff_guid(member.staff_guid);
                 if (scheduleHistorys_buf.Count > 0)
                 {
@@ -3285,7 +3131,7 @@ namespace PharmaRosterAPI
                 }
                 else if (shiftGroupClass.shift_type == "midnight")
                 {
-                    member.weight = (member.weight.StringToInt32() + member.staff_info.MidnightShiftCount.StringToInt32()).ToString();
+                    member.weight = (member.weight.StringToInt32() + member.staff_info.MidnightShiftWeightBase.StringToInt32()).ToString();
                 }
                 else if (shiftGroupClass.shift_type == "holiday")
                 {
@@ -3490,8 +3336,7 @@ namespace PharmaRosterAPI
                         string insertSql = $@"
                     INSERT INTO {sql_ScheduleDay.Database}.{sql_ScheduleDay.TableName}
                     (`GUID`, `date`, `created_at`, `updated_at`)
-                    VALUES ('{newDay.GUID}', '{newDay.date}', '{newDay.created_at}', '{newDay.updated_at}')
-                ";
+                    VALUES ('{newDay.GUID}', '{newDay.date}', '{newDay.created_at}', '{newDay.updated_at}')";
 
                         await sql_ScheduleDay.WriteCommandAsync(insertSql);
 
@@ -3606,6 +3451,10 @@ namespace PharmaRosterAPI
             var keypairs_SpecialDay = specialDays.CoverToDictionaryByDate();
 
             var leaveRequests_result = await leaveRequest.GetLeaveRequestsAsync(new List<string>());
+            for(int i = 0; i < leaveRequests_result.leaveRequests.Count; i++)
+            {
+                leaveRequests_result.leaveRequests[i].staff_info.scheduleHistories = new List<StaffScheduleHistoryClass>();
+            }
             var shiftGroup_result = await shiftGroup.GetShiftGroupsAsync(new List<string>(), true);
             var keypairs_ShiftGroup = shiftGroup_result.shiftGroups.CoverToDictionaryByGUID();
 
@@ -3643,7 +3492,11 @@ namespace PharmaRosterAPI
                         wsr_buf.Add(wsr);
                     }
                     requiredShift.shift_requirements = wsr_buf.JsonSerializationt();
-                    if (sg_buf.Count > 0) requiredShift.shift_group = sg_buf[0];
+                    if (sg_buf.Count > 0)
+                    {
+                        requiredShift.shift_group = sg_buf[0];
+                        sg_buf[0].Members = new List<ShiftGroupMemberClass>();
+                    }
                     if (requiredShift.shift_group != null) requiredShift.shift_group.workShiftRanges = requiredShift.shift_group.workShiftRanges.SortByDayAndTime();
                     requiredShift.shift_group.workShiftRanges = requiredShift.shift_group.workShiftRanges.FilterByDate(scheduleDay.date);
                 }

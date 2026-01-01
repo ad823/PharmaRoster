@@ -128,7 +128,7 @@ namespace PharmaRosterLib
         /// 回傳觸發請求網址
         /// </summary>
         public string RequestUrl { get => _RequestUrl; set => _RequestUrl = value; }
-
+        public string Expires_in { get; set; } = "0";
 
 
 

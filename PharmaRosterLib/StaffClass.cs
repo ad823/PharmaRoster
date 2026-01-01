@@ -30,10 +30,12 @@ namespace PharmaRosterLib
         [Description("VARCHAR,100,INDEX")]
         public string staff_name { get; set; }
 
+
         /// <summary>姓名代號</summary>
         [JsonPropertyName("staff_simple_name")]
         [Description("VARCHAR,10,NONE")]
         public string staff_simple_name { get; set; }
+
 
         /// <summary>角色 (藥師/藥助/工讀生等)</summary>
         [JsonPropertyName("role")]
