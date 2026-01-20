@@ -24,58 +24,6 @@ namespace PharmaRosterAPI
     [Route("phar_roster_api/[controller]")]
     public class specialDay : ControllerBase
     {
-        /// <summary>
-        /// 初始化 ShiftGroup 與 ShiftGroupMember 資料表
-        /// </summary>
-        /// <remarks>
-        /// ## 📌 用途
-        /// 本 API 用於初始化 **ShiftGroup (班別群組)** 與 **ShiftGroupMember (群組成員)** 資料表。  
-        /// 系統會自動檢查資料表是否存在，若不存在則建立。  
-        ///
-        /// ## 📥 Request JSON 範例
-        /// ```json
-        /// {
-        ///   "Method": "init"
-        /// }
-        /// ```
-        ///
-        /// ## 📤 Response JSON 範例
-        /// ✅ 成功
-        /// ```json
-        /// {
-        ///   "Code": 200,
-        ///   "Method": "init",
-        ///   "Result": "初始化 shiftGroup 資料表完成",
-        ///   "Data": [
-        ///     {
-        ///       "TableName": "shiftGroup",
-        ///       "Created": true
-        ///     },
-        ///     {
-        ///       "TableName": "shiftGroupMember",
-        ///       "Created": true
-        ///     }
-        ///   ],
-        ///   "TimeTaken": "0.006s"
-        /// }
-        /// ```
-        ///
-        /// ❌ 錯誤 (例外狀況)
-        /// ```json
-        /// {
-        ///   "Code": -200,
-        ///   "Method": "init",
-        ///   "Result": "Exception: 資料庫連線失敗"
-        /// }
-        /// ```
-        ///
-        /// ## 📑 注意事項
-        /// - 此 API 僅需在系統安裝或初始化階段呼叫一次。  
-        /// - 若資料表已存在，不會重新建立，但仍會回傳成功訊息。  
-        /// - 回傳的 <c>Data</c> 陣列會列出檢查或建立的資料表狀態。  
-        /// </remarks>
-        /// <param name="returnData">前端傳入的標準化請求物件</param>
-        /// <returns>回傳標準化 JSON，包含 Code、Method、Result、Data 與 TimeTaken</returns>
         [HttpPost("init")]
         public string init([FromBody] returnData returnData)
         {
@@ -89,7 +37,7 @@ namespace PharmaRosterAPI
 
                 returnData.Code = 200;
                 returnData.Data = tables;
-                returnData.Result = "初始化 shiftGroup 資料表完成";
+                returnData.Result = "初始化 SpecialDayClass 資料表完成";
                 returnData.TimeTaken = $"{timer}";
                 return returnData.JsonSerializationt(true);
             }
@@ -510,7 +458,7 @@ namespace PharmaRosterAPI
             string sortOrder = (GetVal("sortOrder") ?? "asc").ToUpper();
 
             if (page < 1) page = 1;
-            if (pageSize < 1) pageSize = 50;
+            if (pageSize < 1) pageSize = 1000;
 
             List<SpecialDayClass> specialDays = new List<SpecialDayClass>();
             int totalCount = 0, totalPages = 0;

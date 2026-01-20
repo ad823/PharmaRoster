@@ -304,6 +304,7 @@ namespace PharmaRosterAPI
                     is_locked = "N",
                     fail_count = "0",
                     last_login_at = DateTime.Now.ToDateTimeString(),
+                    last_logout_at = DateTime.Now.ToDateTimeString(),
                     created_at = DateTime.Now.ToDateTimeString(),
                     updated_at = DateTime.Now.ToDateTimeString(),
                 };
@@ -468,10 +469,10 @@ namespace PharmaRosterAPI
 
                 // === 2. 取得 Auth 資料 ===
                 var sql_staffAuthClass = MethodClass.GetSQLControl<StaffAuthClass>();
-
+                string commacd = $"select * from {sql_staffAuthClass.Database}.{sql_staffAuthClass.TableName} where account = '{account}'";
                 DataTable dataTable = sql_staffAuthClass
                     .WtrteCommandAndExecuteReader(
-                        $"select * from {sql_staffAuthClass.Database}.{sql_staffAuthClass.TableName} where account = '{account}'"
+                        commacd
                     );
 
                 StaffAuthClass authClass = dataTable.SQLToClass<StaffAuthClass>().FirstOrDefault();
@@ -543,6 +544,7 @@ namespace PharmaRosterAPI
                 // === 5. 登入成功：更新狀態 ===
                 authClass.fail_count = "0";
                 authClass.last_login_at = DateTime.Now.ToDateTimeString();
+                authClass.last_logout_at = DateTime.Now.ToDateTimeString();
                 authClass.updated_at = DateTime.Now.ToDateTimeString();
 
                 sql_staffAuthClass.UpdateByDefulteExtra(

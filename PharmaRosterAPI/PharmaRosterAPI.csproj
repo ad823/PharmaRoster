@@ -25,6 +25,9 @@
     <Reference Include="Basic">
       <HintPath>..\0.DLL\Basic.dll</HintPath>
     </Reference>
+    <Reference Include="Dapper">
+      <HintPath>..\0.DLL\Dapper.dll</HintPath>
+    </Reference>
     <Reference Include="MyOffice">
       <HintPath>..\0.DLL\MyOffice.dll</HintPath>
     </Reference>

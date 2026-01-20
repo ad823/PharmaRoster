@@ -245,9 +245,9 @@ namespace PharmaRosterLib
                 else
                 {
                     shift_requirement = JsonSerializer.Serialize(value);
-                }
+                }}
             }
-        }
+        
     }
 
 

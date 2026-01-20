@@ -1,6 +1,7 @@
 ﻿using Basic;
 using Microsoft.AspNetCore.Mvc;
 using MyOffice;
+using NPOI.SS.UserModel;
 using Org.BouncyCastle.Bcpg.OpenPgp;
 using Org.BouncyCastle.Ocsp;
 using PharmaRosterLib;
@@ -1558,13 +1559,12 @@ namespace PharmaRosterAPI
         }
 
         [HttpGet("download_monthly_shift_schedule_pdf")]
-        public IActionResult get_download_procurement_pdf(string year_month)
+        public IActionResult download_monthly_shift_schedule_pdf(string year_month)
         {
             returnData returnData = new returnData();
             returnData.ValueAry.Add($"year_month={year_month}");
-            return download_procurement_pdf(returnData);
+            return download_monthly_shift_schedule_pdf(returnData);
         }
-
         /// <summary>
         /// 下載指定月份的排班表 PDF
         /// </summary>
@@ -1642,7 +1642,7 @@ namespace PharmaRosterAPI
         /// <param name="returnData">統一封裝的請求物件，需包含 ValueAry 內之 year_month 參數</param>
         /// <returns>成功時回傳 PDF 檔案串流，失敗時回傳 JSON 錯誤訊息</returns>
         [HttpPost("download_monthly_shift_schedule_pdf")]       
-        public IActionResult download_procurement_pdf([FromBody] returnData returnData)
+        public IActionResult download_monthly_shift_schedule_pdf([FromBody] returnData returnData)
         {
             var timer = new MyTimerBasic();
             returnData.Method = "download_monthly_shift_schedule_pdf";
@@ -1682,9 +1682,7 @@ namespace PharmaRosterAPI
                     return new JsonResult(returnData);
                 }
 
-                Console.WriteLine("[INFO] 開始反序列化 monthly_shift_schedule_xlsx");
-                SheetClass sheet = monthly_shift_schedule_xlsx.xlsx.JsonDeserializet<SheetClass>();
-                Console.WriteLine("[INFO] 反序列化完成");
+          
 
                 string[] date_strings = year_month.Split('-');
                 if (date_strings.Length != 2)
@@ -1720,8 +1718,6 @@ namespace PharmaRosterAPI
                 Dictionary<string, List<StaffClass>> keyValuePairs_staffs = staffs.CoverToDictionaryByGUID();
 
                 int daysInMonth = DateTime.DaysInMonth(year, month);
-                string title = $"{year}-{month}月份值班表";
-                sheet.Rows[0].Cell[0].Text = $"{title}";
 
                 DateTime firstDayOfMonth = new DateTime(year, month, 1);
                 DateTime lastDayOfMonth = new DateTime(year, month, daysInMonth);
@@ -1733,6 +1729,15 @@ namespace PharmaRosterAPI
                 DateTime lastSunday = lastDayOfMonth.AddDays(offsetToSunday);
 
                 Console.WriteLine($"[INFO] 輪循範圍：{firstMonday:yyyy-MM-dd} ~ {lastSunday:yyyy-MM-dd}");
+
+                Console.WriteLine("[INFO] 開始反序列化 monthly_shift_schedule_xlsx");
+                SheetClass sheet = new SheetClass();
+                Console.WriteLine("[INFO] 反序列化完成");
+        
+                string title = $"{year}-{month}月份值班表";
+                if((lastSunday - firstMonday).Days <= 35) sheet = monthly_shift_schedule_5_week_excel.xlsx.JsonDeserializet<SheetClass>();
+                else sheet = monthly_shift_schedule_6_week_excel.xlsx.JsonDeserializet<SheetClass>();
+                sheet.Rows[0].Cell[0].Text = $"{title}";
 
                 // === 輪循從星期一到星期日（涵蓋整個月）===
                 int weekIndex = 1;
@@ -1751,8 +1756,11 @@ namespace PharmaRosterAPI
 
                     // === 可放入生成 Excel / 班表邏輯 ===
 
-                    sheet.Rows[2 + (weekIndex-1) * 6].Cell[dayOfWeek - 1].Text = $"{d.Day}";
+                    sheet.Rows[2 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{d.Day}";
+                    if(d.Day == 30)
+                    {
 
+                    }
                     //小夜班
                     if (d.Month == month)
                     {
@@ -1761,6 +1769,26 @@ namespace PharmaRosterAPI
                         ScheduleDayClass schedule = scheduleDays.Where(x => x.date.StringToDateTime().ToDateString('-') == d.ToDateString('-')).ToList().FirstOrDefault();
                         if (schedule == null) continue;
                         List<AssignedShiftClass> assignedShiftClasses = new List<AssignedShiftClass>();
+
+                        text = "";
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "12:00-20:00").ToList();
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+
+                            if (asg.workShiftRequirement.department.Contains("中藥"))
+                            {
+                                text += $"[{staff.staff_simple_name.Substring(0, 1)}]";
+                            }
+                            else
+                            {
+                                text += staff.staff_simple_name.Substring(0, 1);
+                            }
+                            if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
+                        }
+                        sheet.Rows[4 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
 
                         text = "";
                         assignedShiftClasses = schedule.AssignedShifts.Where(x => x.workShiftRequirement.time == "12:30-21:00").ToList();
@@ -1780,7 +1808,7 @@ namespace PharmaRosterAPI
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
-                        sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[5 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
 
 
                         text = "";
@@ -1801,7 +1829,7 @@ namespace PharmaRosterAPI
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
-                        sheet.Rows[5 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[6 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
 
                   
                         text = "";
@@ -1822,7 +1850,7 @@ namespace PharmaRosterAPI
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
-                        sheet.Rows[6 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[7 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
 
 
                         text = "";
@@ -1861,11 +1889,11 @@ namespace PharmaRosterAPI
                             }
                             if (asg.workShiftRequirement.hdr == "true") flag_HDR = true;
                         }
-                        sheet.Rows[7 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[8 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
 
                         if(flag_HDR)
                         {
-                            sheet.Rows[2 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text += "(HDR)";
+                            sheet.Rows[2 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text += "(HDR)";
                         }
                     }
 
@@ -1898,7 +1926,7 @@ namespace PharmaRosterAPI
                             if (staff == null) { continue; }
                             text += staff.staff_simple_name.Substring(0, 1);
                         }
-                        sheet.Rows[3 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                        sheet.Rows[3 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
 
                     }
 
@@ -1937,7 +1965,7 @@ namespace PharmaRosterAPI
                         {
                             if (text.Replace("--", "").StringIsEmpty() == false)
                             {
-                                sheet.Rows[4 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                                sheet.Rows[4 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
                             }
                         }
                         //else
@@ -1962,7 +1990,7 @@ namespace PharmaRosterAPI
                         }
                         if (text.Replace("[TPN]", "").StringIsEmpty() == false)
                         {
-                            sheet.Rows[5 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                            sheet.Rows[5 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
                         }
                         text = "[化療]";
                  
@@ -1976,7 +2004,7 @@ namespace PharmaRosterAPI
                         }
                         if (text.Replace("[化療]", "").StringIsEmpty() == false)
                         {
-                            sheet.Rows[5 + (weekIndex - 1) * 6].Cell[dayOfWeek - 1].Text = $"{text}";
+                            sheet.Rows[5 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
                         }
                     }
                 }
@@ -1988,6 +2016,445 @@ namespace PharmaRosterAPI
                 Stream stream = new MemoryStream(bytes_pdf);
                 string contentType = "application/octet-stream";
                 string originalName = $"schedule_{month}.pdf";
+                string utf8FileName = Uri.EscapeDataString(originalName);
+
+                Response.Headers.Add("Content-Disposition", $"attachment; filename=\"{originalName}\"; filename*=UTF-8''{utf8FileName}");
+                Response.Headers.Add("Access-Control-Expose-Headers", "Content-Disposition, Content-Length, Content-Type");
+
+                Console.WriteLine("[INFO] API 成功結束，準備回傳檔案");
+                return File(stream, contentType);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("==== [例外發生] ====");
+                Console.WriteLine($"時間：{DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+                Console.WriteLine($"訊息：{ex.Message}");
+                Console.WriteLine($"堆疊：{ex.StackTrace}");
+                if (ex.InnerException != null)
+                {
+                    Console.WriteLine($"內層例外：{ex.InnerException.Message}");
+                    Console.WriteLine($"內層堆疊：{ex.InnerException.StackTrace}");
+                }
+                Console.WriteLine("=====================");
+
+                returnData.Code = -200;
+                returnData.Result = $"例外：{ex.Message}";
+                return new JsonResult(returnData);
+            }
+        }
+
+
+        /// <summary>
+        /// 下載人員班表清單 PDF（依班別類型與月份）
+        /// </summary>
+        /// <remarks>
+        /// ## 📘 功能說明  
+        /// 依據指定的年月 (<c>year_month</c>) 與班別類型 (<c>shift_type</c>)，  
+        /// 匯出整個醫療單位的人員排班列表，並以 PDF 檔案形式下載。
+        ///
+        /// 生成的 PDF 內容會依每位人員的排班資訊產生表格，  
+        /// 每頁最多 30 人，底部附上「時段代碼對照表」，適用於排班公告、管理列印等用途。
+        ///
+        /// ## ⚙️ 執行流程  
+        /// 1. 驗證 `year_month` 與 `shift_type` 格式。  
+        /// 2. 呼叫 `get_schedule_days()` 取得指定月份所有班表資料。  
+        /// 3. 撈取所有人員資料 (每頁 30 筆為一組)。  
+        /// 4. 將每位員工的班表依日期填入 DataTable。  
+        /// 5. 建立 NPOI SheetClass，套用字型、樣式、欄寬設定。  
+        /// 6. 每頁最後一列生成「班別時間代碼對照表」。  
+        /// 7. 匯出成 PDF，橫向 A4 格式輸出。
+        ///
+        /// ## 🧩 表格欄位說明  
+        /// | 欄位 | 說明 |
+        /// |------|------|
+        /// | 序號 | 員工流水號（每頁重新計數） |
+        /// | 人員 | 員工姓名 |
+        /// | 1~31 | 對應每一天的班別代碼（以數字代表不同時段） |
+        ///
+        /// ## 📥 Request JSON 範例  
+        /// ```json
+        /// {
+        ///   "Method": "download_staff_list_shift_schedule_pdf",
+        ///   "ValueAry": [
+        ///     "year_month=2026-01",
+        ///     "shift_type=swing"
+        ///   ],
+        ///   "Data": {}
+        /// }
+        /// ```
+        ///
+        /// ## 🔍 參數說明  
+        /// | 參數名稱 | 類型 | 必填 | 範例 | 說明 |
+        /// |------------|------|------|------|------|
+        /// | year_month | string | ✅ | 2026-01 | 查詢的年月（格式 yyyy-MM） |
+        /// | shift_type | string | ✅ | day | 班別類型，需存在於 <see cref="ShiftTypeEnum"/> 中 |
+        ///
+        /// ## 📤 回傳說明 (成功)
+        /// **Header：**
+        /// ```
+        /// Content-Disposition: attachment; filename="schedule_staff_list_1.pdf"
+        /// Content-Type: application/octet-stream
+        /// ```
+        ///
+        /// **Body：**
+        /// - PDF 檔案串流內容（自動觸發下載）
+        ///
+        /// ## ❌ 錯誤回傳範例  
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Result": "參數驗證失敗：shift_type 格式錯誤"
+        /// }
+        /// ```
+        /// 或：
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Result": "例外：Object reference not set to an instance of an object."
+        /// }
+        /// ```
+        ///
+        /// ## 🖨️ PDF 樣式說明  
+        /// - 紙張：A4 橫式 (Landscape)  
+        /// - 每頁 30 位人員  
+        /// - 字型：微軟正黑體  
+        /// - 一般文字：14pt 黑色，置中對齊  
+        /// - 標題文字：18pt 藍色 (ROYAL_BLUE)  
+        /// - 邊框樣式：<c>BorderStyle.Thin</c>  
+        /// - 最末列顯示時間代碼對照表 (例：`【1】:08:00-16:00　【2】:16:00-23:00`)  
+        ///
+        /// ## 📑 注意事項  
+        /// - 若 `shift_type` 不存在於 `ShiftTypeEnum`，會直接返回錯誤。  
+        /// - 若當月無排班資料，仍會生成空白 PDF 檔。  
+        /// - 此 API 產出檔案流，不建議直接在前端 JSON 測試工具開啟。  
+        /// - 前端呼叫時請設定：
+        ///   ```js
+        ///   axios.post(url, data, { responseType: 'blob' })
+        ///   ```
+        ///   以正確接收 PDF 檔案。  
+        /// </remarks>
+        /// <param name="returnData">封裝請求參數與回傳資料的物件，包含 year_month、shift_type。</param>
+        /// <returns>PDF 檔案串流結果，供瀏覽器觸發下載。</returns>
+        [HttpPost("download_staff_list_shift_schedule_pdf")]
+        public IActionResult download_staff_list_shift_schedule_pdf([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "download_staff_list_shift_schedule_pdf";
+
+            try
+            {
+
+                if (returnData.Data == null)
+                {
+                    Console.WriteLine("[警告] returnData.Data 為 null");
+                    returnData.Code = -200;
+                    returnData.Result = "Data 不能為空";
+                    return new JsonResult(returnData);
+                }
+
+                // 解析參數
+                string GetVal(string key) =>
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+
+                string year_month = GetVal("year_month") ?? "";
+                string shift_type = GetVal("shift_type") ?? "";
+                if (shift_type.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "參數驗證失敗：shift_type 格式錯誤";
+                    return new JsonResult(returnData.JsonSerializationt(true));
+                }
+                if(new ShiftTypeEnum().GetEnumNames().Contains(shift_type) == false)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "參數驗證失敗：shift_type 格式錯誤";
+                    return new JsonResult(returnData.JsonSerializationt(true));
+                }
+                string[] date_strings = year_month.Split('-');
+                if (date_strings.Length != 2)
+                {
+                    Console.WriteLine("[錯誤] year_month 分割後長度錯誤");
+                    returnData.Code = -200;
+                    returnData.Result = "參數驗證失敗：year_month 格式錯誤";
+                    return new JsonResult(returnData.JsonSerializationt(true));
+                }
+
+                int year = date_strings[0].StringToInt32();
+                int month = date_strings[1].StringToInt32();
+                Console.WriteLine($"[DEBUG] year={year}, month={month}");
+                int daysInMonth = DateTime.DaysInMonth(year, month);
+
+                DateTime firstDayOfMonth = new DateTime(year, month, 1);
+                DateTime lastDayOfMonth = new DateTime(year, month, daysInMonth);
+
+                returnData returnDat_get_schedule_days = new returnData();
+                returnDat_get_schedule_days.ValueAry.Add($"date_start={firstDayOfMonth.ToDateString('-')}");
+                returnDat_get_schedule_days.ValueAry.Add($"date_end={lastDayOfMonth.ToDateString('-')}");
+                returnDat_get_schedule_days = get_schedule_days(returnDat_get_schedule_days).JsonDeserializet<returnData>();
+
+                List<ScheduleDayClass> scheduleDays = returnDat_get_schedule_days.Data.ObjToClass<List<ScheduleDayClass>>();
+
+                int index = 0;
+                List<SheetClass> sheets = new List<SheetClass>();
+                DataTable dataTable = null;
+                int page = 0;
+                List<ShiftGroupClass> shiftGroupClasses = shiftGroup.GetShiftGroups();
+                shiftGroupClasses = shiftGroupClasses.Where(x => x.shift_type.ToLower() == shift_type.ToLower()).ToList();
+
+                List<WorkShiftRequirementClass> workShiftRequirements = shiftGroupClasses.SelectMany(x => x.workShiftRanges).ToList();
+
+                var times = workShiftRequirements.Select(x=>x.time)
+                    .Distinct()
+                    .OrderBy(t => ParseStartMinutes(t))   // ⭐ 由早到晚
+                    .ToList();
+                var timeIndexMap = times
+                    .Select((t, idx) => new { t, idx })
+                    .ToDictionary(x => x.t, x => x.idx + 1); // 1-based
+
+                List<StaffClass> staffClasses = staff.GetStaffs(new List<string>() { "pageSize=1000" }).staffClasses;
+
+                List<ShiftGroupMemberClass> shiftGroupMembers = shiftGroupClasses.SelectMany(x => x.Members).Distinct().ToList();
+                staffClasses = shiftGroupMembers.Select(x => x.staff_info).Distinct().ToList();
+                foreach (var staff in staffClasses)
+                {
+             
+                    if(dataTable == null)
+                    {
+                        dataTable = new DataTable();
+                        dataTable.Columns.Add("序號");
+                        dataTable.Columns.Add("人員");
+                        for (int i = 0; i < daysInMonth; i++) dataTable.Columns.Add($"{i + 1}");
+                        dataTable.NewRow();
+                        DataRow dataRow = dataTable.NewRow();
+                        for (int i = 0; i < daysInMonth; i++)
+                        {
+                            dataRow[$"{i + 1}"] = DayOfWeekToZh(new DateTime(year, month, i + 1).DayOfWeek);
+                        }
+                        dataTable.Rows.Add(dataRow);
+                    }
+         
+
+                    var assignedShifts = scheduleDays.SelectMany(x => x.AssignedShifts).Where(x => (x.staff_guid == staff.GUID)).ToList();
+                    if(assignedShifts.Count == 0)
+                    {
+                        continue;
+                    }
+                    bool flag_temp = false;
+                    foreach (var asg in assignedShifts)
+                    {
+                        // ✅ 找 time 在第幾個（1-based）
+                        string time = asg.workShiftRequirement.time;
+                        int timeIndex = timeIndexMap.TryGetValue(time, out int idx) ? idx : -1;
+                        if (timeIndex == -1)
+                        {
+                            continue;
+                        }
+                        int day = asg.date.StringToDateTime().Day;
+
+                        // ✅ 1) 先找表單中是否已存在該員工
+                        DataRow existRow = dataTable.AsEnumerable().FirstOrDefault(r => r.Field<string>("人員") == staff.staff_name);
+
+                        // ✅ 2) 如果不存在就建立新列
+                        if (existRow == null)
+                        {
+                            existRow = dataTable.NewRow();
+                            existRow["序號"] = $"{page * 30 + index + 1}";
+                            existRow["人員"] = staff.staff_name;
+                            //existRow["權重"] = (staff.DayShiftCount + staff.DayShiftWeightBase).ToString();
+                            dataTable.Rows.Add(existRow);
+                        }
+
+                       
+
+                        // ✅ 寫入 (day) 欄位
+                        existRow[$"{day}"] = timeIndex > 0 ? (timeIndex).ToString() : "◆";
+                        flag_temp = true;
+                    }
+                    if (flag_temp) index++;
+                    if (index >= 30)
+                    {
+                        dataTable.Rows.Add(dataTable.NewRow());
+                        SheetClass sheet = dataTable.NPOI_GetSheetClass();
+                        for (int i = 0; i < dataTable.Columns.Count; i++)
+                        {
+                            if (i == 1) sheet.ColumnsWidth.Add(100);
+                            else sheet.ColumnsWidth.Add(50);
+                        }
+
+                        MyCellStyle myCellStyle = new MyCellStyle();
+                        myCellStyle.Alignment = NPOI.SS.UserModel.HorizontalAlignment.Center;
+                        myCellStyle.VerticalAlignment = NPOI.SS.UserModel.VerticalAlignment.Center;
+                        myCellStyle.FontName = "微軟正黑體";
+                        myCellStyle.FontHeightInPoints = 14;
+                        myCellStyle.Color = (short)NPOI_Color.BLACK;
+                        myCellStyle.FontHeight = 14;
+                        myCellStyle.BorderBottom = myCellStyle.BorderLeft = myCellStyle.BorderRight = myCellStyle.BorderTop = NPOI.SS.UserModel.BorderStyle.Thin;
+                        myCellStyle.IsBold = false;
+                        int style_normal_index = sheet.Add(myCellStyle);
+
+                        myCellStyle = new MyCellStyle();
+                        myCellStyle.Alignment = NPOI.SS.UserModel.HorizontalAlignment.Center;
+                        myCellStyle.VerticalAlignment = NPOI.SS.UserModel.VerticalAlignment.Center;
+                        myCellStyle.FontName = "微軟正黑體";
+                        myCellStyle.FontHeightInPoints = 18;
+                        myCellStyle.Color = (short)NPOI_Color.ROYAL_BLUE;
+                        myCellStyle.FontHeight = 18;
+                        myCellStyle.BorderBottom = myCellStyle.BorderLeft = myCellStyle.BorderRight = myCellStyle.BorderTop = NPOI.SS.UserModel.BorderStyle.Thin;
+                        myCellStyle.IsBold = true;
+                        int style_numtext_index = sheet.Add(myCellStyle);
+
+                        myCellStyle = new MyCellStyle();
+                        myCellStyle.Alignment = NPOI.SS.UserModel.HorizontalAlignment.Left;
+                        myCellStyle.VerticalAlignment = NPOI.SS.UserModel.VerticalAlignment.Center;
+                        myCellStyle.FontName = "微軟正黑體";
+                        myCellStyle.FontHeightInPoints = 18;
+                        myCellStyle.FontHeight = 18;
+                        myCellStyle.Color = (short)NPOI_Color.ROYAL_BLUE;
+                        myCellStyle.BorderBottom = myCellStyle.BorderLeft = myCellStyle.BorderRight = myCellStyle.BorderTop = NPOI.SS.UserModel.BorderStyle.Thin;
+                        myCellStyle.IsBold = true;
+                        int style_none_index = sheet.Add(myCellStyle);
+                        List<MyOffice.CellValue> remove_cells = new List<MyOffice.CellValue>();
+                        for (int i = 0; i < sheet.Rows.Count; i++)
+                        {
+                            for (int k = 0; k < sheet.Rows[i].Cell.Count; k++)
+                            {
+                                if(k >= 2) sheet.Rows[i].Cell[k].CellStyle_index = style_numtext_index;
+                                else sheet.Rows[i].Cell[k].CellStyle_index = style_normal_index;
+                                if (i == sheet.Rows.Count -1)
+                                {
+                                    if(k == 0)
+                                    {
+                                        foreach (var kv in timeIndexMap)
+                                        {
+                                            sheet.Rows[i].Cell[k].Text += $"【{kv.Value}】:{kv.Key} ";
+                                        }
+                                       
+                                        sheet.Rows[i].Cell[k].ColStart = 0;
+                                        sheet.Rows[i].Cell[k].ColEnd = dataTable.Columns.Count - 1;
+                                        sheet.Rows[i].Cell[k].CellStyle_index = style_none_index;
+                                    }
+                                    //else
+                                    //{
+                                    //    sheet.RemoveCellValue(i, k);
+                                    //}
+       
+                                }
+                            } 
+                            
+                        }
+                        sheet.RemoveRowsTextEmpty(1);
+                        sheet.RemoveRowsTextEmpty(sheet.Rows.Count - 1);
+                        sheets.Add(sheet);
+                        index = 0;
+                        dataTable = null;
+                        page++;
+                    }
+                }
+                // ✅ 最後一頁不足 30 列：補滿後輸出
+                if (dataTable != null && index > 0)
+                {
+                    // dataTable 第一列是星期 headerRow，所以真正資料列數 = dataTable.Rows.Count - 1
+                    int currentStaffRowCount = dataTable.Rows.Count - 1;
+
+                    // ✅ 補空白列直到滿 30 位人員列
+                    while (currentStaffRowCount < 30)
+                    {
+                        dataTable.Rows.Add(dataTable.NewRow());
+                        currentStaffRowCount++;
+                    }
+
+                    // ✅ 最後再加一列用來印 timeIndexMap 對照表
+                    dataTable.Rows.Add(dataTable.NewRow());
+
+                    // ======= 你原本產 Sheet 的整段邏輯（原封不動搬過來） =======
+                    SheetClass sheet = dataTable.NPOI_GetSheetClass();
+                    for (int i = 0; i < dataTable.Columns.Count; i++)
+                    {
+                        if (i == 1) sheet.ColumnsWidth.Add(100);
+                        else sheet.ColumnsWidth.Add(50);
+                    }
+
+                    MyCellStyle myCellStyle = new MyCellStyle();
+                    myCellStyle.Alignment = NPOI.SS.UserModel.HorizontalAlignment.Center;
+                    myCellStyle.VerticalAlignment = NPOI.SS.UserModel.VerticalAlignment.Center;
+                    myCellStyle.FontName = "微軟正黑體";
+                    myCellStyle.FontHeightInPoints = 14;
+                    myCellStyle.Color = (short)NPOI_Color.BLACK;
+                    myCellStyle.FontHeight = 14;
+                    myCellStyle.BorderBottom = myCellStyle.BorderLeft = myCellStyle.BorderRight = myCellStyle.BorderTop = NPOI.SS.UserModel.BorderStyle.Thin;
+                    myCellStyle.IsBold = false;
+                    int style_normal_index = sheet.Add(myCellStyle);
+
+                    myCellStyle = new MyCellStyle();
+                    myCellStyle.Alignment = NPOI.SS.UserModel.HorizontalAlignment.Center;
+                    myCellStyle.VerticalAlignment = NPOI.SS.UserModel.VerticalAlignment.Center;
+                    myCellStyle.FontName = "微軟正黑體";
+                    myCellStyle.FontHeightInPoints = 18;
+                    myCellStyle.Color = (short)NPOI_Color.ROYAL_BLUE;
+                    myCellStyle.FontHeight = 18;
+                    myCellStyle.BorderBottom = myCellStyle.BorderLeft = myCellStyle.BorderRight = myCellStyle.BorderTop = NPOI.SS.UserModel.BorderStyle.Thin;
+                    myCellStyle.IsBold = true;
+                    int style_numtext_index = sheet.Add(myCellStyle);
+
+                    myCellStyle = new MyCellStyle();
+                    myCellStyle.Alignment = NPOI.SS.UserModel.HorizontalAlignment.Left;
+                    myCellStyle.VerticalAlignment = NPOI.SS.UserModel.VerticalAlignment.Center;
+                    myCellStyle.FontName = "微軟正黑體";
+                    myCellStyle.FontHeightInPoints = 18;
+                    myCellStyle.FontHeight = 18;
+                    myCellStyle.Color = (short)NPOI_Color.ROYAL_BLUE;
+                    myCellStyle.BorderBottom = myCellStyle.BorderLeft = myCellStyle.BorderRight = myCellStyle.BorderTop = NPOI.SS.UserModel.BorderStyle.Thin;
+                    myCellStyle.IsBold = true;
+                    int style_none_index = sheet.Add(myCellStyle);
+
+                    for (int i = 0; i < sheet.Rows.Count; i++)
+                    {
+                        for (int k = 0; k < sheet.Rows[i].Cell.Count; k++)
+                        {
+                            if (k >= 2) sheet.Rows[i].Cell[k].CellStyle_index = style_numtext_index;
+                            else sheet.Rows[i].Cell[k].CellStyle_index = style_normal_index;
+
+                            // ✅ 最後一列印 timeIndexMap
+                            if (i == sheet.Rows.Count - 1)
+                            {
+                                if (k == 0)
+                                {
+                                    foreach (var kv in timeIndexMap.OrderBy(x => x.Value))
+                                    {
+                                        sheet.Rows[i].Cell[k].Text += $"【{kv.Value}】:{kv.Key} ";
+                                    }
+
+                                    sheet.Rows[i].Cell[k].ColStart = 0;
+                                    sheet.Rows[i].Cell[k].ColEnd = dataTable.Columns.Count - 1;
+                                    sheet.Rows[i].Cell[k].CellStyle_index = style_none_index;
+                                }
+                            }
+                        }
+                    }
+
+                    // ✅ 這兩行你原本就有（維持）
+                    sheet.RemoveRowsTextEmpty(1);
+                    sheet.RemoveRowsTextEmpty(sheet.Rows.Count - 1);
+
+                    sheets.Add(sheet);
+
+                    // ✅ Reset 狀態
+                    index = 0;
+                    dataTable = null;
+                    page++;
+                }
+
+
+
+                Console.WriteLine("[INFO] 生成 PDF 中...");
+                byte[] bytes_pdf = sheets.SaveToPDF(PdfSharp.PageSize.A4, PdfSharp.PageOrientation.Landscape);
+                Console.WriteLine("[INFO] PDF 生成完成，大小：" + bytes_pdf.Length);
+
+                Stream stream = new MemoryStream(bytes_pdf);
+                string contentType = "application/octet-stream";
+                string originalName = $"schedule__staff_list_{month}.pdf";
                 string utf8FileName = Uri.EscapeDataString(originalName);
 
                 Response.Headers.Add("Content-Disposition", $"attachment; filename=\"{originalName}\"; filename*=UTF-8''{utf8FileName}");
@@ -2039,8 +2506,6 @@ namespace PharmaRosterAPI
                 return false;
             }
         }
-
-
         [HttpPost("auto_schedule")]
         public async Task<string> auto_schedule([FromBody] returnData returnData)
         {
@@ -2564,17 +3029,14 @@ namespace PharmaRosterAPI
 
         private static readonly string[] TimeRanges =
         {
-            "12:00-20:00",
-            "12:30-21:00",
-            "13:30-22:00",
-            "14:30-23:00",
+            "16:00-23:59",
             "15:30-23:59",
-            "16:00-23:59"
+            "14:30-23:00",
+            "13:30-22:00",
+            "12:30-21:00",
+            "12:00-20:00",
         };
-        private List<List<NightSlot>> BuildNormalDays(
-            List<NightSlot> baseSlots,
-            DateTime startDate,
-            int dayCount)
+        private List<List<NightSlot>> BuildNormalDays( List<NightSlot> baseSlots, DateTime startDate, int dayCount)
         {
             if (dayCount < 1 || dayCount > TimeRanges.Length)
                 throw new ArgumentOutOfRangeException(
@@ -2662,7 +3124,6 @@ namespace PharmaRosterAPI
         {
             return BuildNormalDays(baseSlots, dt, 4);
         }
-
         private List<List<NightSlot>> Normal_3_Days(List<NightSlot> baseSlots, DateTime dt)
         {
             return BuildNormalDays(baseSlots, dt, 3);
@@ -3077,7 +3538,20 @@ namespace PharmaRosterAPI
             }
         }
 
-
+        static string DayOfWeekToZh(DayOfWeek day)
+        {
+            return day switch
+            {
+                DayOfWeek.Sunday => "日",
+                DayOfWeek.Monday => "一",
+                DayOfWeek.Tuesday => "二",
+                DayOfWeek.Wednesday => "三",
+                DayOfWeek.Thursday => "四",
+                DayOfWeek.Friday => "五",
+                DayOfWeek.Saturday => "六",
+                _ => ""
+            };
+        }
 
         // 快速回傳失敗json
         private string FailJson(returnData rd, int code, string msg)

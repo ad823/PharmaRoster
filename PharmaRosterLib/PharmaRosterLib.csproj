@@ -98,6 +98,8 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="BasicClass.cs" />
+    <Compile Include="DayOffGroupClass.cs" />
+    <Compile Include="DayOffScheduleClass.cs" />
     <Compile Include="LeaveRequestClass.cs" />
     <Compile Include="MethodClass.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />

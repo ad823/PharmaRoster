@@ -403,29 +403,62 @@ namespace PharmaRosterAPI
             }
         }
         /// <summary>
-        /// 查詢 Staff 人員資料清單
+        /// 查詢員工清單 (支援關鍵字搜尋、分頁與多表關聯)
         /// </summary>
         /// <remarks>
-        /// ## 📌 用途
-        /// 本 API 用於依據查詢條件 (GUID、account、name 等) 取得 **Staff 人員資料**，
-        /// 並支援分頁與排序功能。  
+        /// ## 📌 用途  
+        /// 提供查詢人員基本資料與相關屬性（屬性設定、請假紀錄、群組成員、排班歷史）等綜合資訊。  
+        /// 支援條件查詢、模糊搜尋、分頁與排序，可用於管理後台或智慧排班系統中。
+        ///
+        /// ## ⚙️ 功能說明  
+        /// 1. 支援查詢條件：  
+        ///    - GUID  
+        ///    - staff_id  
+        ///    - staff_name  
+        ///    - role  
+        ///    - keyword（模糊搜尋）  
+        /// 2. 可控制分頁與排序欄位。  
+        /// 3. 自動關聯：
+        ///    - <c>StaffAttributesClass</c> 員工屬性  
+        ///    - <c>LeaveRequestClass</c> 請假紀錄  
+        ///    - <c>ShiftGroupMemberClass</c> 群組成員  
+        ///    - <c>StaffScheduleHistoryClass</c> 排班歷史（限 status = '正常'）  
+        /// 4. 每筆 <c>StaffClass</c> 會自動執行 <c>RecalculateCounts()</c> 更新統計欄位。  
+        ///
+        /// ## 🔍 查詢模式  
+        /// - **全域模式**：未提供任何條件時，自動載入全部資料並支援 keyword 搜尋。  
+        /// - **條件模式**：當提供任一查詢條件時，僅依條件搜尋。  
         ///
         /// ## 📥 Request JSON 範例
         /// ```json
         /// {
         ///   "Method": "get_staffs",
         ///   "ValueAry": [
-        ///     "account=jdoe",
+        ///     "staff_name=王小明",
+        ///     "role=藥師",
         ///     "page=1",
-        ///     "pageSize=20",
-        ///     "sortBy=created_at",
+        ///     "pageSize=50",
+        ///     "sortBy=updated_at",
         ///     "sortOrder=desc"
-        ///   ]
+        ///   ],
+        ///   "Data": {}
         /// }
         /// ```
         ///
-        /// ## 📤 Response JSON 範例
-        /// ✅ 成功
+        /// ## 🔍 支援參數對照表  
+        /// | 參數名稱 | 類型 | 必填 | 預設值 | 說明 |
+        /// |------------|------|------|---------|------|
+        /// | GUID | string | 否 |  | 指定單一員工 |
+        /// | staff_id | string | 否 |  | 員工編號 |
+        /// | staff_name | string | 否 |  | 員工姓名（支援模糊搜尋） |
+        /// | role | string | 否 |  | 員工角色（如 藥師、助理） |
+        /// | keyword | string | 否 |  | 全域搜尋字串，匹配 ID、姓名、角色 |
+        /// | page | int | 否 | 1 | 查詢頁碼 |
+        /// | pageSize | int | 否 | 50 | 每頁筆數 |
+        /// | sortBy | string | 否 | updated_at | 排序欄位名稱 |
+        /// | sortOrder | string | 否 | desc | 排序方向 asc / desc |
+        ///
+        /// ## 📤 Response JSON 範例 (成功)
         /// ```json
         /// {
         ///   "Code": 200,
@@ -433,46 +466,55 @@ namespace PharmaRosterAPI
         ///   "Result": "共取得(2)筆資料",
         ///   "Data": [
         ///     {
-        ///       "GUID": "ABCD-1234-5678",
-        ///       "account": "jdoe",
-        ///       "name": "John Doe",
-        ///       "role": "pharmacist",
-        ///       "created_at": "2025-09-20 09:00:00"
-        ///     },
-        ///     {
-        ///       "GUID": "XYZ-9876-5432",
-        ///       "account": "asmith",
-        ///       "name": "Alice Smith",
-        ///       "role": "assistant",
-        ///       "created_at": "2025-09-19 14:30:00"
+        ///       "GUID": "C9F1B3A5-AB21-4A09-A8AA-1FEE4A2B63F3",
+        ///       "staff_id": "A001",
+        ///       "staff_name": "王小明",
+        ///       "role": "藥師",
+        ///       "created_at": "2025/01/01 09:00:00",
+        ///       "updated_at": "2025/01/10 14:33:00",
+        ///       "staffAttributes": {
+        ///         "department": "藥劑科",
+        ///         "seniority": "5"
+        ///       },
+        ///       "leaveRequests": [
+        ///         { "type": "事假", "start_date": "2025/01/05", "end_date": "2025/01/07" }
+        ///       ],
+        ///       "shiftGroupMembers": [
+        ///         { "group_name": "門診早班", "order_index": "1" }
+        ///       ],
+        ///       "scheduleHistories": [
+        ///         { "date": "2025/01/08", "shift_name": "早班", "status": "正常" }
+        ///       ]
         ///     }
         ///   ],
-        ///   "TimeTaken": "0.006s",
-        ///   "TotalCount": 2,
-        ///   "TotalPages": 1,
-        ///   "CurrentPage": 1,
-        ///   "PageSize": 20
+        ///   "Extra": {
+        ///     "TotalCount": "2",
+        ///     "TotalPages": "1",
+        ///     "CurrentPage": "1",
+        ///     "PageSize": "50"
+        ///   },
+        ///   "TimeTaken": "102ms"
         /// }
         /// ```
         ///
-        /// ❌ 錯誤 (缺少查詢條件)
+        /// ## ❌ Response JSON 範例 (錯誤)
         /// ```json
         /// {
         ///   "Code": -200,
         ///   "Method": "get_staffs",
-        ///   "Result": "ValueAry 不能為空",
-        ///   "Data": [],
-        ///   "TimeTaken": "0.001s"
+        ///   "Result": "Exception : 資料庫連線失敗"
         /// }
         /// ```
         ///
-        /// ## 📑 注意事項
-        /// - `ValueAry` 為必填，需以 `key=value` 形式傳入查詢條件。  
-        /// - 支援的 key：`GUID`、`account`、`name`、`page`、`pageSize`、`sortBy`、`sortOrder`。  
-        /// - 若無指定排序，預設依 `created_at desc` 排序。  
+        /// ## 📑 注意事項  
+        /// - 當未提供任何條件時，系統自動載入所有員工（可能筆數龐大）。  
+        /// - 若使用 keyword 模式，會於記憶體中進行模糊比對，建議搭配分頁。  
+        /// - 每筆員工資料會附帶關聯子資料，請注意回傳 JSON 內容大小。  
+        /// - 若要僅取特定欄位，建議改用 SQL SELECT 欄位式查詢以提升效能。  
+        /// - 此 API 可用於員工清單頁、篩選彈窗或報表匯出前端模組。
         /// </remarks>
-        /// <param name="returnData">前端傳入的 Request，需包含 ValueAry 作為查詢條件</param>
-        /// <returns>回傳標準化 JSON，包含 Code、Method、Result、TimeTaken、Data 與分頁資訊</returns>
+        /// <param name="returnData">封裝 API 請求與回應內容，包含 ValueAry、Data、Method 等欄位</param>
+        /// <returns>JSON 格式字串，包含員工資料清單、關聯資料及分頁資訊</returns>
         [HttpPost("get_staffs")]
         public string get_staffs([FromBody] returnData returnData)
         {
@@ -623,8 +665,8 @@ namespace PharmaRosterAPI
             {
 
                 string GetVal(string key) =>
-          returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
-          ?.Split('=')[1];
+                  returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                  ?.Split('=')[1];
 
 
                 var sql_staffs = MethodClass.GetSQLControl<StaffClass>();
@@ -1103,12 +1145,12 @@ namespace PharmaRosterAPI
             string keyword = GetVal("keyword") ?? ""; // 🔍 支援全域搜尋
 
             int page = (GetVal("page") ?? "1").StringToInt32();
-            int pageSize = (GetVal("pageSize") ?? "50").StringToInt32();
+            int pageSize = (GetVal("pageSize") ?? "200").StringToInt32();
             string sortBy = GetVal("sortBy") ?? "updated_at";
             string sortOrder = (GetVal("sortOrder") ?? "desc").ToUpper();
 
             if (page < 1) page = 1;
-            if (pageSize < 1) pageSize = 50;
+            if (pageSize < 1) pageSize = 200;
 
             List<StaffClass> staffs = new List<StaffClass>();
             int totalCount = 0, totalPages = 0;
