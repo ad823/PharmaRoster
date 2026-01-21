@@ -20,10 +20,6 @@ namespace PharmaRosterLib
         [Description("VARCHAR,150,INDEX")]
         public string form_name { get; set; }
 
-        // =========================================================
-        // ✅ 表單流程控制（新增 SQL 欄位）
-        // =========================================================
-
         /// <summary>
         /// 是否開放進入「週休選擇」流程 (true / false)。
         /// <para>true：前端可進入週休選擇頁面並進行排假</para>

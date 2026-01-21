@@ -2304,6 +2304,2193 @@ namespace PharmaRosterAPI
             }
         }
 
+
+        // ✅ 全域鎖：避免多人同時 init_flow（同一台 API Server 有效）
+        private static readonly object _dayoffInitFlowLock = new object();
+        /// <summary>
+        /// 初始化排休流程：重置指定表單(form_guid)狀態並開放第一組週休，同時強制鎖定其他表單（一次只能有一個表單進入排休流程）。
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 用於初始化指定排休表單(form_guid)的排休流程：
+        /// 1) 將該表單下所有組別 status 強制設為 "0"（鎖定不可填）
+        /// 2) 將該表單下排序第一組(order_index 最小) status 設為 "1"（可填寫週休）
+        /// 3) 強制鎖定「其他所有表單」的所有組別 status= "0"
+        ///    - 目的：確保系統一次只能有一張表單進入排休流程（避免多表單同時排休導致狀態機錯亂）
+        ///
+        /// 補充：
+        /// - 本 API 會使用全域 lock 防止多人/多請求同時初始化導致流程衝突（同一台 API Server 有效）
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/init_flow
+        ///
+        /// ===============================
+        /// 【Method】
+        /// ===============================
+        /// POST
+        ///
+        /// ===============================
+        /// 【狀態碼(status)定義】(VARCHAR)
+        /// ===============================
+        /// "0" = 未輪到（鎖定不可填）
+        /// "1" = 可填寫週休
+        /// "2" = 週休填寫完成
+        /// "3" = 可填寫特休
+        /// "4" = 特休填寫完成
+        ///
+        /// ===============================
+        /// 【流程規則（重要）】
+        /// ===============================
+        /// 1) 一次只能有一張表單進入排休流程
+        ///    - 若其他表單存在 status="1" 或 status="3"（表示正在填寫週休/特休）
+        ///      且 force != true → 直接拒絕初始化
+        ///    - 若 force=true → 允許強制重置並搶回控制權
+        ///
+        /// 2) 初始化後狀態分布：
+        ///    - 本次 form_guid：
+        ///        - 全部組別 status = "0"
+        ///        - 第一組 status = "1"
+        ///    - 其他表單：
+        ///        - 全部組別 status = "0"
+        ///
+        /// ===============================
+        /// 【force 參數行為說明】
+        /// ===============================
+        /// force=false（預設）
+        /// - 若本表單已進行（存在 status=2/3/4）→ 拒絕
+        /// - 若其他表單進行中（存在 status=1/3）→ 拒絕
+        ///
+        /// force=true
+        /// - 強制重置本表單：
+        ///    - 清空（重置）本表單的時間欄位為 DateTime.MinValue
+        ///      weekly_fill_start_at / weekly_completed_at / annual_fill_start_at / annual_completed_at
+        /// - 強制鎖定其他表單（只改 status，不動時間欄位，保留歷史）
+        ///
+        /// ===============================
+        /// 【時間欄位寫入規則】(DATETIME)
+        /// ===============================
+        /// 任何狀態調整時：
+        /// - status_changed_at = now
+        /// - updated_at = now
+        ///
+        /// 本表單第一組開放週休時：
+        /// - weekly_fill_start_at：
+        ///   - force=true → 一律寫入 now
+        ///   - force=false → 若 weekly_fill_start_at 為空或 MinValue 才寫入 now
+        ///
+        /// 其他表單強制鎖定：
+        /// - 僅調整 status / status_changed_at / updated_at
+        /// - 不修改 weekly/annual 的開始與完成時間欄位（保留歷史）
+        ///
+        /// ===============================
+        /// 【傳入參數】(ValueAry)
+        /// ===============================
+        /// form_guid = 排休表單 GUID（必填）
+        /// force     = true/false（選填，預設 false）
+        ///
+        /// ===============================
+        /// 【JSON 傳入範例】
+        /// ===============================
+        /// (1) 正常初始化（不強制）
+        /// {
+        ///   "ValueAry": [
+        ///     "form_guid=FORM_GUID_001",
+        ///     "force=false"
+        ///   ]
+        /// }
+        ///
+        /// (2) 強制重置初始化（搶回控制權）
+        /// {
+        ///   "ValueAry": [
+        ///     "form_guid=FORM_GUID_001",
+        ///     "force=true"
+        ///   ]
+        /// }
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/init_flow",
+        ///   "Result": "流程初始化完成，已開放第一組週休：1（其餘表單已強制鎖定）",
+        ///   "Data": [
+        ///     {
+        ///       "GUID": "GROUP_GUID_001",
+        ///       "form_guid": "FORM_GUID_001",
+        ///       "order_index": "1",
+        ///       "status": "1",
+        ///       "weekly_fill_start_at": "2026-01-21 22:30:00",
+        ///       "status_changed_at": "2026-01-21 22:30:00",
+        ///       "updated_at": "2026-01-21 22:30:00"
+        ///     }
+        ///   ]
+        /// }
+        ///
+        /// ===============================
+        /// 【失敗回傳 JSON 範例】
+        /// ===============================
+        /// (1) 缺少 form_guid
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/init_flow",
+        ///   "Result": "未提供 form_guid",
+        ///   "Data": null
+        /// }
+        ///
+        /// (2) 查無組別
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/init_flow",
+        ///   "Result": "查無組別資料 form_guid=FORM_GUID_001",
+        ///   "Data": null
+        /// }
+        ///
+        /// (3) 其他表單正在排休（存在 status=1/3）且 force=false
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/init_flow",
+        ///   "Result": "已有其他表單正在排休流程中(status=1/3)，請先完成或使用 force=true 強制重置",
+        ///   "Data": null
+        /// }
+        ///
+        /// (4) 本表單流程已進行（存在 status=2/3/4）且 force=false
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/init_flow",
+        ///   "Result": "流程已進行(存在 status=2/3/4)，如需重置請帶入 force=true",
+        ///   "Data": null
+        /// }
+        ///
+        /// (5) 例外錯誤
+        /// {
+        ///   "Code": -500,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/init_flow",
+        ///   "Result": "Exception message ...",
+        ///   "Data": null
+        /// }
+        /// </remarks>
+        /// <param name="returnData">
+        /// returnData 物件，主要使用 ValueAry 作為參數輸入。
+        /// </param>
+        /// <returns>
+        /// 回傳 returnData.JsonSerializationt() 的 JSON 字串。
+        /// </returns>
+        [HttpPost("init_flow")]
+        public string init_flow([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "/phar_roster_api/dayOffSchedule/init_flow";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                    .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_guid = GetVal("form_guid");
+                string forceStr = GetVal("force");
+
+                bool force = false;
+                if (!forceStr.StringIsEmpty())
+                {
+                    force = forceStr.Equals("true", StringComparison.OrdinalIgnoreCase) || forceStr.Equals("1");
+                }
+
+                if (form_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffGroupClass = MethodClass.GetSQLControl<DayOffGroupClass>();
+
+                // ✅ 用 lock 防止同時 init 造成兩張表單同時 open
+                lock (_dayoffInitFlowLock)
+                {
+                    string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+                    // =========================================================
+                    // ❶ 先抓取所有組別（用於檢查是否已有其他表單進行中）
+                    // =========================================================
+                    List<DayOffGroupClass> allGroups = sql_dayOffGroupClass
+                        .GetAllRows(null)
+                        .SQLToClass<DayOffGroupClass>();
+
+                    if (allGroups == null || allGroups.Count == 0)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "查無任何組別資料 (dayoff_group)";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    // =========================================================
+                    // ❷ 防呆：如果其他表單正在排休(status=1 或 3)，除非 force=true 否則拒絕
+                    // =========================================================
+                    if (!force)
+                    {
+                        bool otherFormInProgress = allGroups.Any(g =>
+                            g.form_guid != form_guid &&
+                            (g.status == "1" || g.status == "3"));
+
+                        if (otherFormInProgress)
+                        {
+                            returnData.Code = -200;
+                            returnData.Result = "已有其他表單正在排休流程中(status=1/3)，請先完成或使用 force=true 強制重置";
+                            return returnData.JsonSerializationt();
+                        }
+                    }
+
+                    // =========================================================
+                    // ❸ 取得本次表單的 groups
+                    // =========================================================
+                    List<DayOffGroupClass> groups = allGroups
+                        .Where(g => g.form_guid == form_guid)
+                        .OrderBy(g => g.order_index.StringToInt32())
+                        .ToList();
+
+                    if (groups == null || groups.Count == 0)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"查無組別資料 form_guid={form_guid}";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    // =========================================================
+                    // ❹ 防呆：本表單流程已進行 → force=false 時拒絕
+                    // =========================================================
+                    if (!force)
+                    {
+                        bool alreadyStarted = groups.Any(g => g.status == "2" || g.status == "3" || g.status == "4");
+                        if (alreadyStarted)
+                        {
+                            returnData.Code = -200;
+                            returnData.Result = "流程已進行(存在 status=2/3/4)，如需重置請帶入 force=true";
+                            return returnData.JsonSerializationt();
+                        }
+                    }
+
+                    // =========================================================
+                    // ❺ 本表單：全部鎖定(status=0)
+                    //     - force=true 才清空時間欄位
+                    // =========================================================
+                    foreach (var g in groups)
+                    {
+                        g.status = "0";
+                        g.status_changed_at = now;
+                        g.updated_at = now;
+
+                        if (force)
+                        {
+                            // ✅ force 才清時間（避免歷史失真）
+                            g.weekly_fill_start_at = DateTime.MinValue.ToDateTimeString();
+                            g.weekly_completed_at = DateTime.MinValue.ToDateTimeString();
+                            g.annual_fill_start_at = DateTime.MinValue.ToDateTimeString();
+                            g.annual_completed_at = DateTime.MinValue.ToDateTimeString();
+                        }
+
+                        sql_dayOffGroupClass.UpdateByDefulteExtra(null, g.ClassToSQL<DayOffGroupClass>());
+                    }
+
+                    // =========================================================
+                    // ❻ 本表單：開放第一組週休(status=1)
+                    // =========================================================
+                    DayOffGroupClass first = groups.FirstOrDefault();
+                    if (first != null)
+                    {
+                        first.status = "1";
+                        first.status_changed_at = now;
+                        first.updated_at = now;
+
+                        // ✅ 只有在 force=true 或空值時才寫入開始時間
+                        if (force || first.weekly_fill_start_at.StringIsEmpty() || first.weekly_fill_start_at == DateTime.MinValue.ToDateTimeString())
+                        {
+                            first.weekly_fill_start_at = now;
+                        }
+
+                        sql_dayOffGroupClass.UpdateByDefulteExtra(null, first.ClassToSQL<DayOffGroupClass>());
+                    }
+
+                    // =========================================================
+                    // ❼ 強制鎖定其他所有表單（一次只能一張表單排休）
+                    //     - 只動 status / changed_at / updated_at
+                    //     - 不動它們的時間欄位（保留歷史）
+                    // =========================================================
+                    var otherFormGroups = allGroups
+                        .Where(g => g.form_guid != form_guid)
+                        .ToList();
+
+                    foreach (var og in otherFormGroups)
+                    {
+                        // 只要不是鎖定狀態就強制鎖定
+                        if (og.status != "0")
+                        {
+                            og.status = "0";
+                            og.status_changed_at = now;
+                            og.updated_at = now;
+
+                            sql_dayOffGroupClass.UpdateByDefulteExtra(null, og.ClassToSQL<DayOffGroupClass>());
+                        }
+                    }
+
+                    // =========================================================
+                    // ❽ 回傳
+                    // =========================================================
+                    returnData.Code = 200;
+                    returnData.Result = $"流程初始化完成，已開放第一組週休：{first?.order_index}（其餘表單已強制鎖定）";
+                    returnData.Data = new List<DayOffGroupClass>() { first };
+                    return returnData.JsonSerializationt();
+                }
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.Result += timer.ToString();
+            }
+        }
+
+
+        /// <summary>
+        /// 完成某組別的填寫階段（週休 / 特休），並自動推進下一組別狀態（含防呆檢查）。
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 用於排休流程的「一組一組填寫」推進機制：
+        /// 1) 週休流程：
+        ///    - 第一組 status="1"(可填週休)
+        ///    - 完成後 current 變為 status="2"(週休完成)
+        ///    - 系統自動開放下一組 next status="1"
+        ///    - 直到所有組別週休完成
+        ///
+        /// 2) 特休流程：
+        ///    - 當且僅當「所有組別週休完成」後，系統開放第一組特休 status="3"(可填特休)
+        ///    - 完成後 current 變為 status="4"(特休完成)
+        ///    - 系統自動開放下一組 next status="3"
+        ///    - 直到所有組別特休完成後流程結束
+        ///
+        /// ※ 本 API 只負責「完成」與「推進」，不負責「初始化」。
+        /// ※ 初始化建議請呼叫 init_flow：第一組 status="1"，其餘組 status="0"。
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/complete_stage
+        ///
+        /// ===============================
+        /// 【Method】
+        /// ===============================
+        /// POST
+        ///
+        /// ===============================
+        /// 【狀態碼(status)定義】(VARCHAR)
+        /// ===============================
+        /// "0" = 未輪到（鎖定不可填）
+        /// "1" = 可填寫週休
+        /// "2" = 週休填寫完成
+        /// "3" = 可填寫特休
+        /// "4" = 特休填寫完成
+        ///
+        /// ===============================
+        /// 【stage 參數說明】
+        /// ===============================
+        /// stage = "weekly"：完成週休（必須 status="1" 才允許）
+        /// stage = "annual"：完成特休（必須 status="3" 才允許）
+        ///
+        /// ===============================
+        /// 【時間欄位寫入規則】(DATETIME)
+        /// ===============================
+        /// 任何狀態變更：
+        /// - status_changed_at = now
+        /// - updated_at = now
+        ///
+        /// stage=weekly：
+        /// - current.weekly_completed_at 若空 → 寫入 now
+        /// - next.weekly_fill_start_at 若空 → 寫入 now（當 next 從 "0" 變成 "1"）
+        ///
+        /// stage=annual：
+        /// - current.annual_completed_at 若空 → 寫入 now
+        /// - next.annual_fill_start_at 若空 → 寫入 now（當 next 從 "2" 變成 "3"）
+        ///
+        /// ===============================
+        /// 【防呆規則】
+        /// ===============================
+        /// 1) 流程資料唯一性（避免流程亂掉）
+        ///    - 週休可填狀態(status="1")同時間只能存在 1 組
+        ///    - 特休可填狀態(status="3")同時間只能存在 1 組
+        ///    - 不允許同時存在 status="1" 與 status="3"
+        ///
+        /// 2) 階段不可跳關
+        ///    - stage=annual 時，必須所有組別週休完成（不得存在 status="0"/"1"）
+        ///    - 若已進入特休階段（存在 status="3"/"4"），禁止再執行 stage=weekly
+        ///
+        /// 3) 只能由「目前輪到的那一組」完成
+        ///    - stage=weekly 時，groups 中唯一 status="1" 必須是 current
+        ///    - stage=annual 時，groups 中唯一 status="3" 必須是 current
+        ///
+        /// 4) next 狀態一致性
+        ///    - 週休推進：下一組若存在，next.status 必須為 "0" 才能開放週休
+        ///    - 特休推進：下一組若存在，next.status 必須為 "2" 才能開放特休
+        ///    - 若 next.status 不符合，代表資料被人為更動或流程異常，將回傳錯誤 (-200)
+        ///
+        /// ===============================
+        /// 【傳入參數】(ValueAry)
+        /// ===============================
+        /// form_guid   = 排休表單 GUID（必填）
+        /// group_guid  = 本次完成的組別 GUID（必填）
+        /// stage       = weekly / annual（必填）
+        ///
+        /// ===============================
+        /// 【JSON 傳入範例】
+        /// ===============================
+        /// (1) 完成週休：
+        /// {
+        ///   "ValueAry": [
+        ///     "form_guid=FORM_GUID_001",
+        ///     "group_guid=GROUP_GUID_001",
+        ///     "stage=weekly"
+        ///   ]
+        /// }
+        ///
+        /// (2) 完成特休：
+        /// {
+        ///   "ValueAry": [
+        ///     "form_guid=FORM_GUID_001",
+        ///     "group_guid=GROUP_GUID_001",
+        ///     "stage=annual"
+        ///   ]
+        /// }
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// ※ 下列 Data 僅為示意（欄位依你的 DayOffGroupClass 為準）
+        ///
+        /// ------------------------------------------------
+        /// 情境 A：完成週休，並開放下一組週休
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "週休完成：1，已開放下一組週休：2",
+        ///   "Data": [
+        ///     {
+        ///       "GUID": "GROUP_GUID_001",
+        ///       "form_guid": "FORM_GUID_001",
+        ///       "order_index": "1",
+        ///       "status": "2",
+        ///       "weekly_completed_at": "2026-01-21 22:30:00",
+        ///       "status_changed_at": "2026-01-21 22:30:00",
+        ///       "updated_at": "2026-01-21 22:30:00"
+        ///     },
+        ///     {
+        ///       "GUID": "GROUP_GUID_002",
+        ///       "form_guid": "FORM_GUID_001",
+        ///       "order_index": "2",
+        ///       "status": "1",
+        ///       "weekly_fill_start_at": "2026-01-21 22:30:00",
+        ///       "status_changed_at": "2026-01-21 22:30:00",
+        ///       "updated_at": "2026-01-21 22:30:00"
+        ///     }
+        ///   ]
+        /// }
+        ///
+        /// ------------------------------------------------
+        /// 情境 B：最後一組週休完成，且全部週休完成 → 自動切換到特休並開放第一組特休
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "所有組別週休已完成，已切換至特休填寫並開放第一組：1",
+        ///   "Data": [
+        ///     {
+        ///       "GUID": "GROUP_GUID_LAST",
+        ///       "order_index": "N",
+        ///       "status": "2",
+        ///       "weekly_completed_at": "2026-01-21 22:40:00"
+        ///     },
+        ///     {
+        ///       "GUID": "GROUP_GUID_001",
+        ///       "order_index": "1",
+        ///       "status": "3",
+        ///       "annual_fill_start_at": "2026-01-21 22:40:00"
+        ///     }
+        ///   ]
+        /// }
+        ///
+        /// ------------------------------------------------
+        /// 情境 C：完成特休，並開放下一組特休
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "特休完成：1，已開放下一組特休：2",
+        ///   "Data": [
+        ///     {
+        ///       "GUID": "GROUP_GUID_001",
+        ///       "order_index": "1",
+        ///       "status": "4",
+        ///       "annual_completed_at": "2026-01-21 23:10:00"
+        ///     },
+        ///     {
+        ///       "GUID": "GROUP_GUID_002",
+        ///       "order_index": "2",
+        ///       "status": "3",
+        ///       "annual_fill_start_at": "2026-01-21 23:10:00"
+        ///     }
+        ///   ]
+        /// }
+        ///
+        /// ------------------------------------------------
+        /// 情境 D：最後一組特休完成，且全部特休完成 → 流程結束
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "所有組別特休已完成，流程結束",
+        ///   "Data": null
+        /// }
+        ///
+        /// ===============================
+        /// 【失敗回傳 JSON 範例】
+        /// ===============================
+        /// (1) 缺少參數：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "未提供 form_guid",
+        ///   "Data": null
+        /// }
+        ///
+        /// (2) 目前輪到的組別不是此組：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "目前輪到填寫週休的組別非此組，請先取得目前開放組別(status=1)再完成",
+        ///   "Data": null
+        /// }
+        ///
+        /// (3) 階段跳關：週休未完成就進特休：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "週休尚未全部完成，禁止進入特休階段 (仍存在 status=0 或 status=1)",
+        ///   "Data": null
+        /// }
+        ///
+        /// (4) 流程狀態異常：可填狀態同時多組/同時存在週休與特休：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)，請修正資料後再操作",
+        ///   "Data": null
+        /// }
+        ///
+        /// (5) next 狀態不符：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "流程狀態異常：下一組(order_index=2) status 應為 0 才能開放週休，但實際為 2",
+        ///   "Data": null
+        /// }
+        ///
+        /// (6) stage 不支援：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "stage 不支援：xxx，僅支援 weekly / annual",
+        ///   "Data": null
+        /// }
+        ///
+        /// (7) 例外錯誤：
+        /// {
+        ///   "Code": -500,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/complete_stage",
+        ///   "Result": "Exception message ...",
+        ///   "Data": null
+        /// }
+        /// </remarks>
+        /// <param name="returnData">
+        /// returnData 物件，主要使用 ValueAry 作為參數輸入。
+        /// </param>
+        /// <returns>
+        /// 回傳 returnData.JsonSerializationt() 的 JSON 字串。
+        /// </returns>
+        [HttpPost("complete_stage")]
+        public string complete_stage([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "/phar_roster_api/dayOffSchedule/complete_stage";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                    .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_guid = GetVal("form_guid");
+                string group_guid = GetVal("group_guid");
+                string stage = GetVal("stage"); // weekly / annual
+
+                if (form_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_guid";
+                    return returnData.JsonSerializationt();
+                }
+                if (group_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 group_guid";
+                    return returnData.JsonSerializationt();
+                }
+                if (stage.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 stage (weekly/annual)";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffGroupClass = MethodClass.GetSQLControl<DayOffGroupClass>();
+
+                // 取得此表單所有組別
+                List<DayOffGroupClass> groups = sql_dayOffGroupClass
+                    .GetRowsByDefult(null, "form_guid", form_guid)
+                    .SQLToClass<DayOffGroupClass>();
+
+                if (groups == null || groups.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"查無組別資料 form_guid={form_guid}";
+                    return returnData.JsonSerializationt();
+                }
+
+                // 排序（注意 order_index 為 VARCHAR）
+                groups = groups
+                    .OrderBy(x => x.order_index.StringToInt32())
+                    .ToList();
+
+                DayOffGroupClass current = groups.FirstOrDefault(x => x.GUID == group_guid);
+                if (current == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"查無 group_guid={group_guid}";
+                    return returnData.JsonSerializationt();
+                }
+
+                string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+                // =========================
+                // ⭐ 防呆：狀態合法性檢查
+                // =========================
+                // 只能存在單一週休可填（status=1）或單一特休可填（status=3）
+                var openWeekly = groups.Where(g => g.status == "1").ToList();
+                var openAnnual = groups.Where(g => g.status == "3").ToList();
+
+                // 若同時存在 1 與 3，代表流程資料異常
+                if (openWeekly.Count > 0 && openAnnual.Count > 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)，請修正資料後再操作";
+                    return returnData.JsonSerializationt();
+                }
+
+                // 若週休可填組超過1
+                if (openWeekly.Count > 1)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"流程狀態異常：可填週休(status=1)組別數量={openWeekly.Count}，應僅允許 1 組";
+                    return returnData.JsonSerializationt();
+                }
+
+                // 若特休可填組超過1
+                if (openAnnual.Count > 1)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"流程狀態異常：可填特休(status=3)組別數量={openAnnual.Count}，應僅允許 1 組";
+                    return returnData.JsonSerializationt();
+                }
+
+                // stage=annual 防呆：必須先全部週休完成才能進入特休
+                // 也就是不能有 status=0 或 status=1 存在
+                bool weeklyAllDone = groups.All(g => g.status != "0" && g.status != "1");
+
+                // 依 stage 決定狀態流轉
+                if (stage.Equals("weekly", StringComparison.OrdinalIgnoreCase))
+                {
+                    // 防呆：如果已進入特休階段（存在 status=3 或 4），不可再完成週休
+                    bool annualStarted = groups.Any(g => g.status == "3" || g.status == "4");
+                    if (annualStarted)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "流程已進入特休階段（存在 status=3/4），不可再完成週休";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    // 防呆：必須由目前開放那一組完成（唯一 status=1）
+                    if (openWeekly.Count != 1 || openWeekly[0].GUID != current.GUID)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "目前輪到填寫週休的組別非此組，請先取得目前開放組別(status=1)再完成";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    // 合法性檢查：必須是可填週休(1) 才能完成
+                    if (current.status != "1")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"該組別狀態不允許完成週休 (status={current.status})，必須為 1=可填週休";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    // 更新當前組：週休完成(2)
+                    current.status = "2";
+                    current.status_changed_at = now;
+                    if (current.weekly_completed_at.StringIsEmpty()) current.weekly_completed_at = now;
+                    current.updated_at = now;
+
+                    // 尋找下一組（週休階段下一個要開放的）
+                    DayOffGroupClass next = GetNextGroup(groups, current);
+
+                    if (next != null)
+                    {
+                        // 開放下一組填週休：未輪到(0) -> 可填週休(1)
+                        if (next.status == "0")
+                        {
+                            next.status = "1";
+                            next.status_changed_at = now;
+                            if (next.weekly_fill_start_at.StringIsEmpty()) next.weekly_fill_start_at = now;
+                            next.updated_at = now;
+
+                            sql_dayOffGroupClass.UpdateByDefulteExtra(null, current.ClassToSQL<DayOffGroupClass>());
+                            sql_dayOffGroupClass.UpdateByDefulteExtra(null, next.ClassToSQL<DayOffGroupClass>());
+
+                            returnData.Code = 200;
+                            returnData.Result = $"週休完成：{current.order_index}，已開放下一組週休：{next.order_index}";
+                            returnData.Data = new List<DayOffGroupClass>() { current, next };
+                            return returnData.JsonSerializationt();
+                        }
+                        else
+                        {
+                            // 防呆：下一組不是 0，代表資料不一致，回傳異常資訊
+                            sql_dayOffGroupClass.UpdateByDefulteExtra(null, current.ClassToSQL<DayOffGroupClass>());
+
+                            returnData.Code = -200;
+                            returnData.Result = $"流程狀態異常：下一組(order_index={next.order_index}) status 應為 0 才能開放週休，但實際為 {next.status}";
+                            return returnData.JsonSerializationt();
+                        }
+                    }
+
+                    // next == null 代表本次完成的是最後一組週休
+                    // 若「全部週休完成」→ 進入特休階段，開放第一組特休(3)
+                    bool allWeeklyDone = groups.All(g => g.status == "2" || g.status == "3" || g.status == "4");
+                    sql_dayOffGroupClass.UpdateByDefulteExtra(null, current.ClassToSQL<DayOffGroupClass>());
+
+                    if (allWeeklyDone)
+                    {
+                        DayOffGroupClass first = groups.FirstOrDefault();
+                        if (first != null && first.status == "2")
+                        {
+                            first.status = "3";
+                            first.status_changed_at = now;
+                            if (first.annual_fill_start_at.StringIsEmpty()) first.annual_fill_start_at = now;
+                            first.updated_at = now;
+
+                            sql_dayOffGroupClass.UpdateByDefulteExtra(null, first.ClassToSQL<DayOffGroupClass>());
+
+                            returnData.Code = 200;
+                            returnData.Result = $"所有組別週休已完成，已切換至特休填寫並開放第一組：{first.order_index}";
+                            returnData.Data = new List<DayOffGroupClass>() { current, first };
+                            return returnData.JsonSerializationt();
+                        }
+
+                        returnData.Code = -200;
+                        returnData.Result = $"流程狀態異常：所有週休完成但第一組狀態非 2，無法自動開放特休 (first.status={first?.status})";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    returnData.Code = 200;
+                    returnData.Result = "週休完成：最後一組已完成，但尚未達成全部週休完成條件";
+                    return returnData.JsonSerializationt();
+                }
+                else if (stage.Equals("annual", StringComparison.OrdinalIgnoreCase))
+                {
+                    // 防呆：特休必須在週休全完成後才能執行
+                    if (!weeklyAllDone)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "週休尚未全部完成，禁止進入特休階段 (仍存在 status=0 或 status=1)";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    // 防呆：必須由目前開放那一組完成（唯一 status=3）
+                    if (openAnnual.Count != 1 || openAnnual[0].GUID != current.GUID)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "目前輪到填寫特休的組別非此組，請先取得目前開放組別(status=3)再完成";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    // 合法性檢查：必須是可填特休(3) 才能完成
+                    if (current.status != "3")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"該組別狀態不允許完成特休 (status={current.status})，必須為 3=可填特休";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    // 更新當前組：特休完成(4)
+                    current.status = "4";
+                    current.status_changed_at = now;
+                    if (current.annual_completed_at.StringIsEmpty()) current.annual_completed_at = now;
+                    current.updated_at = now;
+
+                    // 開放下一組特休：2 -> 3
+                    DayOffGroupClass next = GetNextGroup(groups, current);
+                    if (next != null)
+                    {
+                        if (next.status == "2")
+                        {
+                            next.status = "3";
+                            next.status_changed_at = now;
+                            if (next.annual_fill_start_at.StringIsEmpty()) next.annual_fill_start_at = now;
+                            next.updated_at = now;
+
+                            sql_dayOffGroupClass.UpdateByDefulteExtra(null, current.ClassToSQL<DayOffGroupClass>());
+                            sql_dayOffGroupClass.UpdateByDefulteExtra(null, next.ClassToSQL<DayOffGroupClass>());
+
+                            returnData.Code = 200;
+                            returnData.Result = $"特休完成：{current.order_index}，已開放下一組特休：{next.order_index}";
+                            returnData.Data = new List<DayOffGroupClass>() { current, next };
+                            return returnData.JsonSerializationt();
+                        }
+                        else
+                        {
+                            sql_dayOffGroupClass.UpdateByDefulteExtra(null, current.ClassToSQL<DayOffGroupClass>());
+
+                            returnData.Code = -200;
+                            returnData.Result = $"流程狀態異常：下一組(order_index={next.order_index}) status 應為 2 才能開放特休，但實際為 {next.status}";
+                            return returnData.JsonSerializationt();
+                        }
+                    }
+
+                    // next == null → 最後一組特休完成
+                    sql_dayOffGroupClass.UpdateByDefulteExtra(null, current.ClassToSQL<DayOffGroupClass>());
+
+                    bool allAnnualDone = groups.All(g => g.status == "4");
+                    if (allAnnualDone)
+                    {
+                        returnData.Code = 200;
+                        returnData.Result = "所有組別特休已完成，流程結束";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    returnData.Code = 200;
+                    returnData.Result = "特休完成：最後一組已完成，但仍有組別未達成全數完成狀態";
+                    return returnData.JsonSerializationt();
+                }
+                else
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"stage 不支援：{stage}，僅支援 weekly / annual";
+                    return returnData.JsonSerializationt();
+                }
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.Result += timer.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 取得目前輪到哪一組填寫（週休/特休）的「開放組別」。
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 用於前端判斷目前流程進行到哪個階段，以及「目前輪到哪一組」可填寫：
+        /// - 若存在 status="1" → 表示目前為週休階段，回傳 stage="weekly" 且 open_group=status=1 之組別
+        /// - 若存在 status="3" → 表示目前為特休階段，回傳 stage="annual" 且 open_group=status=3 之組別
+        /// - 若兩者皆不存在 → 表示尚未初始化或流程已結束（stage="none"）
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/get_current_open_group
+        ///
+        /// ===============================
+        /// 【Method】
+        /// ===============================
+        /// POST
+        ///
+        /// ===============================
+        /// 【狀態碼(status)定義】(VARCHAR)
+        /// ===============================
+        /// "0" = 未輪到（鎖定不可填）
+        /// "1" = 可填寫週休
+        /// "2" = 週休填寫完成
+        /// "3" = 可填寫特休
+        /// "4" = 特休填寫完成
+        ///
+        /// ===============================
+        /// 【傳入參數】(ValueAry)
+        /// ===============================
+        /// form_guid = 排休表單 GUID（必填）
+        ///
+        /// ===============================
+        /// 【JSON 傳入範例】
+        /// ===============================
+        /// {
+        ///   "ValueAry": [
+        ///     "form_guid=FORM_GUID_001"
+        ///   ]
+        /// }
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// ------------------------------------------------
+        /// 情境 A：目前為週休階段（存在 status=1）
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_open_group",
+        ///   "Result": "目前為週休階段，已取得開放組別",
+        ///   "Data": {
+        ///     "stage": "weekly",
+        ///     "open_group": {
+        ///       "GUID": "GROUP_GUID_002",
+        ///       "form_guid": "FORM_GUID_001",
+        ///       "order_index": "2",
+        ///       "status": "1",
+        ///       "weekly_fill_start_at": "2026-01-21 22:30:00"
+        ///     },
+        ///     "groups_status_summary": {
+        ///       "status_0": 5,
+        ///       "status_1": 1,
+        ///       "status_2": 1,
+        ///       "status_3": 0,
+        ///       "status_4": 0
+        ///     }
+        ///   }
+        /// }
+        ///
+        /// ------------------------------------------------
+        /// 情境 B：目前為特休階段（存在 status=3）
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_open_group",
+        ///   "Result": "目前為特休階段，已取得開放組別",
+        ///   "Data": {
+        ///     "stage": "annual",
+        ///     "open_group": {
+        ///       "GUID": "GROUP_GUID_001",
+        ///       "form_guid": "FORM_GUID_001",
+        ///       "order_index": "1",
+        ///       "status": "3",
+        ///       "annual_fill_start_at": "2026-01-21 23:10:00"
+        ///     },
+        ///     "groups_status_summary": {
+        ///       "status_0": 0,
+        ///       "status_1": 0,
+        ///       "status_2": 6,
+        ///       "status_3": 1,
+        ///       "status_4": 0
+        ///     }
+        ///   }
+        /// }
+        ///
+        /// ------------------------------------------------
+        /// 情境 C：尚未初始化或流程已結束（不存在 status=1/3）
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_open_group",
+        ///   "Result": "目前無開放組別（尚未初始化或流程已結束）",
+        ///   "Data": {
+        ///     "stage": "none",
+        ///     "open_group": null,
+        ///     "groups_status_summary": {
+        ///       "status_0": 0,
+        ///       "status_1": 0,
+        ///       "status_2": 0,
+        ///       "status_3": 0,
+        ///       "status_4": 7
+        ///     }
+        ///   }
+        /// }
+        ///
+        /// ===============================
+        /// 【失敗回傳 JSON 範例】
+        /// ===============================
+        /// (1) 缺少 form_guid：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_open_group",
+        ///   "Result": "未提供 form_guid",
+        ///   "Data": null
+        /// }
+        ///
+        /// (2) 查無組別：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_open_group",
+        ///   "Result": "查無組別資料 form_guid=FORM_GUID_001",
+        ///   "Data": null
+        /// }
+        ///
+        /// (3) 流程資料異常（同時存在 status=1 與 status=3 或多組可填）：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_open_group",
+        ///   "Result": "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)，請修正資料後再查詢",
+        ///   "Data": null
+        /// }
+        /// </remarks>
+        /// <param name="returnData">
+        /// returnData 物件，主要使用 ValueAry 作為參數輸入。
+        /// </param>
+        /// <returns>
+        /// 回傳 returnData.JsonSerializationt() 的 JSON 字串。
+        /// </returns>
+        [HttpPost("get_current_open_group")]
+        public string get_current_open_group([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "/phar_roster_api/dayOffSchedule/get_current_open_group";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                    .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_guid = GetVal("form_guid");
+                if (form_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffGroupClass = MethodClass.GetSQLControl<DayOffGroupClass>();
+
+                List<DayOffGroupClass> groups = sql_dayOffGroupClass
+                    .GetRowsByDefult(null, "form_guid", form_guid)
+                    .SQLToClass<DayOffGroupClass>();
+
+                if (groups == null || groups.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"查無組別資料 form_guid={form_guid}";
+                    return returnData.JsonSerializationt();
+                }
+
+                // 排序（注意 order_index 為 VARCHAR）
+                groups = groups
+                    .OrderBy(x => x.order_index.StringToInt32())
+                    .ToList();
+
+                // 取得目前 open 組（週休 status=1 / 特休 status=3）
+                var openWeekly = groups.Where(g => g.status == "1").ToList();
+                var openAnnual = groups.Where(g => g.status == "3").ToList();
+
+                // 防呆：不允許同時存在週休與特休 open
+                if (openWeekly.Count > 0 && openAnnual.Count > 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)，請修正資料後再查詢";
+                    return returnData.JsonSerializationt();
+                }
+                // 防呆：open 不允許多組
+                if (openWeekly.Count > 1)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"流程狀態異常：可填週休(status=1)組別數量={openWeekly.Count}，應僅允許 1 組";
+                    return returnData.JsonSerializationt();
+                }
+                if (openAnnual.Count > 1)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"流程狀態異常：可填特休(status=3)組別數量={openAnnual.Count}，應僅允許 1 組";
+                    return returnData.JsonSerializationt();
+                }
+
+                // 狀態統計
+                var summary = new Dictionary<string, int>()
+        {
+            { "status_0", groups.Count(x => x.status == "0") },
+            { "status_1", groups.Count(x => x.status == "1") },
+            { "status_2", groups.Count(x => x.status == "2") },
+            { "status_3", groups.Count(x => x.status == "3") },
+            { "status_4", groups.Count(x => x.status == "4") },
+        };
+
+                // 組裝回傳資料
+                string stage = "none";
+                DayOffGroupClass openGroup = null;
+
+                if (openWeekly.Count == 1)
+                {
+                    stage = "weekly";
+                    openGroup = openWeekly[0];
+                }
+                else if (openAnnual.Count == 1)
+                {
+                    stage = "annual";
+                    openGroup = openAnnual[0];
+                }
+
+                var data = new DayOffCurrentOpenGroupResponse
+                {
+                    stage = stage,
+                    open_group = openGroup,
+                    groups_status_summary = summary
+                };
+
+                returnData.Code = 200;
+                if (stage == "weekly") returnData.Result = "目前為週休階段，已取得開放組別";
+                else if (stage == "annual") returnData.Result = "目前為特休階段，已取得開放組別";
+                else returnData.Result = "目前無開放組別（尚未初始化或流程已結束）";
+
+                returnData.Data = data;
+                string json = returnData.JsonSerializationt();
+                return returnData.JsonSerializationt();
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.Result += timer.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 取得排休流程進度（週休/特休完成比例、目前階段、目前輪到組別等）。
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 提供前端顯示排休流程進度用，回傳內容包含：
+        /// 1) 目前流程階段（weekly / annual / none / finished）
+        /// 2) 目前開放可填寫的組別（週休 status=1 或 特休 status=3）
+        /// 3) 各狀態組別數量統計（status_0~status_4）
+        /// 4) 週休完成進度(%)、特休完成進度(%)、整體進度(%)（週休50% + 特休50%）
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/get_flow_progress
+        ///
+        /// ===============================
+        /// 【Method】
+        /// ===============================
+        /// POST
+        ///
+        /// ===============================
+        /// 【狀態碼(status)定義】(VARCHAR)
+        /// ===============================
+        /// "0" = 未輪到（鎖定不可填）
+        /// "1" = 可填寫週休
+        /// "2" = 週休填寫完成
+        /// "3" = 可填寫特休
+        /// "4" = 特休填寫完成
+        ///
+        /// ===============================
+        /// 【傳入參數】(ValueAry)
+        /// ===============================
+        /// form_guid = 排休表單 GUID（必填）
+        ///
+        /// ===============================
+        /// 【JSON 傳入範例】
+        /// ===============================
+        /// {
+        ///   "ValueAry": [
+        ///     "form_guid=FORM_GUID_001"
+        ///   ]
+        /// }
+        ///
+        /// ===============================
+        /// 【回傳資料欄位說明】
+        /// ===============================
+        /// stage：
+        /// - "none"     ：尚未初始化（無 status=1 與 status=3）
+        /// - "weekly"   ：週休階段（存在 status=1）
+        /// - "annual"   ：特休階段（存在 status=3）
+        /// - "finished" ：流程結束（所有組別 status=4）
+        ///
+        /// weekly_progress_percent：週休完成比例（0~100）
+        /// annual_progress_percent：特休完成比例（0~100）
+        /// overall_progress_percent：整體流程完成比例（0~100），計算：
+        /// - weekly_progress_percent * 0.5 + annual_progress_percent * 0.5
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_flow_progress",
+        ///   "Result": "已取得流程進度",
+        ///   "Data": {
+        ///     "form_guid": "FORM_GUID_001",
+        ///     "stage": "weekly",
+        ///     "open_group": {
+        ///       "GUID": "GROUP_GUID_002",
+        ///       "order_index": "2",
+        ///       "status": "1"
+        ///     },
+        ///     "total_groups": 7,
+        ///     "groups_status_summary": {
+        ///       "status_0": 5,
+        ///       "status_1": 1,
+        ///       "status_2": 1,
+        ///       "status_3": 0,
+        ///       "status_4": 0
+        ///     },
+        ///     "weekly_progress_percent": 14.2857,
+        ///     "annual_progress_percent": 0,
+        ///     "overall_progress_percent": 7.1428
+        ///   }
+        /// }
+        ///
+        /// ===============================
+        /// 【失敗回傳 JSON 範例】
+        /// ===============================
+        /// (1) 缺少 form_guid：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_flow_progress",
+        ///   "Result": "未提供 form_guid",
+        ///   "Data": null
+        /// }
+        ///
+        /// (2) 查無組別：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_flow_progress",
+        ///   "Result": "查無組別資料 form_guid=FORM_GUID_001",
+        ///   "Data": null
+        /// }
+        ///
+        /// (3) 流程狀態異常（同時存在 status=1 與 status=3 或多組可填）：
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_flow_progress",
+        ///   "Result": "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)，請修正資料後再查詢",
+        ///   "Data": null
+        /// }
+        /// </remarks>
+        /// <param name="returnData">
+        /// returnData 物件，主要使用 ValueAry 作為參數輸入。
+        /// </param>
+        /// <returns>
+        /// 回傳 returnData.JsonSerializationt() 的 JSON 字串。
+        /// </returns>
+        [HttpPost("get_flow_progress")]
+        public string get_flow_progress([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "/phar_roster_api/dayOffSchedule/get_flow_progress";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                    .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_guid = GetVal("form_guid");
+                if (form_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffGroupClass = MethodClass.GetSQLControl<DayOffGroupClass>();
+
+    
+                List<object[]> objects = sql_dayOffGroupClass.GetRowsByDefult(null, "form_guid", form_guid);
+                List<DayOffGroupClass> groups = objects.SQLToClass<DayOffGroupClass>();
+                if (groups == null || groups.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"查無組別資料 form_guid={form_guid}";
+                    return returnData.JsonSerializationt();
+                }
+
+                // 排序（order_index 為 VARCHAR）
+                groups = groups.OrderBy(x => x.order_index.StringToInt32()).ToList();
+
+                var openWeekly = groups.Where(g => g.status == "1").ToList();
+                var openAnnual = groups.Where(g => g.status == "3").ToList();
+
+                // 防呆：同時存在週休與特休 open
+                if (openWeekly.Count > 0 && openAnnual.Count > 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)，請修正資料後再查詢";
+                    return returnData.JsonSerializationt();
+                }
+                // 防呆：open 不允許多組
+                if (openWeekly.Count > 1)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"流程狀態異常：可填週休(status=1)組別數量={openWeekly.Count}，應僅允許 1 組";
+                    return returnData.JsonSerializationt();
+                }
+                if (openAnnual.Count > 1)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"流程狀態異常：可填特休(status=3)組別數量={openAnnual.Count}，應僅允許 1 組";
+                    return returnData.JsonSerializationt();
+                }
+
+                int total = groups.Count;
+                int count0 = groups.Count(x => x.status == "0");
+                int count1 = groups.Count(x => x.status == "1");
+                int count2 = groups.Count(x => x.status == "2");
+                int count3 = groups.Count(x => x.status == "3");
+                int count4 = groups.Count(x => x.status == "4");
+
+                var summary = new Dictionary<string, int>()
+        {
+            { "status_0", count0 },
+            { "status_1", count1 },
+            { "status_2", count2 },
+            { "status_3", count3 },
+            { "status_4", count4 },
+        };
+
+                // 階段判斷
+                string stage = "none";
+                DayOffGroupClass openGroup = null;
+
+                bool finished = groups.All(g => g.status == "4");
+                if (finished)
+                {
+                    stage = "finished";
+                }
+                else if (openWeekly.Count == 1)
+                {
+                    stage = "weekly";
+                    openGroup = openWeekly[0];
+                }
+                else if (openAnnual.Count == 1)
+                {
+                    stage = "annual";
+                    openGroup = openAnnual[0];
+                }
+                else
+                {
+                    stage = "none";
+                }
+
+                // 週休完成比例：status >= 2 視為週休完成
+                // (2/3/4 都代表週休完成)
+                int weeklyDone = groups.Count(g => g.status == "2" || g.status == "3" || g.status == "4");
+                double weeklyPercent = total == 0 ? 0 : (weeklyDone * 100.0 / total);
+
+                // 特休完成比例：status=4 視為特休完成
+                int annualDone = groups.Count(g => g.status == "4");
+                double annualPercent = total == 0 ? 0 : (annualDone * 100.0 / total);
+
+                // 整體：週休 50% + 特休 50%
+                double overallPercent = weeklyPercent * 0.5 + annualPercent * 0.5;
+
+                var data = new DayOffFlowProgressResponse
+                {
+                    form_guid = form_guid,
+                    stage = stage,
+                    open_group = openGroup,
+                    total_groups = total,
+                    groups_status_summary = summary,
+                    weekly_progress_percent = Math.Round(weeklyPercent, 4),
+                    annual_progress_percent = Math.Round(annualPercent, 4),
+                    overall_progress_percent = Math.Round(overallPercent, 4)
+                };
+
+                returnData.Code = 200;
+                returnData.Result = "已取得流程進度";
+                returnData.Data = data;
+                return returnData.JsonSerializationt();
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.Result += timer.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 查詢目前「正在排休流程」的表單（全系統一次只能有一張表單進入排休）。
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 用於查詢目前是否存在正在進行排休流程的表單（Active Form）。
+        /// 系統規則為「一次只能有一張表單進入排休」，因此：
+        /// - 若存在 status="1"（可填週休）→ 代表某表單正在週休階段
+        /// - 若存在 status="3"（可填特休）→ 代表某表單正在特休階段
+        /// - 若皆不存在 → 代表目前沒有任何表單正在排休（尚未初始化或已結束）
+        ///
+        /// 回傳內容包含：
+        /// - active_form_guid：目前正在排休的 form_guid
+        /// - stage：weekly / annual / none
+        /// - open_group：目前開放可填寫的組別
+        /// - groups_status_summary：該 form_guid 下各狀態統計
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/get_current_active_form
+        ///
+        /// ===============================
+        /// 【Method】
+        /// ===============================
+        /// POST
+        ///
+        /// ===============================
+        /// 【狀態碼(status)定義】(VARCHAR)
+        /// ===============================
+        /// "0" = 未輪到（鎖定不可填）
+        /// "1" = 可填寫週休
+        /// "2" = 週休填寫完成
+        /// "3" = 可填寫特休
+        /// "4" = 特休填寫完成
+        ///
+        /// ===============================
+        /// 【資料一致性規則（防呆）】
+        /// ===============================
+        /// 1) 不允許同時存在 status="1" 與 status="3"
+        /// 2) status="1" 全系統不允許超過 1 組
+        /// 3) status="3" 全系統不允許超過 1 組
+        /// 4) 若 active_form_guid 找到，但該表單內無 open_group，回傳 stage="none"
+        ///
+        /// ===============================
+        /// 【JSON 傳入範例】
+        /// ===============================
+        /// { }
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// (1) 週休階段
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_active_form",
+        ///   "Result": "目前有表單正在週休階段排休",
+        ///   "Data": {
+        ///     "active_form_guid": "FORM_GUID_001",
+        ///     "stage": "weekly",
+        ///     "open_group": {
+        ///       "GUID": "GROUP_GUID_002",
+        ///       "form_guid": "FORM_GUID_001",
+        ///       "order_index": "2",
+        ///       "status": "1"
+        ///     },
+        ///     "groups_status_summary": {
+        ///       "status_0": 5,
+        ///       "status_1": 1,
+        ///       "status_2": 1,
+        ///       "status_3": 0,
+        ///       "status_4": 0
+        ///     }
+        ///   }
+        /// }
+        ///
+        /// (2) 無任何表單排休中
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_active_form",
+        ///   "Result": "目前無任何表單正在排休流程中",
+        ///   "Data": {
+        ///     "active_form_guid": null,
+        ///     "stage": "none",
+        ///     "open_group": null
+        ///   }
+        /// }
+        ///
+        /// ===============================
+        /// 【失敗回傳 JSON 範例】
+        /// ===============================
+        /// (1) 狀態異常：同時存在 status=1 與 status=3
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_active_form",
+        ///   "Result": "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)，請修正資料後再查詢",
+        ///   "Data": null
+        /// }
+        ///
+        /// (2) 狀態異常：可填週休超過 1 組
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/get_current_active_form",
+        ///   "Result": "流程狀態異常：可填週休(status=1)組別數量=2，應僅允許 1 組",
+        ///   "Data": null
+        /// }
+        /// </remarks>
+        /// <param name="returnData">returnData 物件（本 API 無需 ValueAry 參數）。</param>
+        /// <returns>回傳 returnData.JsonSerializationt() 的 JSON 字串。</returns>
+        [HttpPost("get_current_active_form")]
+        public string get_current_active_form([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "/phar_roster_api/dayOffSchedule/get_current_active_form";
+
+            try
+            {
+                var sql_dayOffGroupClass = MethodClass.GetSQLControl<DayOffGroupClass>();
+
+                // 取得全系統所有組別
+                List<DayOffGroupClass> allGroups = sql_dayOffGroupClass
+                    .GetAllRows(null)
+                    .SQLToClass<DayOffGroupClass>();
+
+                if (allGroups == null || allGroups.Count == 0)
+                {
+                    returnData.Code = 200;
+                    returnData.Result = "目前無任何表單正在排休流程中";
+                    returnData.Data = new
+                    {
+                        active_form_guid = (string)null,
+                        stage = "none",
+                        open_group = (object)null
+                    };
+                    return returnData.JsonSerializationt();
+                }
+
+                // 找出 open group（週休 status=1 / 特休 status=3）
+                var openWeekly = allGroups.Where(g => g.status == "1").ToList();
+                var openAnnual = allGroups.Where(g => g.status == "3").ToList();
+
+                // 防呆：不允許同時存在週休與特休 open
+                if (openWeekly.Count > 0 && openAnnual.Count > 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)，請修正資料後再查詢";
+                    return returnData.JsonSerializationt();
+                }
+
+                // 防呆：open 不允許多組
+                if (openWeekly.Count > 1)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"流程狀態異常：可填週休(status=1)組別數量={openWeekly.Count}，應僅允許 1 組";
+                    return returnData.JsonSerializationt();
+                }
+                if (openAnnual.Count > 1)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"流程狀態異常：可填特休(status=3)組別數量={openAnnual.Count}，應僅允許 1 組";
+                    return returnData.JsonSerializationt();
+                }
+
+                string active_form_guid = null;
+                string stage = "none";
+                DayOffGroupClass openGroup = null;
+
+                if (openWeekly.Count == 1)
+                {
+                    stage = "weekly";
+                    openGroup = openWeekly[0];
+                    active_form_guid = openGroup.form_guid;
+                }
+                else if (openAnnual.Count == 1)
+                {
+                    stage = "annual";
+                    openGroup = openAnnual[0];
+                    active_form_guid = openGroup.form_guid;
+                }
+                else
+                {
+                    // 無任何 open group
+                    returnData.Code = 200;
+                    returnData.Result = "目前無任何表單正在排休流程中";
+                    returnData.Data = new
+                    {
+                        active_form_guid = (string)null,
+                        stage = "none",
+                        open_group = (object)null
+                    };
+                    return returnData.JsonSerializationt();
+                }
+
+                // 取得該表單底下所有 groups，做狀態統計
+                var activeFormGroups = allGroups
+                    .Where(g => g.form_guid == active_form_guid)
+                    .OrderBy(g => g.order_index.StringToInt32())
+                    .ToList();
+
+                var summary = DayOffGroupStatusSummary.FromGroups(activeFormGroups);
+ 
+                returnData.Code = 200;
+                if (stage == "weekly") returnData.Result = "目前有表單正在週休階段排休";
+                else returnData.Result = "目前有表單正在特休階段排休";
+
+                returnData.Data = new DayOffActiveFormResponse
+                {
+                    active_form_guid = active_form_guid,
+                    stage = stage,
+                    open_group = openGroup,
+                    groups_status_summary = summary
+                };
+
+                return returnData.JsonSerializationt();
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.Result += timer.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 檢查指定 staff 是否在「目前排休輪次(open group)」中（是否輪到填寫週休/特休）。
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 用於前端判斷「使用者是否輪到填寫排休」。
+        /// 系統排休流程規則：
+        /// 1) 一次只能有一張排休表單進入排休流程（Active Form）
+        /// 2) 同一時間只允許存在 1 個 open group：
+        ///    - 週休階段：open group 的狀態為 status="1"
+        ///    - 特休階段：open group 的狀態為 status="3"
+        ///
+        /// 本 API 會：
+        /// - 找出目前 active 表單（若未提供 form_guid）
+        /// - 找出該表單目前 open group（status=1 或 3）
+        /// - 查詢 staff_id 是否屬於 open group
+        /// - 回傳 can_write/is_in_round 供前端控制填寫權限
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/check_staff_in_current_round
+        ///
+        /// ===============================
+        /// 【Method】
+        /// ===============================
+        /// POST
+        ///
+        /// ===============================
+        /// 【狀態碼(status)定義】(VARCHAR)
+        /// ===============================
+        /// "0" = 未輪到（鎖定不可填）
+        /// "1" = 可填寫週休（open group）
+        /// "2" = 週休填寫完成
+        /// "3" = 可填寫特休（open group）
+        /// "4" = 特休填寫完成
+        ///
+        /// ===============================
+        /// 【傳入參數】(ValueAry)
+        /// ===============================
+        /// staff_id    = 員工識別碼/員工 GUID（必填）
+        /// form_guid   = 排休表單 GUID（選填）
+        ///              - 有提供：以該表單為判斷依據（不使用全系統 active form 探測）
+        ///              - 未提供：自動從全系統組別中尋找唯一 open group（status=1 或 3）
+        ///
+        /// ===============================
+        /// 【流程判斷規則】
+        /// ===============================
+        /// A) 有提供 form_guid：
+        ///    - 僅針對該表單找 open group
+        ///    - 若同表單同時存在 status=1 與 status=3 → 視為資料異常，回 -200
+        ///    - 若同表單 status=1 或 status=3 超過 1 組 → 視為資料異常，回 -200
+        ///
+        /// B) 未提供 form_guid：
+        ///    - 全系統只允許存在 1 組 status=1 或 1 組 status=3（二擇一）
+        ///    - 若同時存在 status=1 與 status=3 → 視為資料異常，回 -200
+        ///    - 若 status=1 超過 1 組或 status=3 超過 1 組 → 視為資料異常，回 -200
+        ///    - 若全系統不存在 status=1/3 → 視為目前沒有表單排休中，回 Code=200, stage=none
+        ///
+        /// C) staff 判斷：
+        ///    - 以 DayOffGroupMemberClass 的 form_guid + staff_id 尋找 staff 所屬 group_guid
+        ///    - 若 staff 不在該表單任何組別 → 回 -200
+        ///    - 若 staff 所屬 group_guid == open_group_guid → can_write=true / is_in_round=true
+        ///
+        /// ===============================
+        /// 【回傳資料(Data)欄位說明】
+        /// ===============================
+        /// staff_id                 : 本次查詢 staff_id
+        /// active_form_guid         : 目前 active 表單 GUID（若無則為 null）
+        /// stage                    : "none" / "weekly" / "annual"
+        /// stage_name               : "無" / "週休" / "特休"
+        /// can_write                : bool，是否可填寫（等同 is_in_round）
+        /// is_in_round              : bool，是否輪到（staff 是否在 open group）
+        /// open_group_guid          : 目前開放組別 GUID（open group）
+        /// open_group_order_index   : open group 排序序號（int）
+        /// open_group_name          : open group 名稱（若無名稱欄位則為 null）
+        /// staff_group_guid         : staff 所屬組別 GUID
+        /// staff_group_order_index  : staff 所屬組別序號（int）
+        /// staff_group_name         : staff 所屬組別名稱（若無名稱欄位則為 null）
+        /// next_group_guid          : 下一組 GUID（若已是最後一組則為 null）
+        /// next_group_order_index   : 下一組序號（可能為 null）
+        /// next_group_name          : 下一組名稱（若無名稱欄位則為 null）
+        /// remain_groups_to_open    : 還差幾組才輪到（0 表示輪到或已超過）
+        /// message                  : 完整提示訊息（可直接顯示）
+        /// progress_message         : 簡短進度訊息（更口語）
+        ///
+        /// ===============================
+        /// 【JSON 傳入範例】
+        /// ===============================
+        /// (1) 未指定 form_guid（自動找 active form）
+        /// {
+        ///   "ValueAry": [
+        ///     "staff_id=STAFF_GUID_001"
+        ///   ]
+        /// }
+        ///
+        /// (2) 指定某一張表單判斷
+        /// {
+        ///   "ValueAry": [
+        ///     "staff_id=STAFF_GUID_001",
+        ///     "form_guid=FORM_GUID_001"
+        ///   ]
+        /// }
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// ------------------------------------------------
+        /// 情境 A：staff 輪到（在 open group）
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/check_staff_in_current_round",
+        ///   "Result": "staff 已輪到可填寫",
+        ///   "Data": {
+        ///     "staff_id": "STAFF_GUID_001",
+        ///     "active_form_guid": "FORM_GUID_001",
+        ///     "stage": "weekly",
+        ///     "stage_name": "週休",
+        ///     "can_write": true,
+        ///     "is_in_round": true,
+        ///     "open_group_guid": "GROUP_GUID_002",
+        ///     "open_group_order_index": 2,
+        ///     "open_group_name": null,
+        ///     "staff_group_guid": "GROUP_GUID_002",
+        ///     "staff_group_order_index": 2,
+        ///     "staff_group_name": null,
+        ///     "next_group_guid": "GROUP_GUID_003",
+        ///     "next_group_order_index": 3,
+        ///     "next_group_name": null,
+        ///     "remain_groups_to_open": 0,
+        ///     "message": "目前輪到第 2 組(週休)，你屬於第 2 組，可開始填寫",
+        ///     "progress_message": "✅ 已輪到你填寫週休。"
+        ///   }
+        /// }
+        ///
+        /// ------------------------------------------------
+        /// 情境 B：staff 尚未輪到
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/check_staff_in_current_round",
+        ///   "Result": "staff 尚未輪到填寫",
+        ///   "Data": {
+        ///     "staff_id": "STAFF_GUID_001",
+        ///     "active_form_guid": "FORM_GUID_001",
+        ///     "stage": "annual",
+        ///     "stage_name": "特休",
+        ///     "can_write": false,
+        ///     "is_in_round": false,
+        ///     "open_group_guid": "GROUP_GUID_001",
+        ///     "open_group_order_index": 1,
+        ///     "staff_group_guid": "GROUP_GUID_003",
+        ///     "staff_group_order_index": 3,
+        ///     "remain_groups_to_open": 2,
+        ///     "message": "目前輪到第 1 組(特休)，你屬於第 3 組，尚未輪到（還差 2 組）",
+        ///     "progress_message": "⏳ 尚未輪到你填寫特休，目前進度：第 1 組 / 你在第 3 組。"
+        ///   }
+        /// }
+        ///
+        /// ------------------------------------------------
+        /// 情境 C：目前沒有任何表單在排休（全系統無 status=1/3）
+        /// ------------------------------------------------
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/check_staff_in_current_round",
+        ///   "Result": "目前無任何表單正在排休流程中",
+        ///   "Data": {
+        ///     "staff_id": "STAFF_GUID_001",
+        ///     "active_form_guid": null,
+        ///     "stage": "none",
+        ///     "stage_name": "無",
+        ///     "can_write": false,
+        ///     "is_in_round": false,
+        ///     "message": "目前尚未開始排休流程",
+        ///     "progress_message": "目前尚未開始排休流程"
+        ///   }
+        /// }
+        ///
+        /// ===============================
+        /// 【失敗回傳 JSON 範例】
+        /// ===============================
+        /// (1) 未提供 staff_id
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/check_staff_in_current_round",
+        ///   "Result": "未提供 staff_id",
+        ///   "Data": null
+        /// }
+        ///
+        /// (2) 指定 form_guid 但查無組別
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/check_staff_in_current_round",
+        ///   "Result": "查無組別資料 form_guid=FORM_GUID_001",
+        ///   "Data": null
+        /// }
+        ///
+        /// (3) 流程狀態異常：同時存在週休與特休 open（全系統或同表單）
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/check_staff_in_current_round",
+        ///   "Result": "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)",
+        ///   "Data": null
+        /// }
+        ///
+        /// (4) staff 不在該表單任何組別
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "/phar_roster_api/dayOffSchedule/check_staff_in_current_round",
+        ///   "Result": "staff_id=STAFF_GUID_001 不在該排休表單(form_guid=FORM_GUID_001)的任何組別中",
+        ///   "Data": null
+        /// }
+        /// </remarks>
+        /// <param name="returnData">returnData 物件，主要使用 ValueAry 作為參數輸入。</param>
+        /// <returns>回傳 returnData.JsonSerializationt() 的 JSON 字串。</returns>
+        [HttpPost("check_staff_in_current_round")]
+        public string check_staff_in_current_round([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "/phar_roster_api/dayOffSchedule/check_staff_in_current_round";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                    .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string staff_id = GetVal("staff_id");
+                string form_guid_param = GetVal("form_guid");
+
+                if (staff_id.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 staff_id";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffGroupClass = MethodClass.GetSQLControl<DayOffGroupClass>();
+                var sql_dayOffGroupMemberClass = MethodClass.GetSQLControl<DayOffGroupMemberClass>();
+
+                // ================================
+                // 取全系統組別
+                // ================================
+                List<DayOffGroupClass> allGroups = sql_dayOffGroupClass.GetAllRows(null).SQLToClass<DayOffGroupClass>();
+                if (allGroups == null || allGroups.Count == 0)
+                {
+                    returnData.Code = 200;
+                    returnData.Result = "目前無任何表單正在排休流程中";
+                    returnData.Data = new
+                    {
+                        staff_id,
+                        active_form_guid = (string)null,
+                        stage = "none",
+                        stage_name = "無",
+                        can_write = false,
+                        is_in_round = false,
+                        message = "目前尚未開始排休流程",
+                        progress_message = "目前尚未開始排休流程"
+                    };
+                    return returnData.JsonSerializationt();
+                }
+
+                // 小工具：安全抓 group name（若你沒有此欄位，會回 null）
+                string GetGroupName(DayOffGroupClass g)
+                {
+                    if (g == null) return null;
+
+                    // ✅ 如果你有名稱欄位，請在這裡改成你自己的欄位，例如 g.group_name
+                    // return g.group_name;
+
+                    // 暫時：若沒有名稱欄位 → 回 null
+                    return null;
+                }
+
+                // ================================
+                // 決定 active form / open group
+                // ================================
+                string active_form_guid = null;
+                string stage = "none";
+                DayOffGroupClass openGroup = null;
+
+                if (!form_guid_param.StringIsEmpty())
+                {
+                    active_form_guid = form_guid_param;
+
+                    var formGroups = allGroups
+                        .Where(g => g.form_guid == active_form_guid)
+                        .OrderBy(g => g.order_index.StringToInt32())
+                        .ToList();
+
+                    if (formGroups.Count == 0)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"查無組別資料 form_guid={active_form_guid}";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    var openWeekly = formGroups.Where(g => g.status == "1").ToList();
+                    var openAnnual = formGroups.Where(g => g.status == "3").ToList();
+
+                    if (openWeekly.Count > 0 && openAnnual.Count > 0)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "流程狀態異常：同一表單同時存在 status=1 與 status=3";
+                        return returnData.JsonSerializationt();
+                    }
+                    if (openWeekly.Count > 1 || openAnnual.Count > 1)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "流程狀態異常：同一表單 open group 數量異常（status=1 或 status=3 超過 1 組）";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (openWeekly.Count == 1) { stage = "weekly"; openGroup = openWeekly[0]; }
+                    else if (openAnnual.Count == 1) { stage = "annual"; openGroup = openAnnual[0]; }
+                    else stage = "none";
+                }
+                else
+                {
+                    var openWeeklyAll = allGroups.Where(g => g.status == "1").ToList();
+                    var openAnnualAll = allGroups.Where(g => g.status == "3").ToList();
+
+                    if (openWeeklyAll.Count > 0 && openAnnualAll.Count > 0)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "流程狀態異常：同時存在可填週休(status=1)與可填特休(status=3)";
+                        return returnData.JsonSerializationt();
+                    }
+                    if (openWeeklyAll.Count > 1)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"流程狀態異常：可填週休(status=1)組別數量={openWeeklyAll.Count}，應僅允許 1 組";
+                        return returnData.JsonSerializationt();
+                    }
+                    if (openAnnualAll.Count > 1)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"流程狀態異常：可填特休(status=3)組別數量={openAnnualAll.Count}，應僅允許 1 組";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (openWeeklyAll.Count == 1)
+                    {
+                        stage = "weekly";
+                        openGroup = openWeeklyAll[0];
+                        active_form_guid = openGroup.form_guid;
+                    }
+                    else if (openAnnualAll.Count == 1)
+                    {
+                        stage = "annual";
+                        openGroup = openAnnualAll[0];
+                        active_form_guid = openGroup.form_guid;
+                    }
+                    else
+                    {
+                        returnData.Code = 200;
+                        returnData.Result = "目前無任何表單正在排休流程中";
+                        returnData.Data = new
+                        {
+                            staff_id,
+                            active_form_guid = (string)null,
+                            stage = "none",
+                            stage_name = "無",
+                            can_write = false,
+                            is_in_round = false,
+                            message = "目前尚未開始排休流程",
+                            progress_message = "目前尚未開始排休流程"
+                        };
+                        return returnData.JsonSerializationt();
+                    }
+                }
+
+                if (stage == "none" || openGroup == null || active_form_guid.StringIsEmpty())
+                {
+                    returnData.Code = 200;
+                    returnData.Result = "該表單目前無 open group（尚未初始化或已結束）";
+                    returnData.Data = new DayOffCheckStaffInRoundResponse
+                    {
+                        staff_id = staff_id,
+                        active_form_guid = active_form_guid,
+                        stage = "none",
+                        stage_name = "無",
+                        can_write = false,
+                        is_in_round = false,
+                        message = "目前無開放可填寫的組別",
+                        progress_message = "目前無開放可填寫的組別"
+                    };
+                    return returnData.JsonSerializationt();
+                }
+
+                // ================================
+                // 取得 staff 所屬 group（members）
+                // ================================
+                List<DayOffGroupMemberClass> members = sql_dayOffGroupMemberClass
+                    .GetRowsByDefult(null, "form_guid", active_form_guid)
+                    .SQLToClass<DayOffGroupMemberClass>();
+
+                var staffMember = members?.FirstOrDefault(m => m.staff_id == staff_id);
+                if (staffMember == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"staff_id={staff_id} 不在該排休表單(form_guid={active_form_guid})的任何組別中";
+                    return returnData.JsonSerializationt();
+                }
+
+                // staff 所屬組別（同一張 form_guid）
+                var formGroupsAll = allGroups
+                    .Where(g => g.form_guid == active_form_guid)
+                    .OrderBy(g => g.order_index.StringToInt32())
+                    .ToList();
+
+                DayOffGroupClass staffGroup = formGroupsAll.FirstOrDefault(g => g.GUID == staffMember.group_guid);
+
+                int openOrder = openGroup.order_index.StringToInt32();
+                int staffOrder = (staffGroup?.order_index ?? "0").StringToInt32();
+
+                bool isInRound = staffMember.group_guid == openGroup.GUID;
+                bool canWrite = isInRound;
+
+                // 下一組資訊（同表單）
+                DayOffGroupClass nextGroup = formGroupsAll
+                    .FirstOrDefault(g => g.order_index.StringToInt32() == openOrder + 1);
+
+                // 還差幾組
+                int remain = Math.Max(0, staffOrder - openOrder);
+
+                string stageName = stage == "weekly" ? "週休" : "特休";
+                string message = isInRound
+                    ? $"目前輪到第 {openOrder} 組({stageName})，你屬於第 {staffOrder} 組，可開始填寫"
+                    : $"目前輪到第 {openOrder} 組({stageName})，你屬於第 {staffOrder} 組，尚未輪到（還差 {remain} 組）";
+
+                string progressMessage = isInRound
+                    ? $"✅ 已輪到你填寫{stageName}。"
+                    : $"⏳ 尚未輪到你填寫{stageName}，目前進度：第 {openOrder} 組 / 你在第 {staffOrder} 組。";
+
+                // ================================
+                // 回傳
+                // ================================
+                returnData.Code = 200;
+                returnData.Result = canWrite ? "staff 已輪到可填寫" : "staff 尚未輪到填寫";
+                returnData.Data = new DayOffCheckStaffInRoundResponse
+                {
+                    // staff
+                    staff_id = staff_id,
+
+                    // 流程/表單
+                    active_form_guid = active_form_guid,
+                    stage = stage,
+                    stage_name = stageName,
+
+                    // 權限
+                    can_write = canWrite,
+                    is_in_round = isInRound,
+
+                    // open group
+                    open_group_guid = openGroup.GUID,
+                    open_group_order_index = openOrder,
+                    open_group_name = GetGroupName(openGroup),
+
+                    // staff group
+                    staff_group_guid = staffMember.group_guid,
+                    staff_group_order_index = staffOrder,
+                    staff_group_name = GetGroupName(staffGroup),
+
+                    // next group
+                    next_group_guid = nextGroup?.GUID,
+                    next_group_order_index = nextGroup.order_index.StringToInt32(),
+                    next_group_name = GetGroupName(nextGroup),
+
+                    // remain / message
+                    remain_groups_to_open = remain,
+                    message = message,
+                    progress_message = progressMessage
+                };
+
+                return returnData.JsonSerializationt();
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.Result += timer.ToString();
+            }
+        }
+
+
+
+
+
+        /// <summary>
+        /// 取得下一組（依 order_index 排序後）
+        /// </summary>
+        private DayOffGroupClass GetNextGroup(List<DayOffGroupClass> groups, DayOffGroupClass current)
+        {
+            int idx = groups.FindIndex(g => g.GUID == current.GUID);
+            if (idx < 0) return null;
+            if (idx + 1 >= groups.Count) return null;
+            return groups[idx + 1];
+        }
+
         private StaffDayOffOptionClass BuildStaffDayOffSpecialDayOption(DayOffScheduleItemClass item, Dictionary<string, List<DayOffScheduleItemClass>> itemIndex)
         {
             if (item == null) return null;
