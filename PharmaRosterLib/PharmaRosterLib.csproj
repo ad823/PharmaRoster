@@ -110,6 +110,7 @@
     <Compile Include="SpecialDayClass.cs" />
     <Compile Include="StaffAuthClass.cs" />
     <Compile Include="StaffClass.cs" />
+    <Compile Include="StaffDayOffOptionLogClass.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="app.config" />

@@ -9,65 +9,6 @@ using System.Threading.Tasks;
 
 namespace PharmaRosterLib
 {
-    /// <summary>
-    /// staff 是否輪到排休填寫（週休/特休）回傳資料
-    /// </summary>
-    public class DayOffCheckStaffInRoundResponse
-    {
-        /// <summary>員工 GUID/識別碼</summary>
-        public string staff_id { get; set; }
-
-        /// <summary>目前 active 的排休表單 GUID（若無則為 null）</summary>
-        public string active_form_guid { get; set; }
-
-        /// <summary>目前流程階段：none / weekly / annual</summary>
-        public string stage { get; set; } = "none";
-
-        /// <summary>目前流程階段顯示文字：無 / 週休 / 特休</summary>
-        public string stage_name { get; set; } = "無";
-
-        /// <summary>是否可填寫（更直覺，等同 is_in_round）</summary>
-        public bool can_write { get; set; } = false;
-
-        /// <summary>是否在目前輪次（是否輪到）</summary>
-        public bool is_in_round { get; set; } = false;
-
-        /// <summary>目前開放組別 GUID（open group）</summary>
-        public string open_group_guid { get; set; }
-
-        /// <summary>目前開放組別排序序號（int）</summary>
-        public int open_group_order_index { get; set; }
-
-        /// <summary>目前開放組別名稱（若無名稱欄位則為 null）</summary>
-        public string open_group_name { get; set; }
-
-        /// <summary>staff 所屬組別 GUID</summary>
-        public string staff_group_guid { get; set; }
-
-        /// <summary>staff 所屬組別排序序號（int）</summary>
-        public int staff_group_order_index { get; set; }
-
-        /// <summary>staff 所屬組別名稱（若無名稱欄位則為 null）</summary>
-        public string staff_group_name { get; set; }
-
-        /// <summary>下一組 GUID（若已是最後一組則為 null）</summary>
-        public string next_group_guid { get; set; }
-
-        /// <summary>下一組排序序號（若無則為 0）</summary>
-        public int next_group_order_index { get; set; }
-
-        /// <summary>下一組名稱（若無名稱欄位則為 null）</summary>
-        public string next_group_name { get; set; }
-
-        /// <summary>還差幾組才輪到（0 表示已輪到或已超過）</summary>
-        public int remain_groups_to_open { get; set; }
-
-        /// <summary>給前端直接顯示的訊息</summary>
-        public string message { get; set; }
-
-        /// <summary>進度口語訊息（更短更口語）</summary>
-        public string progress_message { get; set; }
-    }
 
     public class DayOffCurrentOpenGroupResponse
     {
@@ -235,6 +176,17 @@ namespace PharmaRosterLib
         /// </summary>
         [Description("DATETIME,20,NONE")]
         public string updated_at { get; set; }
+
+        // DayOffGroupClass（非SQL欄位，回傳前端用）
+        public string stage { get; set; } = "none";        // none / weekly / annual
+        public string stage_name { get; set; } = "無";     // 無 / 週休 / 特休
+        public string open_group_guid { get; set; }        // 目前開放組別 GUID
+        public string open_group_order_index { get; set; } // 目前開放組別 order_index
+        public string is_open_group { get; set; } = "false";  // 這一組是不是正在開放
+        public string can_write { get; set; } = "false";      // 登入者是否可填寫（等同 is_open_group）
+        public string remain_groups_to_open { get; set; } = "0";
+        public string message { get; set; } = "";
+        public string progress_message { get; set; } = "";
 
         /// <summary>
         /// 組內成員清單（非 SQL 欄位）。
