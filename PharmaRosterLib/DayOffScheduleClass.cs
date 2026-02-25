@@ -423,6 +423,7 @@ namespace PharmaRosterLib
             selected_half_am = "false";
             selected_half_pm = "false";
             date = DateTime.MinValue.ToDateTimeString();
+            
         }
 
         /// <summary>選擇全天假（會自動互斥）</summary>

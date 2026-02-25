@@ -388,7 +388,7 @@ namespace PharmaRosterAPI
                     foreach (var item in dayOffScheduleDay.items)
                     {
                         item.option = staffDayOffOptionClasses
-                                                    .Where(x => x.staff_guid == item.staff_guid && x.date.StringToDateTime().ToDateString("-") == item.date.StringToDateTime().ToDateString("-"))
+                                                    .Where(x => x.staff_guid == item.staff_guid && x.GUID == item.option_guid)
                                                     .FirstOrDefault();                      
                     }
                 }
@@ -1193,9 +1193,7 @@ namespace PharmaRosterAPI
                     foreach (var item in day.items)
                     {
                         item.option = staffDayOffOptionClasses
-                            .Where(x =>
-                                x.staff_guid == item.staff_guid &&
-                                x.date.StringToDateTime().ToDateString("-") == item.date.StringToDateTime().ToDateString("-"))
+                            .Where(x =>x.staff_guid == item.staff_guid && x.GUID == item.option_guid)
                             .FirstOrDefault();
                     }
                 }
@@ -3184,7 +3182,6 @@ namespace PharmaRosterAPI
             }
         }
 
-
         // ✅ 全域鎖：避免多人同時 init_flow（同一台 API Server 有效）
         private static readonly object _dayoffInitFlowLock = new object();
 
@@ -3435,22 +3432,6 @@ namespace PharmaRosterAPI
                 returnData.Result += timer.ToString();
             }
         }
-
-        /// <summary>
-        /// 將時間字串正規化：空值/MinValue/非法字串 → MinValue 字串；合法字串 → 原樣回傳
-        /// </summary>
-        private string NormalizeDateTimeOrMin(string dt)
-        {
-            string min = DateTime.MinValue.ToDateTimeString();
-            if (dt.StringIsEmpty()) return min;
-            if (dt == min) return min;
-
-            DateTime tmp;
-            if (!DateTime.TryParse(dt, out tmp)) return min;
-
-            return dt;
-        }
-
 
         /// <summary>
         /// 完成某組別的填寫階段（週休 / 特休），並自動推進下一組別狀態（含防呆檢查）。
@@ -4011,8 +3992,6 @@ namespace PharmaRosterAPI
                 returnData.Result += timer.ToString();
             }
         }
-
-
 
         //填寫者使用的API
         /// <summary>
@@ -4777,7 +4756,6 @@ namespace PharmaRosterAPI
             }
         }
 
-
         /// <summary>
         /// 登入後查詢：用「DayOffGroupClass」回傳目前輪到填寫與完成狀態。
         /// </summary>
@@ -5114,7 +5092,7 @@ namespace PharmaRosterAPI
         }
 
         /// <summary>
-        /// 儲存登入者單筆放假選擇（寫入 staff_dayoff_option），不異動 assigned_shift。
+        /// 儲存登入者單筆放假選擇（寫入 staff_dayoff_option），並寫入異動歷程（StaffDayOffOptionLogClass）；不異動 assigned_shift。
         /// </summary>
         /// <remarks>
         /// ===============================
@@ -5129,7 +5107,11 @@ namespace PharmaRosterAPI
         /// 寫入資料表：staff_dayoff_option
         /// - 只更新：
         ///   selected_full / selected_half_am / selected_half_pm / date / updated_at
-        /// - ✅ assigned_shift 不異動（依你要求）
+        /// - ✅ assigned_shift 不異動
+        ///
+        /// ✅ 同時寫入 staff_dayoff_option_log（StaffDayOffOptionLogClass）
+        /// - 不改資料表欄位的最小修正：
+        ///   - action=CANCEL 時，log.off_date 會記錄「取消前的 option.date」，避免 off_date 空白
         ///
         /// ===============================
         /// ✅ 權限/流程檢核
@@ -5170,7 +5152,7 @@ namespace PharmaRosterAPI
         ///   ]
         /// }
         ///
-        /// (2) 取消
+        /// (2) 取消（不需 off_date）
         /// {
         ///   "ValueAry": [
         ///     "form_name=2026年03月排休表",
@@ -5178,21 +5160,6 @@ namespace PharmaRosterAPI
         ///     "option_guid=OPTION_GUID_001",
         ///     "select_type=CANCEL"
         ///   ]
-        /// }
-        ///
-        /// ===============================
-        /// ✅ Response JSON（示意）
-        /// ===============================
-        /// {
-        ///   "Code": 200,
-        ///   "Result": "success",
-        ///   "Data": {
-        ///     "option_guid": "OPTION_GUID_001",
-        ///     "selected_full": "true",
-        ///     "selected_half_am": "false",
-        ///     "selected_half_pm": "false",
-        ///     "date": "2026-03-05"
-        ///   }
         /// }
         /// </remarks>
         /// <param name="returnData">通用傳入物件（ValueAry 帶參數）</param>
@@ -5246,6 +5213,7 @@ namespace PharmaRosterAPI
 
                 select_type = select_type.Trim().ToUpperInvariant();
                 bool isCancel = (select_type == "CANCEL");
+
                 if (!isCancel)
                 {
                     if (select_type != "FULL" && select_type != "HALF_AM" && select_type != "HALF_PM")
@@ -5262,7 +5230,6 @@ namespace PharmaRosterAPI
                         return returnData.JsonSerializationt();
                     }
 
-                    // 正規化日期字串 → yyyy-MM-dd（存回 option.date 可接受帶時間；但建議先統一）
                     DateTime dt = off_date.StringToDateTime();
                     if (dt == DateTime.MinValue)
                     {
@@ -5281,6 +5248,7 @@ namespace PharmaRosterAPI
                 var sql_group = MethodClass.GetSQLControl<DayOffGroupClass>();
                 var sql_member = MethodClass.GetSQLControl<DayOffGroupMemberClass>();
                 var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_log = MethodClass.GetSQLControl<StaffDayOffOptionLogClass>(); // ✅ Log
 
                 // ===============================
                 // 2) form
@@ -5337,7 +5305,6 @@ namespace PharmaRosterAPI
                 // ===============================
                 // 5) 流程檢核：必須輪到該 staff 所屬組別才能寫
                 // ===============================
-                // 取 groups
                 List<object[]> obj_groups = sql_group.GetRowsByDefult(null, "form_guid", form_guid);
                 List<DayOffGroupClass> groups = obj_groups.SQLToClass<DayOffGroupClass>() ?? new List<DayOffGroupClass>();
 
@@ -5371,7 +5338,6 @@ namespace PharmaRosterAPI
                     return returnData.JsonSerializationt();
                 }
 
-                // 找 staff 的 group_member
                 List<object[]> obj_members = sql_member.GetRowsByDefult(null, "form_guid", form_guid);
                 List<DayOffGroupMemberClass> members = obj_members.SQLToClass<DayOffGroupMemberClass>() ?? new List<DayOffGroupMemberClass>();
 
@@ -5410,13 +5376,21 @@ namespace PharmaRosterAPI
                 }
 
                 // ===============================
-                // 7) 寫入選擇（不改 assigned_shift）
+                // ✅ 7) BEFORE 快照（最小改動：用於 CANCEL log.off_date）
+                // ===============================
+                string before_date = option.date ?? "";
+                string before_selected_full = option.selected_full ?? "false";
+                string before_selected_half_am = option.selected_half_am ?? "false";
+                string before_selected_half_pm = option.selected_half_pm ?? "false";
+
+                // ===============================
+                // 8) 寫入選擇（不改 assigned_shift）
                 // ===============================
                 string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
 
-                // 取消
                 if (isCancel)
                 {
+                    // ✅ 取消：清空選擇（option.date 會變空）
                     option.ClearSelection();
                     option.updated_at = now;
                 }
@@ -5426,7 +5400,6 @@ namespace PharmaRosterAPI
                     if (option.is_any_date != "true")
                     {
                         var list = option.suggested_dates_list ?? new List<string>();
-                        // 建議日期也統一用 yyyy-MM-dd 比對
                         var set = list
                             .Select(x => x.StringToDateTime().ToDateString('-'))
                             .Where(x => x.StringIsEmpty() == false)
@@ -5440,7 +5413,6 @@ namespace PharmaRosterAPI
                         }
                     }
 
-                    // 依 select_type + can_x 檢核與選擇
                     string err;
                     bool ok = false;
 
@@ -5448,7 +5420,7 @@ namespace PharmaRosterAPI
                         ok = option.TrySelectFullDay(off_date, out err);
                     else if (select_type == "HALF_AM")
                         ok = option.TrySelectHalfAM(off_date, out err);
-                    else // HALF_PM
+                    else
                         ok = option.TrySelectHalfPM(off_date, out err);
 
                     if (!ok)
@@ -5458,19 +5430,66 @@ namespace PharmaRosterAPI
                         return returnData.JsonSerializationt();
                     }
 
-                    // 保護互斥一致性
                     option.NormalizeSelection();
                     option.updated_at = now;
                 }
 
                 // ===============================
-                // 8) 更新 DB（只更新 option 本身）
+                // 9) 更新 DB（只更新 option 本身）
                 // ===============================
-           
-                sql_option.UpdateByDefulteExtra(null, new List<object[]> { option.ClassToSQL<StaffDayOffOptionClass>() });
+                sql_option.UpdateByDefulteExtra(null, new List<object[]>
+        {
+            option.ClassToSQL<StaffDayOffOptionClass>()
+        });
 
                 // ===============================
-                // 9) 回傳
+                // ✅ 10) 寫入 Log（最小改動核心：CANCEL 時 off_date 記 before_date）
+                // ===============================
+                try
+                {
+                    var log = new StaffDayOffOptionLogClass();
+
+                    // 必填欄位（依你資料表實際欄位調整）
+                    log.GUID = Guid.NewGuid().ToString();
+                    log.form_guid = form_guid;
+                    log.option_guid = option.GUID;
+                    log.staff_guid = staff_guid;
+
+                    // 若你 log 表有 staff_id / stage / action / off_date
+                    log.staff_id = staff_id;
+                    log.stage = stage;
+                    log.action = select_type;
+
+                    // ✅ 最小改動修正點：
+                    // CANCEL 時 option.date 已清空，所以用 before_date 記錄「取消哪一天」
+                    // 非 CANCEL 則記錄這次選擇後的 option.date（等同 off_date）
+                    log.off_date = (select_type == "CANCEL") ? before_date : (option.date ?? "");
+
+                    // 如果你的 log 表有 before/after 欄位（有就寫、沒有也不影響你可刪掉）
+                    // ↓↓↓ 若你沒有這些欄位，請直接刪除這段，避免編譯錯
+                    log.before_selected_full = before_selected_full;
+                    log.before_selected_half_am = before_selected_half_am;
+                    log.before_selected_half_pm = before_selected_half_pm;
+
+                    log.after_selected_full = option.selected_full ?? "false";
+                    log.after_selected_half_am = option.selected_half_am ?? "false";
+                    log.after_selected_half_pm = option.selected_half_pm ?? "false";
+
+                    log.created_at = now;
+
+                    sql_log.AddRows(null, new List<object[]>
+            {
+                log.ClassToSQL<StaffDayOffOptionLogClass>()
+            });
+                }
+                catch
+                {
+                    // ✅ log 寫入失敗不阻擋主流程（避免影響使用者儲存）
+                    // 你若想嚴格：可改成 throw
+                }
+
+                // ===============================
+                // 11) 回傳
                 // ===============================
                 returnData.Code = 200;
                 returnData.Result = "success";
@@ -5489,80 +5508,271 @@ namespace PharmaRosterAPI
             }
         }
 
-        // =========================================================
-        // Helper：取得 active form（保守版）
-        // 規則：dayoff_group 內存在 status=1 或 status=3 的 form_guid 視為 active
-        // =========================================================
-        private DayOffScheduleFormClass TryGetActiveForm(SQLControl sql_form, SQLControl sql_group)
+        /// <summary>
+        /// 查詢 staff_dayoff_option 的異動歷程（StaffDayOffOptionLogClass）。
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// ✅ 功能說明
+        /// ===============================
+        /// 前端用此 API 取得「放假選擇歷程」清單，可用於：
+        /// - 使用者自查：我什麼時候選了哪一天、改了幾次
+        /// - 管理端稽核：某張表單的所有修改紀錄
+        /// - 追蹤問題：某個 option_guid 的完整操作軌跡
+        ///
+        /// 本 API 只查詢 staff_dayoff_option_log（不異動任何資料）。
+        ///
+        /// ===============================
+        /// ✅ 參數（returnData.ValueAry）
+        /// ===============================
+        /// - form_name   : 表單名稱（必填）
+        /// - staff_id    : 工號（選填；空字串或未帶 → 回整張表單的所有 log）
+        /// - option_guid : option GUID（選填）
+        /// - date_start  : 起始時間（選填；yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss）
+        /// - date_end    : 結束時間（選填；yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss）
+        /// - top         : 最多回傳筆數（選填；預設 500，最大 5000）
+        ///
+        /// ===============================
+        /// ✅ 重要行為
+        /// ===============================
+        /// 1) staff_id 空 → 回整組（整張表單所有 staff 的 log）
+        /// 2) 會依 created_at 由新到舊排序（最新在前）
+        /// 3) date_start/date_end 若只給日期（yyyy-MM-dd），會自動補：
+        ///    - start：00:00:00
+        ///    - end  ：23:59:59
+        ///
+        /// ===============================
+        /// ✅ Request JSON 範例
+        /// ===============================
+        /// (1) 查整張表單（管理端）
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表"
+        ///   ]
+        /// }
+        ///
+        /// (2) 查某員工（使用者）
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345"
+        ///   ]
+        /// }
+        ///
+        /// (3) 查某 option 的完整軌跡
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "option_guid=OPTION_GUID_001"
+        ///   ]
+        /// }
+        ///
+        /// (4) 加日期區間 + 限制筆數
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "date_start=2026-03-01",
+        ///     "date_end=2026-03-10",
+        ///     "top=200"
+        ///   ]
+        /// }
+        ///
+        /// ===============================
+        /// ✅ Response JSON（示意）
+        /// ===============================
+        /// {
+        ///   "Code": 200,
+        ///   "Result": "success",
+        ///   "Data": [
+        ///     {
+        ///       "GUID": "...",
+        ///       "form_guid": "...",
+        ///       "option_guid": "...",
+        ///       "staff_id": "A12345",
+        ///       "stage": "weekly",
+        ///       "action": "FULL",
+        ///       "off_date": "2026-03-05",
+        ///       "before_selected_full": "false",
+        ///       "after_selected_full": "true",
+        ///       "created_at": "2026-02-24 17:12:33"
+        ///     }
+        ///   ]
+        /// }
+        /// </remarks>
+        /// <param name="returnData">通用傳入物件（ValueAry 帶參數）</param>
+        /// <returns>序列化後的 returnData JSON 字串</returns>
+        [HttpPost("get_staff_dayoff_option_logs")]
+        public string get_staff_dayoff_option_logs([FromBody] returnData returnData)
         {
+            var timer = new MyTimerBasic();
+            returnData.Method = "get_staff_dayoff_option_logs";
+
             try
             {
-                List<object[]> obj_groups_all = sql_group.GetAllRows(null);
-                var groups_all = obj_groups_all.SQLToClass<DayOffGroupClass>() ?? new List<DayOffGroupClass>();
+                // ===============================
+                // 0) 取參數
+                // ===============================
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
 
-                string activeFormGuid = groups_all
-                    .Where(g => g.status == "1" || g.status == "3")
-                    .OrderByDescending(g => g.status_changed_at.StringToDateTime())
-                    .Select(g => g.form_guid)
-                    .FirstOrDefault();
+                string form_name = GetVal("form_name");
+                string staff_id = GetVal("staff_id");
+                string option_guid = GetVal("option_guid");
+                string date_start = GetVal("date_start");
+                string date_end = GetVal("date_end");
+                string topStr = GetVal("top");
 
-                if (activeFormGuid.StringIsEmpty()) return null;
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return returnData.JsonSerializationt();
+                }
 
-                object[] obj_form = sql_form.GetRowsByDefult(null, "GUID", activeFormGuid).FirstOrDefault();
-                return obj_form?.SQLToClass<DayOffScheduleFormClass>();
+                int top = 500;
+                if (!topStr.StringIsEmpty())
+                {
+                    int t = topStr.StringToInt32();
+                    if (t > 0) top = t;
+                }
+                if (top > 5000) top = 5000;
+
+                // ===============================
+                // 1) SQL Controls
+                // ===============================
+                var sql_form = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_staff = MethodClass.GetSQLControl<StaffClass>();
+                var sql_log = MethodClass.GetSQLControl<StaffDayOffOptionLogClass>();
+
+                // ===============================
+                // 2) form_name -> form_guid
+                // ===============================
+                object[] obj_form = sql_form.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -404;
+                    returnData.Result = $"找不到表單 form_name={form_name}";
+                    return returnData.JsonSerializationt();
+                }
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+                string form_guid = form.GUID;
+
+                // ===============================
+                // 3) staff_id -> staff_guid（若 staff_id 有填才需要）
+                // ===============================
+                string staff_guid = "";
+                string staff_name = "";
+                if (!staff_id.StringIsEmpty())
+                {
+                    object[] obj_staff = sql_staff.GetRowsByDefult(null, "staff_id", staff_id).FirstOrDefault();
+                    if (obj_staff == null)
+                    {
+                        returnData.Code = -404;
+                        returnData.Result = $"找不到 staff_id={staff_id}";
+                        return returnData.JsonSerializationt();
+                    }
+                    StaffClass staff = obj_staff.SQLToClass<StaffClass>();
+                    staff_guid = staff.GUID;
+                    staff_name = staff.staff_name;
+                }
+
+                // ===============================
+                // 4) 解析時間區間
+                // ===============================
+                DateTime dtStart = DateTime.MinValue;
+                DateTime dtEnd = DateTime.MaxValue;
+
+                if (!date_start.StringIsEmpty())
+                {
+                    // 若只給 yyyy-MM-dd，補 00:00:00
+                    if (date_start.Length <= 10) date_start = date_start.Trim() + " 00:00:00";
+                    dtStart = date_start.StringToDateTime();
+                    if (dtStart == DateTime.MinValue)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"date_start 格式錯誤: {GetVal("date_start")}";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+                if (!date_end.StringIsEmpty())
+                {
+                    // 若只給 yyyy-MM-dd，補 23:59:59
+                    if (date_end.Length <= 10) date_end = date_end.Trim() + " 23:59:59";
+                    dtEnd = date_end.StringToDateTime();
+                    if (dtEnd == DateTime.MinValue)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"date_end 格式錯誤: {GetVal("date_end")}";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+
+                // ===============================
+                // 5) 取 logs（先用 form_guid 限縮，再用 LINQ 過濾）
+                // ===============================
+                List<object[]> obj_logs = sql_log.GetRowsByDefult(null, "form_guid", form_guid);
+                List<StaffDayOffOptionLogClass> logs = obj_logs.SQLToClass<StaffDayOffOptionLogClass>() ?? new List<StaffDayOffOptionLogClass>();
+
+                // form_guid 防呆（避免資料異常）
+                logs = logs
+                    .Where(x => x != null && string.Equals(x.form_guid, form_guid, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                // staff 篩選（staff_id 空就不篩）
+                if (!staff_guid.StringIsEmpty())
+                {
+                    logs = logs
+                        .Where(x => string.Equals(x.staff_guid, staff_guid, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+
+                // option 篩選
+                if (!option_guid.StringIsEmpty())
+                {
+                    logs = logs
+                        .Where(x => string.Equals(x.option_guid, option_guid, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+
+                // 日期區間（用 created_at）
+                logs = logs
+                    .Where(x =>
+                    {
+                        DateTime c = x.created_at.StringToDateTime();
+                        if (c == DateTime.MinValue) return false;
+                        return c >= dtStart && c <= dtEnd;
+                    })
+                    .ToList();
+
+                // 排序：最新在前
+                logs = logs
+                    .OrderByDescending(x => x.created_at.StringToDateTime())
+                    .ThenByDescending(x => x.GUID) // 同秒穩定排序
+                    .Take(top)
+                    .ToList();
+
+                // ===============================
+                // 6) 回傳
+                // ===============================
+                returnData.Code = 200;
+                returnData.Result = "success";
+                returnData.Data = logs;
+                return returnData.JsonSerializationt(true);
             }
-            catch
+            catch (Exception ex)
             {
-                return null;
+                returnData.Code = -500;
+                returnData.Result = $"Exception : {ex.Message}";
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.TimeTaken = timer.ToString();
             }
         }
-
-        // =========================================================
-        // Helper：把「非SQL欄位」塞回 DayOffGroupClass
-        // ⚠️ 你需要先把這些欄位加到 DayOffGroupClass（非SQL欄位）
-        // =========================================================
-        private void SetExtraFields(
-            DayOffGroupClass g,
-            string stage,
-            string stageName,
-            string openGuid,
-            string openOrder,
-            bool isOpenGroup,
-            bool canWrite,
-            int remainGroups,
-            string message,
-            string progress)
-        {
-            g.stage = stage;
-            g.stage_name = stageName;
-
-            g.open_group_guid = openGuid;
-            g.open_group_order_index = openOrder;
-
-            g.is_open_group = isOpenGroup ? "true" : "false";
-            g.can_write = canWrite ? "true" : "false";
-            g.remain_groups_to_open = remainGroups.ToString();
-
-            g.message = message;
-            g.progress_message = progress;
-        }
-
-        private string BuildMessage(string stageName, bool canWrite, int remain, string stage)
-        {
-            if (stage == "none") return "目前未開放填寫";
-            if (canWrite) return $"目前開放{stageName}填寫：輪到你";
-            return $"目前開放{stageName}填寫：尚未輪到你（還差 {remain} 組）";
-        }
-
-        private string BuildProgressMessage(bool canWrite, int remain, string stage)
-        {
-            if (stage == "none") return "尚未開放";
-            if (canWrite) return "輪到你";
-            if (remain > 0) return $"還差{remain}組";
-            return "未輪到";
-        }
-
-
 
         /// <summary>
         /// 取得指定表單(form_name)中，指定登入者(staff_id)的排休/排班資訊（只回登入者自己的 items，且所有 day 都回傳，即使該日沒有 item 也顯示）。
@@ -5824,6 +6034,372 @@ namespace PharmaRosterAPI
             }
         }
 
+        /// <summary>
+        /// 登入者完成送出目前階段（週休/特休）：
+        /// 寫入 dayoff_group_member 的完成狀態，並在整組都完成時自動推進 group 狀態與開放下一組。
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// ✅ 功能說明
+        /// ===============================
+        /// 前端「填寫者」在週休/特休畫面按下「完成送出」時呼叫：
+        /// 1) 找出目前表單 active 的 open group（status=1 或 status=3）
+        /// 2) 檢核登入者是否屬於 open group
+        /// 3) 將 dayoff_group_member 對應欄位標記完成：
+        ///    - 週休階段(stage=weekly)：is_weekoff_completed=true、weekoff_completed_at=now
+        ///    - 特休階段(stage=annual)：is_annualleave_completed=true、annualleave_completed_at=now
+        /// 4) 若該 open group 內「全部成員」都完成：
+        ///    - weekly：group.status 1→2，並開下一組 0→1
+        ///    - annual：group.status 3→4，並開下一組 2→3
+        ///
+        /// ===============================
+        /// ✅ stage 判定規則
+        /// ===============================
+        /// 若未傳入 stage：
+        /// - 優先找 status=1 的 group → stage=weekly
+        /// - 否則找 status=3 的 group → stage=annual
+        /// - 都沒有 → 表示目前沒有開放填寫
+        ///
+        /// 若有傳入 stage（weekly/annual）：
+        /// - 會強制使用該 stage 去找對應 open group（weekly=status1, annual=status3）
+        ///
+        /// ===============================
+        /// ✅ 參數（returnData.ValueAry）
+        /// ===============================
+        /// - form_name : 表單名稱（必填）
+        /// - staff_id  : 登入者工號（必填）
+        /// - stage     : weekly / annual（選填，不填則自動判定）
+        ///
+        /// ===============================
+        /// ✅ Request JSON 範例
+        /// ===============================
+        /// (1) 自動判定目前階段
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345"
+        ///   ]
+        /// }
+        ///
+        /// (2) 指定週休完成
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "stage=weekly"
+        ///   ]
+        /// }
+        ///
+        /// ===============================
+        /// ✅ Response（示意）
+        /// ===============================
+        /// {
+        ///   "Code": 200,
+        ///   "Result": "success",
+        ///   "Data": {
+        ///     "stage": "weekly",
+        ///     "open_group": { ... DayOffGroupClass ... },
+        ///     "next_group": { ... DayOffGroupClass ... },
+        ///     "open_group_completed": true
+        ///   }
+        /// }
+        /// </remarks>
+        /// <param name="returnData">通用傳入物件（ValueAry 帶參數）</param>
+        /// <returns>序列化後的 returnData JSON 字串</returns>
+        [HttpPost("complete_staff_stage")]
+        public string complete_staff_stage([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "complete_staff_stage";
+
+            try
+            {
+                // ===============================
+                // 0) 取參數
+                // ===============================
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_id = GetVal("staff_id");
+                string stage = GetVal("stage"); // weekly / annual
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return returnData.JsonSerializationt();
+                }
+                if (staff_id.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 staff_id";
+                    return returnData.JsonSerializationt();
+                }
+
+                stage = (stage ?? "").Trim().ToLower();
+
+                // ===============================
+                // 1) SQL Controls
+                // ===============================
+                var sql_form = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_staff = MethodClass.GetSQLControl<StaffClass>();
+                var sql_group = MethodClass.GetSQLControl<DayOffGroupClass>();
+                var sql_member = MethodClass.GetSQLControl<DayOffGroupMemberClass>();
+
+                // ===============================
+                // 2) form
+                // ===============================
+                object[] obj_form = sql_form.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -404;
+                    returnData.Result = $"找不到表單 form_name={form_name}";
+                    return returnData.JsonSerializationt();
+                }
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+                string form_guid = form.GUID;
+
+                // ===============================
+                // 3) staff_id -> staff_guid
+                // ===============================
+                object[] obj_staff = sql_staff.GetRowsByDefult(null, "staff_id", staff_id).FirstOrDefault();
+                if (obj_staff == null)
+                {
+                    returnData.Code = -404;
+                    returnData.Result = $"找不到 staff_id={staff_id}";
+                    return returnData.JsonSerializationt();
+                }
+                StaffClass staff = obj_staff.SQLToClass<StaffClass>();
+                string staff_guid = staff.GUID;
+
+                // ===============================
+                // 4) 取 groups / members
+                // ===============================
+                List<DayOffGroupClass> groups =
+                    sql_group.GetRowsByDefult(null, "form_guid", form_guid)
+                    .SQLToClass<DayOffGroupClass>() ?? new List<DayOffGroupClass>();
+
+                List<DayOffGroupMemberClass> members =
+                    sql_member.GetRowsByDefult(null, "form_guid", form_guid)
+                    .SQLToClass<DayOffGroupMemberClass>() ?? new List<DayOffGroupMemberClass>();
+
+                // ===============================
+                // 5) 找 open group + 判定 stage
+                // ===============================
+                DayOffGroupClass openWeekly = groups
+                    .Where(g => g.status == "1")
+                    .OrderBy(g => g.order_index.StringToInt32())
+                    .FirstOrDefault();
+
+                DayOffGroupClass openAnnual = groups
+                    .Where(g => g.status == "3")
+                    .OrderBy(g => g.order_index.StringToInt32())
+                    .FirstOrDefault();
+
+                DayOffGroupClass openGroup = null;
+
+                if (stage == "weekly")
+                {
+                    openGroup = openWeekly;
+                }
+                else if (stage == "annual")
+                {
+                    openGroup = openAnnual;
+                }
+                else
+                {
+                    // 自動判定
+                    if (openWeekly != null)
+                    {
+                        stage = "weekly";
+                        openGroup = openWeekly;
+                    }
+                    else if (openAnnual != null)
+                    {
+                        stage = "annual";
+                        openGroup = openAnnual;
+                    }
+                    else
+                    {
+                        stage = "none";
+                    }
+                }
+
+                if (openGroup == null)
+                {
+                    returnData.Code = -403;
+                    returnData.Result = "目前未開放任何組別填寫";
+                    return returnData.JsonSerializationt();
+                }
+
+                // ===============================
+                // 6) 找 staff member，必須在 open group
+                // ===============================
+                DayOffGroupMemberClass staffMember = members
+                    .FirstOrDefault(m =>
+                        string.Equals(m.staff_guid, staff_guid, StringComparison.OrdinalIgnoreCase));
+
+                if (staffMember == null)
+                {
+                    returnData.Code = -404;
+                    returnData.Result = "找不到此 staff 在該表單的 group_member";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (!string.Equals(staffMember.group_guid, openGroup.GUID, StringComparison.OrdinalIgnoreCase))
+                {
+                    returnData.Code = -403;
+                    returnData.Result = "尚未輪到你的組別，禁止完成送出";
+                    return returnData.JsonSerializationt();
+                }
+
+                // ===============================
+                // 7) 寫入 member 完成欄位
+                // ===============================
+                string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+                if (stage == "weekly")
+                {
+                    staffMember.is_weekoff_completed = "true";
+                    if (staffMember.weekoff_completed_at.StringIsEmpty())
+                        staffMember.weekoff_completed_at = now;
+                }
+                else if (stage == "annual")
+                {
+                    staffMember.is_annualleave_completed = "true";
+                    if (staffMember.annualleave_completed_at.StringIsEmpty())
+                        staffMember.annualleave_completed_at = now;
+                }
+                else
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "stage 不正確（weekly/annual）";
+                    return returnData.JsonSerializationt();
+                }
+
+                staffMember.updated_at = now;
+
+                // 更新 member（注意你專案 UpdateByDefulteExtra 的參數型態）
+                // ✅ 通常是：UpdateByDefulteExtra(null, List<object[]> rows)
+                sql_member.UpdateByDefulteExtra(null, new List<object[]> { staffMember.ClassToSQL<DayOffGroupMemberClass>() });
+
+                // ===============================
+                // 8) 若整組都完成 → 推進 group 狀態、開下一組
+                // ===============================
+                bool openGroupCompleted = false;
+                DayOffGroupClass nextGroup = null;
+
+                List<DayOffGroupMemberClass> openGroupMembers = members
+                    .Where(m => string.Equals(m.group_guid, openGroup.GUID, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (stage == "weekly")
+                {
+                    openGroupCompleted = openGroupMembers.All(m => m.is_weekoff_completed == "true");
+                    if (openGroupCompleted)
+                    {
+                        // openGroup: 1 -> 2
+                        if (openGroup.status == "1")
+                        {
+                            openGroup.SetStatusWithTime("2");
+                            sql_group.UpdateByDefulteExtra(null, new List<object[]> { openGroup.ClassToSQL<DayOffGroupClass>() });
+                        }
+
+                        // 開下一組：找 order_index > current 的最小組
+                        int cur = openGroup.order_index.StringToInt32();
+                        nextGroup = groups
+                            .Where(g => g.order_index.StringToInt32() > cur)
+                            .OrderBy(g => g.order_index.StringToInt32())
+                            .FirstOrDefault();
+
+                        if (nextGroup != null)
+                        {
+                            // 週休階段：通常 nextGroup.status 應該是 0（未輪到）
+                            if (nextGroup.status == "0")
+                            {
+                                nextGroup.SetStatusWithTime("1");
+                                sql_group.UpdateByDefulteExtra(null, new List<object[]> { nextGroup.ClassToSQL<DayOffGroupClass>() });
+                            }
+                        }
+                    }
+                }
+                else // annual
+                {
+                    openGroupCompleted = openGroupMembers.All(m => m.is_annualleave_completed == "true");
+                    if (openGroupCompleted)
+                    {
+                        // openGroup: 3 -> 4
+                        if (openGroup.status == "3")
+                        {
+                            openGroup.SetStatusWithTime("4");
+                            sql_group.UpdateByDefulteExtra(null, new List<object[]> { openGroup.ClassToSQL<DayOffGroupClass>() });
+                        }
+
+                        // 開下一組：找 order_index > current 的最小組
+                        int cur = openGroup.order_index.StringToInt32();
+                        nextGroup = groups
+                            .Where(g => g.order_index.StringToInt32() > cur)
+                            .OrderBy(g => g.order_index.StringToInt32())
+                            .FirstOrDefault();
+
+                        if (nextGroup != null)
+                        {
+                            // 特休階段：通常 nextGroup.status 應該是 2（週休完成待特休）
+                            if (nextGroup.status == "2")
+                            {
+                                nextGroup.SetStatusWithTime("3");
+                                sql_group.UpdateByDefulteExtra(null, new List<object[]> { nextGroup.ClassToSQL<DayOffGroupClass>() });
+                            }
+                        }
+                    }
+                }
+
+                // ===============================
+                // 9) 回傳（用 DayOffGroupClass 呈現）
+                // ===============================
+                returnData.Code = 200;
+                returnData.Result = "success";
+                returnData.Data = new
+                {
+                    stage = stage,
+                    open_group = openGroup,
+                    next_group = nextGroup,
+                    open_group_completed = openGroupCompleted
+                };
+
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = $"Exception : {ex.Message}";
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.TimeTaken = timer.ToString();
+            }
+        }
+
+
+        /// <summary>
+        /// 將時間字串正規化：空值/MinValue/非法字串 → MinValue 字串；合法字串 → 原樣回傳
+        /// </summary>
+        private string NormalizeDateTimeOrMin(string dt)
+        {
+            string min = DateTime.MinValue.ToDateTimeString();
+            if (dt.StringIsEmpty()) return min;
+            if (dt == min) return min;
+
+            DateTime tmp;
+            if (!DateTime.TryParse(dt, out tmp)) return min;
+
+            return dt;
+        }
+
 
         // =========================
         // ✅ Helper：依 option 計算 day 的登入者視角統計
@@ -5884,7 +6460,78 @@ namespace PharmaRosterAPI
             form.any_date_is_full = isFull ? "true" : "false";
         }
 
+        // =========================================================
+        // Helper：取得 active form（保守版）
+        // 規則：dayoff_group 內存在 status=1 或 status=3 的 form_guid 視為 active
+        // =========================================================
+        private DayOffScheduleFormClass TryGetActiveForm(SQLControl sql_form, SQLControl sql_group)
+        {
+            try
+            {
+                List<object[]> obj_groups_all = sql_group.GetAllRows(null);
+                var groups_all = obj_groups_all.SQLToClass<DayOffGroupClass>() ?? new List<DayOffGroupClass>();
 
+                string activeFormGuid = groups_all
+                    .Where(g => g.status == "1" || g.status == "3")
+                    .OrderByDescending(g => g.status_changed_at.StringToDateTime())
+                    .Select(g => g.form_guid)
+                    .FirstOrDefault();
+
+                if (activeFormGuid.StringIsEmpty()) return null;
+
+                object[] obj_form = sql_form.GetRowsByDefult(null, "GUID", activeFormGuid).FirstOrDefault();
+                return obj_form?.SQLToClass<DayOffScheduleFormClass>();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        // =========================================================
+        // Helper：把「非SQL欄位」塞回 DayOffGroupClass
+        // ⚠️ 你需要先把這些欄位加到 DayOffGroupClass（非SQL欄位）
+        // =========================================================
+        private void SetExtraFields(
+            DayOffGroupClass g,
+            string stage,
+            string stageName,
+            string openGuid,
+            string openOrder,
+            bool isOpenGroup,
+            bool canWrite,
+            int remainGroups,
+            string message,
+            string progress)
+        {
+            g.stage = stage;
+            g.stage_name = stageName;
+
+            g.open_group_guid = openGuid;
+            g.open_group_order_index = openOrder;
+
+            g.is_open_group = isOpenGroup ? "true" : "false";
+            g.can_write = canWrite ? "true" : "false";
+            g.remain_groups_to_open = remainGroups.ToString();
+
+            g.message = message;
+            g.progress_message = progress;
+        }
+
+        private string BuildMessage(string stageName, bool canWrite, int remain, string stage)
+        {
+            if (stage == "none") return "目前未開放填寫";
+            if (canWrite) return $"目前開放{stageName}填寫：輪到你";
+            return $"目前開放{stageName}填寫：尚未輪到你（還差 {remain} 組）";
+        }
+
+        private string BuildProgressMessage(bool canWrite, int remain, string stage)
+        {
+            if (stage == "none") return "尚未開放";
+            if (canWrite) return "輪到你";
+            if (remain > 0) return $"還差{remain}組";
+            return "未輪到";
+        }
 
 
         /// <summary>

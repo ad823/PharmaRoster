@@ -101,6 +101,9 @@
     <Compile Include="DayOffGroupClass.cs" />
     <Compile Include="DayOffScheduleClass.cs" />
     <Compile Include="LeaveRequestClass.cs" />
+    <Compile Include="LinePushLogClass.cs" />
+    <Compile Include="LineSettingClass.cs" />
+    <Compile Include="LineWebhookClass.cs" />
     <Compile Include="MethodClass.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="ScheduleDayClass.cs" />
@@ -111,6 +114,8 @@
     <Compile Include="StaffAuthClass.cs" />
     <Compile Include="StaffClass.cs" />
     <Compile Include="StaffDayOffOptionLogClass.cs" />
+    <Compile Include="StaffLineBindCodeClass.cs" />
+    <Compile Include="StaffLineLinkClass.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="app.config" />
