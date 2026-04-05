@@ -6877,12 +6877,12 @@ namespace PharmaRosterAPI
             // item日期
             DateTime itemDate = item.date.StringToDateTime();
 
-     
+
             if (itemDate.DayOfWeek == DayOfWeek.Sunday)
             {
                 DateTime dateTimeSuggestedDate = new DateTime();
                 dateTimeSuggestedDate = itemDate.AddDays(5);
-            
+
                 StaffDayOffOptionClass option = new StaffDayOffOptionClass();
                 option.GUID = Guid.NewGuid().ToString();
                 option.form_guid = item.form_guid;
@@ -6893,6 +6893,9 @@ namespace PharmaRosterAPI
                 option.can_full = "true";
                 option.can_half_pm = "false";
                 option.can_half_am = "false";
+                option.selected_full = "false";
+                option.selected_half_am = "false";
+                option.selected_half_pm = "false";
                 option.assigned_shift = ShiftTypeEnum.midnight.GetEnumName();
                 // 超出月份 → 任選日期
                 if (dateTimeSuggestedDate.Month != itemDate.Month)
@@ -6913,6 +6916,47 @@ namespace PharmaRosterAPI
                     option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
                 }
 
+                option.NormalizeSelection();
+                return option;
+            }
+            else
+            {
+                DateTime dateTimeSuggestedDate = itemDate.AddDays(-1);
+                if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
+                {
+                    return null;
+                }
+                StaffDayOffOptionClass option = new StaffDayOffOptionClass();
+                option.GUID = Guid.NewGuid().ToString();
+                option.form_guid = item.form_guid;
+                option.item_guid = item.GUID;
+                option.staff_guid = staffGuid;
+                option.date = item.date;
+                option.can_full = "true";
+                option.can_half_pm = "false";
+                option.can_half_am = "false";
+                option.selected_full = "false";
+                option.selected_half_am = "false";
+                option.selected_half_pm = "false";
+                option.assigned_shift = ShiftTypeEnum.midnight.GetEnumName();
+                // 超出月份 → 任選日期
+                if (dateTimeSuggestedDate.Month != itemDate.Month)
+                {
+                    dateTimeSuggestedDate = GetFirstSaturdayOfMonth(itemDate);
+                    if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
+                    {
+                        return null;
+                    }
+                    option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
+                }
+                else
+                {
+                    if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
+                    {
+                        return null;
+                    }
+                    option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
+                }
                 option.NormalizeSelection();
                 return option;
             }

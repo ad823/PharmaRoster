@@ -843,9 +843,22 @@ namespace PharmaRosterAPI
                     input.GUID = requiredShift.GUID;
                     input.created_at = requiredShift.created_at;
                     input.updated_at = DateTime.Now.ToDateTimeString_6();
-                    List<WorkShiftRequirementClass> workShiftRequirements = shiftGroupClass.workShiftRanges.UpdateRequirements(requiredShift.workShiftRequirements);
-                    workShiftRequirements = workShiftRequirements.UpdateRequirements(input.workShiftRequirements);
-                    input.workShiftRequirements = workShiftRequirements;
+                    bool flag_update = true;
+                    for(int i = 0; i < input.workShiftRequirements.Count; i++)
+                    {
+                        if (input.workShiftRequirements[i].department == "其他" && input.workShiftRequirements[i].shift_type == "holiday")
+                        {
+                            flag_update = false;
+                            break;
+                        }
+                    }
+                    if(flag_update)
+                    {
+                        List<WorkShiftRequirementClass> workShiftRequirements = shiftGroupClass.workShiftRanges.UpdateRequirements(requiredShift.workShiftRequirements);
+                        workShiftRequirements = workShiftRequirements.UpdateRequirements(input.workShiftRequirements);
+                        input.workShiftRequirements = workShiftRequirements;
+                    }
+               
                     datas_update.Add(input);
                 }
 
@@ -1757,10 +1770,7 @@ namespace PharmaRosterAPI
                     // === 可放入生成 Excel / 班表邏輯 ===
 
                     sheet.Rows[2 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{d.Day}";
-                    if(d.Day == 30)
-                    {
-
-                    }
+                
                     //小夜班
                     if (d.Month == month)
                     {
@@ -1961,6 +1971,18 @@ namespace PharmaRosterAPI
                             text += staff.staff_simple_name.Substring(0, 1);
                         }
 
+                        //國定假日
+                        assignedShiftClasses = schedule.AssignedShifts.Where(x => (x.workShiftRequirement.time == "08:00-12:00")
+                      && x.workShiftRequirement.department == "其他").ToList();
+                        if (assignedShiftClasses.Count > 0) text += "(";
+                        for (int i = 0; i < assignedShiftClasses.Count; i++)
+                        {
+                            AssignedShiftClass asg = assignedShiftClasses[i];
+                            StaffClass staff = keyValuePairs_staffs.SortDictionaryByGUID(asg.staff_guid).FirstOrDefault();
+                            if (staff == null) { continue; }
+                            text += (staff.staff_simple_name.Substring(0, 1));
+                        }
+                        if (assignedShiftClasses.Count > 0) text += ")";
                         if (dayOfWeek == 6 || dayOfWeek == 7 || true)
                         {
                             if (text.Replace("--", "").StringIsEmpty() == false)
@@ -1990,7 +2012,7 @@ namespace PharmaRosterAPI
                         }
                         if (text.Replace("[TPN]", "").StringIsEmpty() == false)
                         {
-                            sheet.Rows[5 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
+                            sheet.Rows[5 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text += $"{text}";
                         }
                         text = "[化療]";
                  
@@ -2004,7 +2026,7 @@ namespace PharmaRosterAPI
                         }
                         if (text.Replace("[化療]", "").StringIsEmpty() == false)
                         {
-                            sheet.Rows[5 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text = $"{text}";
+                            sheet.Rows[5 + (weekIndex - 1) * 7].Cell[dayOfWeek - 1].Text += $"{text}";
                         }
                     }
                 }
@@ -3970,6 +3992,10 @@ namespace PharmaRosterAPI
                     {
                         requiredShift.shift_group = sg_buf[0];
                         sg_buf[0].Members = new List<ShiftGroupMemberClass>();
+                    }
+                    else
+                    {
+
                     }
                     if (requiredShift.shift_group != null) requiredShift.shift_group.workShiftRanges = requiredShift.shift_group.workShiftRanges.SortByDayAndTime();
                     requiredShift.shift_group.workShiftRanges = requiredShift.shift_group.workShiftRanges.FilterByDate(scheduleDay.date);
