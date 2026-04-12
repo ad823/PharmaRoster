@@ -377,7 +377,32 @@ namespace PharmaRosterLib
         [Description("VARCHAR,5,NONE")]
         public string selected_half_pm { get; set; }
 
-   
+        /// <summary>
+        /// 此休假是否已釋出給其他人
+        /// true = 原持有人已釋出，待他人選擇
+        /// </summary>
+        [Description("VARCHAR,5,NONE")]
+        public string is_released { get; set; } = "false";
+
+        /// <summary>
+        /// 釋出時間
+        /// </summary>
+        [Description("DATETIME,0,NONE")]
+        public string released_at { get; set; } = "";
+
+        /// <summary>
+        /// 是否為他人釋出的名額
+        /// true = 此筆為可被接手的釋出名額
+        /// </summary>
+        [Description("VARCHAR,5,NONE")]
+        public string is_from_release { get; set; } = "false";
+
+        /// <summary>
+        /// 來源放假選項 GUID（哪一筆被釋出而來）
+        /// </summary>
+        [Description("VARCHAR,50,NONE")]
+        public string source_option_guid { get; set; } = "";
+
         [Description("DATETIME,20,NONE")]
         public string updated_at { get; set; }
 
@@ -592,7 +617,12 @@ namespace PharmaRosterLib
         /// </summary>
         public void NormalizeSelection()
         {
-            if(selected_full.StringToBool() == false && selected_half_am.StringToBool() == false && selected_half_pm.StringToBool() == false)date = DateTime.MinValue.ToDateTimeString();
+            if (force_ff_at.StringIsEmpty()) force_ff_at = DateTime.MinValue.ToDateTimeString();
+            if (released_at.StringIsEmpty()) released_at = DateTime.MinValue.ToDateTimeString();
+            if (selected_full == null) selected_full = "false";
+            if (selected_half_am == null) selected_half_am = "false";
+            if (selected_half_pm == null) selected_half_pm = "false";
+            if (selected_full.StringToBool() == false && selected_half_am.StringToBool() == false && selected_half_pm.StringToBool() == false) date = DateTime.MinValue.ToDateTimeString();
             // 系統強制FF → 不允許任何變更（保留系統設定）
             if (is_force_ff == "true")
             {
@@ -626,16 +656,16 @@ namespace PharmaRosterLib
                 ClearSelection();
                 return;
             }
-            if (selected_half_am == "true" && can_full != "true")
-            {
-                ClearSelection();
-                return;
-            }
-            if (selected_half_pm == "true" && can_full != "true")
-            {
-                ClearSelection();
-                return;
-            }
+            //if (selected_half_am == "true" && can_full != "true")
+            //{
+            //    ClearSelection();
+            //    return;
+            //}
+            //if (selected_half_pm == "true" && can_full != "true")
+            //{
+            //    ClearSelection();
+            //    return;
+            //}
         }
     }
 

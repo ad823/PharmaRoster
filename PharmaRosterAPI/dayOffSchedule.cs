@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
 using MySql.Data.MySqlClient;
 using NPOI.SS.Formula.Eval;
+using NPOI.SS.Formula.Functions;
 using PharmaRosterLib;
 using SQLUI;
 using System;
@@ -1118,16 +1119,29 @@ namespace PharmaRosterAPI
         /// <returns>
         /// 回傳 returnData.JsonSerializationt() 的 JSON 字串。
         /// </returns>
+        /// <summary>
+        /// 計算排休表單可用放假日，並建立系統預設/特殊規則選項。
+        /// </summary>
+        /// <remarks>
+        /// 規則：
+        /// 1. 先計算特殊規則建議休假日
+        /// 2. 再補週六、週日 item
+        /// 3. 僅對「無 item 且未被特殊規則指定建議休假日」的週六/週日補 item
+        /// 4. 補出的 item 同時建立 FF option
+        /// </remarks>
+        /// <param name="returnData">returnData 物件，主要使用 ValueAry 作為參數輸入。</param>
+        /// <returns>回傳 returnData.JsonSerializationt() 的 JSON 字串。</returns>
         [HttpPost("calculate_available_dayoff_dates")]
         public string calculate_available_dayoff_dates([FromBody] returnData returnData)
         {
+            init(returnData);
             var timer = new MyTimerBasic();
             returnData.Method = "calculate_available_dayoff_dates";
             try
             {
                 string GetVal(string key) =>
-                  returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
-                  ?.Split('=')[1];
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
 
                 string form_name = GetVal("form_name");
                 string simple = GetVal("simple");
@@ -1158,8 +1172,6 @@ namespace PharmaRosterAPI
                 List<DayOffScheduleItemClass> dayOffScheduleItemClasses = obj_dayOffScheduleItem.SQLToClass<DayOffScheduleItemClass>();
                 List<StaffDayOffOptionClass> staffDayOffOptionClasses = obj_staffDayOffOption.SQLToClass<StaffDayOffOptionClass>();
 
-                // ✅ 已存在 option 的快速索引（避免重複新增）
-                // Unique Key: item_guid|staff_guid|date
                 HashSet<string> existsOptionKeySet = staffDayOffOptionClasses
                     .Where(x => x != null)
                     .Select(x =>
@@ -1169,7 +1181,6 @@ namespace PharmaRosterAPI
                     })
                     .ToHashSet();
 
-                // ✅ 綁定 days
                 dayOffScheduleForm.days.LockAdd(dayOffScheduleDayClasses);
 
                 if (simple == true.ToString().ToLower())
@@ -1181,9 +1192,8 @@ namespace PharmaRosterAPI
                 }
 
                 // =========================================================
-                // ✅ 先把 option 綁定到 item.option（既有資料）
+                // 先綁既有 option
                 // =========================================================
-                // day.items 組合
                 foreach (var day in dayOffScheduleDayClasses)
                 {
                     day.items = dayOffScheduleItemClasses
@@ -1193,31 +1203,24 @@ namespace PharmaRosterAPI
                     foreach (var item in day.items)
                     {
                         item.option = staffDayOffOptionClasses
-                            .Where(x =>x.staff_guid == item.staff_guid && x.GUID == item.option_guid)
+                            .Where(x => x.staff_guid == item.staff_guid && x.GUID == item.option_guid)
                             .FirstOrDefault();
                     }
                 }
 
                 // =========================================================
-                // ✅ 建立 staffItemDict（依 staff_guid 分類 items）
+                // 建立索引
                 // =========================================================
                 Dictionary<string, List<DayOffScheduleItemClass>> staffItemDict = dayOffScheduleItemClasses
                     .Where(x => x != null && x.staff_guid.StringIsEmpty() == false)
                     .GroupBy(x => x.staff_guid)
                     .ToDictionary(g => g.Key, g => g.ToList());
 
-                // =========================================================
-                // ✅ 建立 itemKeyIndex：staff_guid|yyyy-MM-dd → item（用於判斷該日是否已有 item）
-                // =========================================================
                 Dictionary<string, DayOffScheduleItemClass> itemKeyIndex = dayOffScheduleItemClasses
                     .Where(x => x != null && x.staff_guid.StringIsEmpty() == false && x.date.StringIsEmpty() == false)
                     .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime().ToDateString('-')}")
                     .ToDictionary(g => g.Key, g => g.First());
 
-                // =========================================================
-                // ✅ itemIndex（你原本特殊規則 builder 會用到）
-                // key: staff_guid|yyyy-MM-dd -> List<DayOffScheduleItemClass>
-                // =========================================================
                 Dictionary<string, List<DayOffScheduleItemClass>> itemIndex =
                     staffItemDict
                         .SelectMany(kv => kv.Value.Select(item => new { staffGuid = kv.Key, item }))
@@ -1226,23 +1229,45 @@ namespace PharmaRosterAPI
                         .ToDictionary(g => g.Key, g => g.Select(x => x.item).ToList());
 
                 List<StaffDayOffOptionClass> staffDayOffOptions_add = new List<StaffDayOffOptionClass>();
-                List<DayOffScheduleItemClass> dayOffScheduleItems_update = new List<DayOffScheduleItemClass>();
-
-                // ✅ 方案A新增：要補進 DB 的 item
                 List<DayOffScheduleItemClass> dayOffScheduleItems_add = new List<DayOffScheduleItemClass>();
+                List<DayOffScheduleItemClass> dayOffScheduleItems_update = new List<DayOffScheduleItemClass>();
 
                 string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
 
                 // =========================================================
-                // ✅ 判斷是否有排班（依你的 WorkShiftRequirementClass）
+                // 特殊規則已保留日期集合
+                // key = staff_guid|yyyy-MM-dd
                 // =========================================================
+                HashSet<string> reservedSuggestedDateSet = new HashSet<string>();
+
+                void AddSuggestedDatesToReservedSet(StaffDayOffOptionClass opt)
+                {
+                    if (opt == null) return;
+                    if (opt.staff_guid.StringIsEmpty()) return;
+
+                    if (opt.suggested_dates_list != null)
+                    {
+                        foreach (var d in opt.suggested_dates_list)
+                        {
+                            DateTime dt = d.StringToDateTime();
+                            if (dt == DateTime.MinValue) continue;
+                            reservedSuggestedDateSet.Add($"{opt.staff_guid}|{dt.ToDateString('-')}");
+                        }
+                    }
+
+                    DateTime mainDt = opt.date.StringToDateTime();
+                    if (mainDt != DateTime.MinValue)
+                    {
+                        reservedSuggestedDateSet.Add($"{opt.staff_guid}|{mainDt.ToDateString('-')}");
+                    }
+                }
+
                 bool HasSchedule(DayOffScheduleItemClass item)
                 {
                     if (item == null) return false;
 
                     WorkShiftRequirementClass req = item.workShiftRequirement;
                     if (req == null) return false;
-
                     if (req.disabled) return false;
                     if (req.RequiredCountBase <= 0) return false;
                     if (req.shift_type.StringIsEmpty()) return false;
@@ -1250,79 +1275,59 @@ namespace PharmaRosterAPI
                     return true;
                 }
 
-                // =========================================================
-                // ✅ 建立「週日 OFF item」的 shift_requirement（disabled=true）
-                // 目的：確保 HasSchedule(item) 一定是 false
-                // =========================================================
-                string BuildSundayOffShiftRequirementJson()
+             
+
+                StaffDayOffOptionClass BuildForceFFOption(DayOffScheduleItemClass item, DateTime dt)
                 {
-                    // 不硬塞 day/time/department/hdr，避免你前端依賴出錯
-                    var req = new WorkShiftRequirementClass()
+                    string offDate = dt.ToDateString('-');
+                    if (dt.DayOfWeek == DayOfWeek.Saturday) item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt);
+                    if (dt.DayOfWeek == DayOfWeek.Sunday) item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt);
+                    item.selected_dayoff_type = "FF"; // 若你前端有使用，可留；不需要也可空字串
+                                                      // FF 一律整天假        
+
+                    var option = new StaffDayOffOptionClass();
+                    option.GUID = Guid.NewGuid().ToString();
+                    option.form_guid = item.form_guid;
+                    option.item_guid = item.GUID;
+                    option.staff_guid = item.staff_guid;
+                    option.date = offDate;
+                    option.suggested_dates_list = new List<string>() { offDate };
+                    option.is_any_date = "false";
+                    option.assigned_shift = "OFF";
+
+                    // 週六半天、週日全天
+                    if (dt.DayOfWeek == DayOfWeek.Saturday)
                     {
-                        day = "SUN",
-                        time = "",
-                        shift_type = "OFF",
-                        required_count = "0",
-                        assigned_count = "0",
-                        department = "",
-                        hdr = "",
-                        disabled = true
-                    };
-                    return JsonSerializer.Serialize(req);
+                        option.can_full = "false";
+                        option.can_half_am = "true";
+                        option.can_half_pm = "false";
+                        option.selected_full = "false";
+                        option.selected_half_am = "true";
+                        option.selected_half_pm = "false";
+                        option.is_force_ff = "false";
+                    }
+                    else
+                    {
+                        option.can_full = "true";
+                        option.can_half_am = "false";
+                        option.can_half_pm = "false";
+                        option.selected_full = "true";
+                        option.selected_half_am = "false";
+                        option.selected_half_pm = "false";
+                        option.is_force_ff = "true";
+                    }
+
+                    option.is_forbidden = "false";
+                    option.is_force_ff = "true";
+                    option.force_ff_at = now;
+                    option.updated_at = now;
+                    option.released_at = DateTime.MinValue.ToDateTimeString();
+                    return option;
                 }
 
                 // =========================================================
-                // ✅ 建立 FF option（date + suggested_dates 都是週日當天）
+                // staff 清單
                 // =========================================================
-                StaffDayOffOptionClass BuildForceFFOption(DayOffScheduleItemClass item, string dt)
-                {
-                    var opt = new StaffDayOffOptionClass();
-                    opt.GUID = Guid.NewGuid().ToString();
-                    opt.form_guid = dayOffScheduleForm.GUID;
-                    opt.item_guid = item.GUID;
-                    opt.staff_guid = item.staff_guid;
-
-                    // ✅ date 就是週日當天
-                    opt.date = dt;
-
-                    // ✅ suggested_dates 也必須包含週日當天
-                    opt.suggested_dates_list = new List<string>() { dt };
-
-                    // FF 一律整天假
-                    opt.assigned_shift = "OFF";
-                    opt.can_full = "true";
-                    opt.can_half_am = "false";
-                    opt.can_half_pm = "false";
-
-                    opt.is_any_date = "false";
-                    opt.is_forbidden = "false";
-
-                    // ✅ 你新增的 FF 欄位（請確保 class 已加上）
-                    opt.is_force_ff = "true";
-                    opt.force_ff_at = now;
-
-                    // ✅ 強制選擇整天假
-                    opt.selected_full = "true";
-                    opt.selected_half_am = "false";
-                    opt.selected_half_pm = "false";
-
-                    opt.NormalizeSelection();
-                    return opt;
-                }
-
-                // =========================================================
-                // ✅ 方案A核心：補「週日沒排班」的 item + FF option
-                // 你提到「沒排班不會有 item」，所以必須先補 item
-                //
-                // 規則：
-                // - 只針對星期日
-                // - 若該 staff 當天已存在 item -> 不補
-                // - 若存在 item 且已經有 option -> 不覆蓋
-                // - 補出的 item 一律為 OFF（disabled=true, required_count=0）
-                // - 補出 item 後立即建立 FF option，date 與 suggested_dates 都是週日
-                // =========================================================
-
-                // 1) staff 清單：僅針對本表單已出現過的 staff（最安全）
                 var staffList = dayOffScheduleItemClasses
                     .Where(x => x != null && x.staff_guid.StringIsEmpty() == false)
                     .GroupBy(x => x.staff_guid)
@@ -1336,115 +1341,31 @@ namespace PharmaRosterAPI
                     })
                     .ToList();
 
-                // 2) 找出本表單所有星期日（以 day 表為準，避免只用 item）
-                var sundayDays = dayOffScheduleDayClasses
-                    .Where(d =>
-                    {
-                        // ⚠️ 若你的 DayOffScheduleDayClass 不是 d.date，請改欄位名稱
-                        DateTime dt = d.date.StringToDateTime();
-                        return dt != DateTime.MinValue && dt.DayOfWeek == DayOfWeek.Sunday;
-                    })
-                    .ToList();
-
-                foreach (var day in sundayDays)
-                {
-                    DateTime dayDtObj = day.date.StringToDateTime();
-                    if (dayDtObj == DateTime.MinValue) continue;
-
-                    string dt = dayDtObj.ToDateString('-'); // yyyy-MM-dd
-
-                    foreach (var staff in staffList)
-                    {
-                        if (staff.staff_guid.StringIsEmpty()) continue;
-
-                        string keyStaffDate = $"{staff.staff_guid}|{dt}";
-
-                        // ✅ 若已存在 item（代表有排班或已建過），就不補 item
-                        if (itemKeyIndex.ContainsKey(keyStaffDate))
-                        {
-                            // 防呆：存在 item 但沒有 option，是否要補 FF？
-                            // 你目前規則是「週日沒上班才 FF」，但既然有 item 代表流程已建資料
-                            // 這裡不做任何覆蓋，完全保守
-                            continue;
-                        }
-
-                        // ✅ 不存在 item -> 代表「沒排班」的日子（你說週日沒排班不會有 item）
-                        // => 補一筆 OFF item + FF option
-
-                        var newItem = new DayOffScheduleItemClass();
-                        newItem.GUID = Guid.NewGuid().ToString();
-                        newItem.form_guid = dayOffScheduleForm.GUID;
-                        newItem.day_guid = day.GUID;
-                        newItem.option_guid = ""; // 下面會補
-                        newItem.date = dt;
-
-                        newItem.is_special_day = "false";
-
-                        newItem.staff_guid = staff.staff_guid;
-                        newItem.staff_id = staff.staff_id;
-                        newItem.staff_name = staff.staff_name;
-                        newItem.staff_simple_name = staff.staff_simple_name;
-                        newItem.position = staff.position;
-
-                        // ✅ 這筆 item 就是「週日 OFF」
-                        newItem.selected_dayoff_type = "FF"; // 若你前端有使用，可留；不需要也可空字串
-                        newItem.shift_requirement = BuildSundayOffShiftRequirementJson();
-
-                        newItem.created_at = now;
-                        newItem.updated_at = now;
-
-                        // ✅ 建 FF option（date + suggested_dates 都是週日）
-                        var ffOpt = BuildForceFFOption(newItem, dt);
-
-                        newItem.option_guid = ffOpt.GUID;
-                        newItem.option = ffOpt;
-
-                        // ✅ 加入要寫入 DB 的清單
-                        dayOffScheduleItems_add.Add(newItem);
-                        staffDayOffOptions_add.Add(ffOpt);
-
-                        // ✅ 更新內存清單，確保回傳資料與後續 builder 邏輯可用
-                        dayOffScheduleItemClasses.Add(newItem);
-                        day.items.Add(newItem);
-
-                        // itemKeyIndex 補上，避免同一次執行重複補
-                        itemKeyIndex[keyStaffDate] = newItem;
-
-                        // staffItemDict 補上（避免後續特殊 builder 漏掉）
-                        if (!staffItemDict.ContainsKey(staff.staff_guid))
-                            staffItemDict[staff.staff_guid] = new List<DayOffScheduleItemClass>();
-                        staffItemDict[staff.staff_guid].Add(newItem);
-
-                        // itemIndex 補上（給 builder 用）
-                        if (!itemIndex.ContainsKey(keyStaffDate))
-                            itemIndex[keyStaffDate] = new List<DayOffScheduleItemClass>();
-                        itemIndex[keyStaffDate].Add(newItem);
-
-                        // existsOptionKeySet（雖然 key 含 item_guid 會是新的，但仍補上保守）
-                        string optionKey = $"{ffOpt.item_guid}|{ffOpt.staff_guid}|{dt}";
-                        existsOptionKeySet.Add(optionKey);
-
-                        // item.option_guid 要更新 DB（新 item 寫入時已含 option_guid，不需額外 update）
-                        // 但你若 DB add item 的欄位不含 option_guid，才需要加入 update 清單
-                        // dayOffScheduleItems_update.Add(newItem);
-                    }
-                }
-
                 // =========================================================
-                // ✅ 原本特殊規則 option 建立流程
-                // - 若 item 已有 option_guid（包含我們補的週日FF）→ 不覆蓋
+                // 先跑特殊規則
                 // =========================================================
                 foreach (var staffGuid in staffItemDict.Keys.ToList())
                 {
-                    staffItemDict.TryGetValue(staffGuid, out var items);
-                    items ??= new List<DayOffScheduleItemClass>();
-
-                    foreach (var item in items)
+                    var staffItems = staffItemDict[staffGuid]
+                        .Where(x => x != null && x.date.StringIsEmpty() == false)
+                        .OrderBy(x => x.date.StringToDateTime())
+                        .ToList();
+                
+                    foreach (var item in staffItems)
                     {
+                        //if (staffGuid != "06faaad9-6ee2-4034-98fd-602710a288b4")
+                        //{
+                        //    continue;
+                        //}
                         if (item == null) continue;
 
-                        // ✅ 已經有 option_guid（包含週日FF）→ 不做
-                        if (item.option_guid.StringIsEmpty() == false) continue;
+                        if (item.option_guid.StringIsEmpty() == false)
+                        {
+                            if (item.option != null) AddSuggestedDatesToReservedSet(item.option);
+                            continue;
+                        }
+
+                        if (!HasSchedule(item)) continue;
 
                         StaffDayOffOptionClass staffDayOffOptionClass = null;
 
@@ -1454,62 +1375,161 @@ namespace PharmaRosterAPI
                         if (staffDayOffOptionClass == null) staffDayOffOptionClass = BuildStaffDayOffMidnightOption(item, itemIndex);
 
                         if (staffDayOffOptionClass == null) continue;
+
                         if (staffDayOffOptionClass.force_ff_at.Check_Date_String() == false) staffDayOffOptionClass.force_ff_at = DateTime.MinValue.ToDateString();
-                        // ✅ Unique key
+
                         string optionDate = staffDayOffOptionClass.date.StringToDateTime().ToDateString('-');
                         string optionKey = $"{staffDayOffOptionClass.item_guid}|{staffDayOffOptionClass.staff_guid}|{optionDate}";
 
-                        // ✅ 已存在就跳過
                         if (existsOptionKeySet.Contains(optionKey)) continue;
 
                         existsOptionKeySet.Add(optionKey);
 
                         item.option_guid = staffDayOffOptionClass.GUID;
+                        item.option = staffDayOffOptionClass;
+
                         dayOffScheduleItems_update.Add(item);
                         staffDayOffOptions_add.Add(staffDayOffOptionClass);
+                        AddSuggestedDatesToReservedSet(staffDayOffOptionClass);
                     }
                 }
 
                 // =========================================================
-                // ✅ DB 寫入（順序：先加 item，再加 option，再 update item.option_guid）
+                // 再補週六、週日 item + FF option
+                // 條件：
+                // 1. 該人該日沒有 item
+                // 2. 該人該日沒有被特殊規則指定建議休假日
                 // =========================================================
+                var holidayDays = dayOffScheduleDayClasses
+                    .Where(d =>
+                    {
+                        DateTime dt = d.date.StringToDateTime();
+                        return dt != DateTime.MinValue &&
+                               (dt.DayOfWeek == DayOfWeek.Saturday || dt.DayOfWeek == DayOfWeek.Sunday);
+                    })
+                    .OrderBy(d => d.date.StringToDateTime())
+                    .ToList();
 
-                // 1) 新增 item（週日補 item）
+                foreach (var day in holidayDays)
+                {
+                    DateTime dayDt = day.date.StringToDateTime();
+                    if (dayDt == DateTime.MinValue) continue;
+
+                    string dt = dayDt.ToDateString('-');
+
+                    foreach (var staff in staffList)
+                    {
+                        if (staff.staff_guid.StringIsEmpty()) continue;
+
+                        string keyStaffDate = $"{staff.staff_guid}|{dt}";
+                        //if (staff.staff_guid != "06faaad9-6ee2-4034-98fd-602710a288b4")
+                        //{
+                        //    continue;
+                        //}
+                        // 已有 item -> 不補
+                        if (itemKeyIndex.ContainsKey(keyStaffDate)) continue;
+
+                        // 已被特殊規則指定建議休假日 -> 不補
+                        if (reservedSuggestedDateSet.Contains(keyStaffDate)) continue;
+
+                        var newItem = new DayOffScheduleItemClass();
+                        newItem.GUID = Guid.NewGuid().ToString();
+                        newItem.form_guid = dayOffScheduleForm.GUID;
+                        newItem.day_guid = day.GUID;
+                        newItem.option_guid = "";
+                        newItem.date = dt;
+                        newItem.is_special_day = "false";
+
+                        newItem.staff_guid = staff.staff_guid;
+                        newItem.staff_id = staff.staff_id;
+                        newItem.staff_name = staff.staff_name;
+                        newItem.staff_simple_name = staff.staff_simple_name;
+                        newItem.position = staff.position;
+
+                        newItem.shift_requirement = BuildHolidayOffShiftRequirementJson(dayDt);
+                        newItem.created_at = now;
+                        newItem.updated_at = now;
+
+                        var ffOpt = BuildForceFFOption(newItem, dayDt);
+
+                        newItem.option_guid = ffOpt.GUID;
+                        newItem.option = ffOpt;
+
+                        dayOffScheduleItems_add.Add(newItem);
+                        staffDayOffOptions_add.Add(ffOpt);
+
+                        dayOffScheduleItemClasses.Add(newItem);
+                        staffDayOffOptionClasses.Add(ffOpt);
+                        day.items.Add(newItem);
+
+                        itemKeyIndex[keyStaffDate] = newItem;
+
+                        if (!staffItemDict.ContainsKey(staff.staff_guid))
+                            staffItemDict[staff.staff_guid] = new List<DayOffScheduleItemClass>();
+                        staffItemDict[staff.staff_guid].Add(newItem);
+
+                        if (!itemIndex.ContainsKey(keyStaffDate))
+                            itemIndex[keyStaffDate] = new List<DayOffScheduleItemClass>();
+                        itemIndex[keyStaffDate].Add(newItem);
+
+                        existsOptionKeySet.Add($"{newItem.GUID}|{newItem.staff_guid}|{dt}");
+                    }
+                }
+
+                // =========================================================
+                // DB 寫入
+                // =========================================================
                 if (dayOffScheduleItems_add.Count > 0)
                 {
                     sql_dayOffScheduleItemClass.AddRows(null, dayOffScheduleItems_add.ClassToSQL<DayOffScheduleItemClass>());
                 }
 
-                // 2) 新增 option（包含週日 FF + 原本特殊規則）
                 if (staffDayOffOptions_add.Count > 0)
                 {
                     sql_staffDayOffOptionClass.AddRows(null, staffDayOffOptions_add.ClassToSQL<StaffDayOffOptionClass>());
                 }
 
-                // 3) 更新 item.option_guid（僅針對原本 item 新建 option 的情境；週日補 item 已包含 option_guid）
                 if (dayOffScheduleItems_update.Count > 0)
                 {
                     sql_dayOffScheduleItemClass.UpdateByDefulteExtra(null, dayOffScheduleItems_update.ClassToSQL<DayOffScheduleItemClass>());
                 }
 
                 // =========================================================
-                // ✅ 回傳
+                // 回傳前重新綁定
                 // =========================================================
+                foreach (var day in dayOffScheduleDayClasses)
+                {
+                    day.items = dayOffScheduleItemClasses
+                        .Where(x => x.day_guid == day.GUID)
+                        .OrderBy(x => x.date.StringToDateTime())
+                        .ThenBy(x => x.staff_id)
+                        .ToList();
+
+                    foreach (var item in day.items)
+                    {
+                        item.option = staffDayOffOptionClasses
+                            .Where(x => x.staff_guid == item.staff_guid && x.GUID == item.option_guid)
+                            .FirstOrDefault();
+                    }
+                }
+
+                dayOffScheduleForm.days = dayOffScheduleDayClasses
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
                 returnData.Code = 200;
                 returnData.Data = dayOffScheduleForm;
                 returnData.Result =
-                    $"新增排休資料成功,共{staffDayOffOptions_add.Count}筆(含週日沒排班→補OFF item + FF option)";
+                    $"計算完成，新增 item {dayOffScheduleItems_add.Count} 筆，新增 option {staffDayOffOptions_add.Count} 筆，更新 item {dayOffScheduleItems_update.Count} 筆";
+                returnData.TimeTaken = $"{timer}";
                 return returnData.JsonSerializationt(true);
             }
             catch (Exception ex)
             {
                 returnData.Code = -200;
                 returnData.Result = ex.Message;
+                returnData.TimeTaken = $"{timer}";
                 return returnData.JsonSerializationt();
-            }
-            finally
-            {
-                returnData.Result += timer.ToString();
             }
         }
 
@@ -5956,7 +5976,7 @@ namespace PharmaRosterAPI
                             can_half_pm = "false",
                             is_forbidden = "false",
                             is_force_ff = "false",
-                            force_ff_at = "",
+                            force_ff_at = DateTime.MinValue.ToDateTimeString(),
                             selected_full = "false",
                             selected_half_am = "false",
                             selected_half_pm = "false"
@@ -6545,6 +6565,84 @@ namespace PharmaRosterAPI
             return groups[idx + 1];
         }
 
+        // =========================================================
+        // ✅ 建立 FF option（date + suggested_dates 都是週日當天）
+        // =========================================================
+        private StaffDayOffOptionClass BuildForceFFOption(DayOffScheduleItemClass item, string dt)
+        {
+            var opt = new StaffDayOffOptionClass();
+            opt.GUID = Guid.NewGuid().ToString();
+            opt.form_guid = item.form_guid;
+            opt.item_guid = item.GUID;
+            opt.staff_guid = item.staff_guid;
+
+            opt.date = dt;
+
+            opt.suggested_dates_list = new List<string>() { dt };
+            if (dt.StringToDateTime().DayOfWeek == DayOfWeek.Sunday)
+            {
+                item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt.StringToDateTime());
+                item.selected_dayoff_type = "FF"; // 若你前端有使用，可留；不需要也可空字串
+                                                  // FF 一律整天假        
+                opt.can_full = "true";
+                opt.can_half_am = "false";
+                opt.can_half_pm = "false";
+                // ✅ 強制選擇整天假
+                opt.selected_full = "true";
+                opt.selected_half_am = "false";
+                opt.selected_half_pm = "false";
+                opt.is_any_date = "false";
+
+
+                // ✅ 你新增的 FF 欄位（請確保 class 已加上）
+                opt.is_force_ff = "true";
+            }
+            if (dt.StringToDateTime().DayOfWeek == DayOfWeek.Saturday)
+            {
+                item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt.StringToDateTime());
+                item.selected_dayoff_type = "FF"; // 若你前端有使用，可留；不需要也可空字串
+                                                  // FF 一律整天假        
+                opt.can_full = "false";
+                opt.can_half_am = "true";
+                opt.can_half_pm = "true";
+                // ✅ 強制選擇整天假
+                opt.selected_full = "false";
+                opt.selected_half_am = "false";
+                opt.selected_half_pm = "false";
+                opt.is_any_date = "true";
+
+                opt.is_force_ff = "false";
+            }
+
+            opt.is_forbidden = "false";
+            opt.assigned_shift = "OFF";
+            opt.force_ff_at = DateTime.Now.ToDateTimeString_6();
+
+         
+
+            opt.NormalizeSelection();
+            return opt;
+        }
+        private string BuildHolidayOffShiftRequirementJson(DateTime dt)
+        {
+            string dayCode = dt.DayOfWeek == DayOfWeek.Saturday ? "Saturday" :
+                             dt.DayOfWeek == DayOfWeek.Sunday ? "Sunday" : "";
+
+            var req = new WorkShiftRequirementClass()
+            {
+                day = dayCode,
+                time = "",
+                shift_type = "",
+                required_count = "0",
+                assigned_count = "0",
+                department = "",
+                hdr = "",
+                disabled = true
+            };
+            return JsonSerializer.Serialize(req);
+        }
+
+
         private StaffDayOffOptionClass BuildStaffDayOffSpecialDayOption(DayOffScheduleItemClass item, Dictionary<string, List<DayOffScheduleItemClass>> itemIndex)
         {
             if (item == null) return null;
@@ -6603,7 +6701,7 @@ namespace PharmaRosterAPI
             if (itemDate.DayOfWeek == DayOfWeek.Saturday || itemDate.DayOfWeek == DayOfWeek.Sunday)
             {
                 DateTime dateTimeSuggestedDate = new DateTime();
-                if (itemDate.DayOfWeek == DayOfWeek.Saturday) dateTimeSuggestedDate = itemDate.AddDays(5);
+                if (itemDate.DayOfWeek == DayOfWeek.Saturday) dateTimeSuggestedDate = itemDate.AddDays(7);
                 if (itemDate.DayOfWeek == DayOfWeek.Sunday) dateTimeSuggestedDate = itemDate.AddDays(4);
             
                 StaffDayOffOptionClass option = new StaffDayOffOptionClass();
@@ -6615,18 +6713,31 @@ namespace PharmaRosterAPI
                 option.can_full = "true";
                 option.can_half_pm = "false";
                 option.can_half_am = "false";
+       
                 option.assigned_shift = ShiftTypeEnum.swing.GetEnumName();
                 // 超出月份 → 任選日期
                 if (dateTimeSuggestedDate.Month != itemDate.Month)
                 {
                     option.is_any_date = "true";
-             
+                    if (itemDate.DayOfWeek == DayOfWeek.Saturday)
+                    {
+                        option.can_full = "false";
+                        option.can_half_pm = "false";
+                        option.can_half_am = "true";
+                    }
+                      
                 }
                 else
                 {
                     if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
                     {
                         return null;
+                    }
+                    if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
+                    {
+                        option.can_full = "false";
+                        option.can_half_pm = "false";
+                        option.can_half_am = "true";
                     }
                     option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
                 }
@@ -6683,6 +6794,12 @@ namespace PharmaRosterAPI
                 option.can_half_pm = "false";
                 option.can_half_am = "false";
                 option.assigned_shift = ShiftTypeEnum.swing.GetEnumName();
+                if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
+                {
+                    option.can_full = "false";
+                    option.can_half_pm = "false";
+                    option.can_half_am = "true";
+                }
                 option.NormalizeSelection();
 
                 return option;
@@ -6710,26 +6827,27 @@ namespace PharmaRosterAPI
     
                 DateTime dateTimeSuggestedDate = new DateTime();
                 dateTimeSuggestedDate = itemDate.AddDays(7);
-          
+             
                 StaffDayOffOptionClass option = new StaffDayOffOptionClass();
                 option.GUID = Guid.NewGuid().ToString();
                 option.form_guid = item.form_guid;
                 option.item_guid = item.GUID;
                 option.staff_guid = staffGuid;
                 option.date = item.date;
-
                 option.can_full = "true";
                 option.can_half_pm = "false";
                 option.can_half_am = "false";
+                  
                 option.assigned_shift = ShiftTypeEnum.holiday.GetEnumName();
                 // 超出月份 → 任選日期
                 if (dateTimeSuggestedDate.Month != itemDate.Month)
                 {
-                    dateTimeSuggestedDate = GetFirstSaturdayOfMonth(itemDate);
-                    if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
-                    {
-                        return null;
-                    }
+                 
+                    option.is_any_date = "true";
+                    option.can_full = "false";
+                    option.can_half_pm = "false";
+                    option.can_half_am = "true";
+          
                     option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
                 }
                 else
@@ -6737,6 +6855,12 @@ namespace PharmaRosterAPI
                     if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
                     {
                         return null;
+                    }
+                    if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
+                    {
+                        option.can_full = "false";
+                        option.can_half_pm = "false";
+                        option.can_half_am = "true";
                     }
                     option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
                 }
@@ -6770,6 +6894,12 @@ namespace PharmaRosterAPI
                     {
                         return null;
                     }
+                    if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
+                    {
+                        option.can_full = "false";
+                        option.can_half_pm = "false";
+                        option.can_half_am = "true";
+                    }
                     option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
                 }
                 else
@@ -6777,6 +6907,12 @@ namespace PharmaRosterAPI
                     if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
                     {
                         return null;
+                    }
+                    if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
+                    {
+                        option.can_full = "false";
+                        option.can_half_pm = "false";
+                        option.can_half_am = "true";
                     }
                     option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
                 }
@@ -6813,6 +6949,12 @@ namespace PharmaRosterAPI
                         if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
                         {
                             return null;
+                        }
+                        if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
+                        {
+                            option.can_full = "false";
+                            option.can_half_pm = "false";
+                            option.can_half_am = "true";
                         }
                         option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
 
@@ -6852,6 +6994,12 @@ namespace PharmaRosterAPI
                         if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
                         {
                             return null;
+                        }
+                        if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
+                        {
+                            option.can_full = "false";
+                            option.can_half_pm = "false";
+                            option.can_half_am = "true";
                         }
                         option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
                     }
@@ -6905,6 +7053,12 @@ namespace PharmaRosterAPI
                     {
                         return null;
                     }
+                    if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
+                    {
+                        option.can_full = "false";
+                        option.can_half_pm = "false";
+                        option.can_half_am = "true";
+                    }
                     option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
                 }
                 else
@@ -6946,6 +7100,12 @@ namespace PharmaRosterAPI
                     if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
                     {
                         return null;
+                    }
+                    if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
+                    {
+                        option.can_full = "false";
+                        option.can_half_pm = "false";
+                        option.can_half_am = "true";
                     }
                     option.suggested_dates = (new List<string>() { dateTimeSuggestedDate.ToDateString('-') }).JsonSerializationt();
                 }
