@@ -84,6 +84,8 @@ namespace PharmaRosterLib
 
         /// <summary>表單包含的日期清單（非資料表欄位）</summary>
         public List<DayOffScheduleDayClass> days { get; set; } = new List<DayOffScheduleDayClass>();
+
+   
     }
 
     [Description("dayoff_schedule_day")]
@@ -378,6 +380,13 @@ namespace PharmaRosterLib
         public string selected_half_pm { get; set; }
 
         /// <summary>
+        /// 釋出的假別類型
+        /// FULL / HALF_AM / HALF_PM
+        /// </summary>
+        [Description("VARCHAR,20,NONE")]
+        public string released_dayoff_type { get; set; } = "";
+
+        /// <summary>
         /// 此休假是否已釋出給其他人
         /// true = 原持有人已釋出，待他人選擇
         /// </summary>
@@ -398,10 +407,44 @@ namespace PharmaRosterLib
         public string is_from_release { get; set; } = "false";
 
         /// <summary>
+        /// 休假來源類型
+        /// RESERVED = 預留休
+        /// HOLE_FILL = 填洞休假
+        /// RELEASED = 釋出中的原始名額
+        /// </summary>
+        [Description("VARCHAR,20,NONE")]
+        public string dayoff_source_type { get; set; } = "";
+
+        [Description("VARCHAR,50,NONE")]
+        public string release_pool_guid { get; set; } = "";
+
+        /// <summary>
         /// 來源放假選項 GUID（哪一筆被釋出而來）
         /// </summary>
         [Description("VARCHAR,50,NONE")]
         public string source_option_guid { get; set; } = "";
+
+        /// <summary>
+        /// 是否為應休額度排休
+        /// true：此筆為使用應休額度所產生的排休
+        /// false：非應休額度排休（例如預留休、釋出、填洞）
+        /// </summary>
+        [Description("VARCHAR,5,NONE")]
+        public string is_quota_dayoff { get; set; } = "false";
+
+        /// <summary>
+        /// 應休額度消耗值
+        /// 例如：1 / 0.5 / 0
+        /// </summary>
+        [Description("VARCHAR,10,NONE")]
+        public string quota_used { get; set; } = "0";
+
+        /// <summary>
+        /// 應休排休類型
+        /// WEEKDAY_FULL / WEEKDAY_HALF_AM / WEEKDAY_HALF_PM / SATURDAY_HALF_AM / SUNDAY_FULL
+        /// </summary>
+        [Description("VARCHAR,30,NONE")]
+        public string quota_dayoff_type { get; set; } = "";
 
         [Description("DATETIME,20,NONE")]
         public string updated_at { get; set; }
@@ -447,7 +490,7 @@ namespace PharmaRosterLib
             selected_full = "false";
             selected_half_am = "false";
             selected_half_pm = "false";
-            date = DateTime.MinValue.ToDateTimeString();
+            //date = DateTime.MinValue.ToDateTimeString();
             
         }
 
@@ -622,7 +665,7 @@ namespace PharmaRosterLib
             if (selected_full == null) selected_full = "false";
             if (selected_half_am == null) selected_half_am = "false";
             if (selected_half_pm == null) selected_half_pm = "false";
-            if (selected_full.StringToBool() == false && selected_half_am.StringToBool() == false && selected_half_pm.StringToBool() == false) date = DateTime.MinValue.ToDateTimeString();
+            //if (selected_full.StringToBool() == false && selected_half_am.StringToBool() == false && selected_half_pm.StringToBool() == false) date = DateTime.MinValue.ToDateTimeString();
             // 系統強制FF → 不允許任何變更（保留系統設定）
             if (is_force_ff == "true")
             {
@@ -669,4 +712,537 @@ namespace PharmaRosterLib
         }
     }
 
+    [Description("dayoff_release_pool")]
+    public class DayOffReleasePoolClass
+    {
+        /// <summary>釋出池唯一識別碼</summary>
+        [Description("VARCHAR,50,PRIMARY")]
+        public string GUID { get; set; }
+
+        /// <summary>所屬表單 GUID</summary>
+        [Description("VARCHAR,50,INDEX")]
+        public string form_guid { get; set; }
+
+        /// <summary>來源 option GUID</summary>
+        [Description("VARCHAR,50,INDEX")]
+        public string source_option_guid { get; set; }
+
+        /// <summary>來源 item GUID</summary>
+        [Description("VARCHAR,50,INDEX")]
+        public string source_item_guid { get; set; }
+
+        /// <summary>來源 staff GUID</summary>
+        [Description("VARCHAR,50,INDEX")]
+        public string source_staff_guid { get; set; }
+
+        /// <summary>釋出日期</summary>
+        [Description("DATETIME,0,INDEX")]
+        public string date { get; set; }
+
+        /// <summary>釋出類型 FULL / HALF_AM / HALF_PM</summary>
+        [Description("VARCHAR,20,NONE")]
+        public string release_dayoff_type { get; set; }
+
+        /// <summary>可接手總名額</summary>
+        [Description("VARCHAR,10,NONE")]
+        public string total_slots { get; set; }
+
+        /// <summary>已接手名額</summary>
+        [Description("VARCHAR,10,NONE")]
+        public string claimed_slots { get; set; }
+
+        /// <summary>剩餘名額</summary>
+        [Description("VARCHAR,10,NONE")]
+        public string remaining_slots { get; set; }
+
+        /// <summary>狀態 OPEN / CLOSED / CANCELLED</summary>
+        [Description("VARCHAR,20,NONE")]
+        public string status { get; set; }
+
+        /// <summary>版本號（樂觀鎖）</summary>
+        [Description("VARCHAR,10,NONE")]
+        public string version_no { get; set; }
+
+        /// <summary>建立時間</summary>
+        [Description("DATETIME,0,NONE")]
+        public string created_at { get; set; }
+
+        /// <summary>更新時間</summary>
+        [Description("DATETIME,0,NONE")]
+        public string updated_at { get; set; }
+    }
+
+    public class HoleFillAvailableOptionDto
+    {
+        public string release_pool_guid { get; set; }
+        public string source_option_guid { get; set; }
+        public string source_item_guid { get; set; }
+        public string source_staff_guid { get; set; }
+        public string source_staff_id { get; set; }
+        public string source_staff_name { get; set; }
+        public string date { get; set; }
+        public string release_dayoff_type { get; set; }
+        public string total_slots { get; set; }
+        public string claimed_slots { get; set; }
+        public string remaining_slots { get; set; }
+        public string am_remaining_count { get; set; }
+        public string pm_remaining_count { get; set; }
+        public string can_claim { get; set; }
+        public string block_reason { get; set; }
+    }
+    public class StaffDayoffDailyStatusDto
+    {
+        /// <summary>日期</summary>
+        public string date { get; set; }
+
+        /// <summary>是否為週六</summary>
+        public string is_saturday { get; set; }
+
+        /// <summary>是否為週日</summary>
+        public string is_sunday { get; set; }
+
+        /// <summary>是否為週末</summary>
+        public string is_weekend { get; set; }
+
+        /// <summary>是否有排班</summary>
+        public string has_schedule { get; set; }
+
+        /// <summary>班別代碼 / shift_type</summary>
+        public string assigned_shift { get; set; }
+
+        /// <summary>休假來源類型 RESERVED / RELEASED_SOURCE / HOLE_FILL</summary>
+        public string dayoff_source_type { get; set; }
+
+        /// <summary>是否任選假</summary>
+        public string is_any_date { get; set; }
+
+        /// <summary>是否選擇全日休</summary>
+        public string selected_full { get; set; }
+
+        /// <summary>是否選擇上午半日休</summary>
+        public string selected_half_am { get; set; }
+
+        /// <summary>是否選擇下午半日休</summary>
+        public string selected_half_pm { get; set; }
+
+        /// <summary>是否已釋出</summary>
+        public string is_released { get; set; }
+
+        /// <summary>釋出類型 FULL / HALF_AM / HALF_PM</summary>
+        public string released_dayoff_type { get; set; }
+
+        /// <summary>是否為填洞休假（前端方便判斷）</summary>
+        public string is_hole_fill { get; set; }
+
+        /// <summary>是否計入週末次數</summary>
+        public string is_weekend_selected_counted { get; set; }
+
+        /// <summary>是否計入下午次數</summary>
+        public string is_pm_selected_counted { get; set; }
+
+        /// <summary>當日應休增量</summary>
+        public string quota_delta { get; set; }
+
+        /// <summary>當日已休增量</summary>
+        public string used_delta { get; set; }
+    }
+
+    /// <summary>
+    /// 單一人員應休額度統計結果
+    /// </summary>
+    public class GetStaffRemainingQuotaDayoffResponse
+    {
+        /// <summary>人員 GUID</summary>
+        public string staff_guid { get; set; }
+
+        /// <summary>應休總額度</summary>
+        public string quota_total { get; set; }
+
+        /// <summary>已使用應休額度</summary>
+        public string quota_used_total { get; set; }
+
+        /// <summary>剩餘應休額度</summary>
+        public string quota_remaining { get; set; }
+    }
+
+    public class StaffDayoffStatusSummaryDto
+    {
+        public string form_guid { get; set; }
+        public string form_name { get; set; }
+
+        public string staff_guid { get; set; }
+        public string staff_id { get; set; }
+        public string staff_name { get; set; }
+
+        /// <summary>應休總量</summary>
+        public string quota_dayoff { get; set; }
+
+        /// <summary>已休總量</summary>
+        public string used_dayoff { get; set; }
+
+        /// <summary>剩餘應休</summary>
+        public string remaining_dayoff { get; set; }
+
+        /// <summary>週六未排班次數</summary>
+        public string saturday_no_schedule_count { get; set; }
+
+        /// <summary>任選假次數（is_any_date=true）</summary>
+        public string any_date_count { get; set; }
+
+        /// <summary>釋出全日次數</summary>
+        public string release_full_count { get; set; }
+
+        /// <summary>釋出半日次數</summary>
+        public string release_half_count { get; set; }
+
+        /// <summary>週六/週日已休選擇次數（只算填洞休假）</summary>
+        public string weekend_selected_count { get; set; }
+
+        /// <summary>週六/週日已休選擇上限</summary>
+        public string weekend_selected_limit { get; set; }
+
+        /// <summary>下午休假選擇次數（只算填洞休假 + 單獨下午）</summary>
+        public string pm_selected_count { get; set; }
+
+        /// <summary>下午休假選擇上限</summary>
+        public string pm_selected_limit { get; set; }
+
+        public List<StaffDayoffDailyStatusDto> daily_status { get; set; } = new List<StaffDayoffDailyStatusDto>();
+    }
+
+    /// <summary>
+    /// 單一人員應休排休公平機制統計
+    /// </summary>
+    public class StaffQuotaDayoffRuleSummary
+    {
+        /// <summary>總應休額度</summary>
+        public string quota_total { get; set; }
+
+        /// <summary>已使用應休額度</summary>
+        public string quota_used_total { get; set; }
+
+        /// <summary>剩餘應休額度</summary>
+        public string quota_remaining { get; set; }
+
+        /// <summary>下午半日已使用次數（只算應休排休）</summary>
+        public string pm_half_used_count { get; set; }
+
+        /// <summary>週六已使用次數（只算應休排休）</summary>
+        public string saturday_used_count { get; set; }
+
+        /// <summary>下午半日上限次數</summary>
+        public string pm_half_limit_count { get; set; }
+
+        /// <summary>週六上限次數</summary>
+        public string saturday_limit_count { get; set; }
+
+        /// <summary>是否有額外週六次數</summary>
+        public string has_extra_saturday_limit { get; set; }
+    }
+
+    /// <summary>
+    /// 指定日期的人員休假狀態明細
+    /// </summary>
+    public class DayoffDatePersonStatusDto
+    {
+        /// <summary>人員 GUID</summary>
+        public string staff_guid { get; set; }
+
+        /// <summary>人員工號</summary>
+        public string staff_id { get; set; }
+
+        /// <summary>人員姓名</summary>
+        public string staff_name { get; set; }
+
+        /// <summary>
+        /// 狀態類型
+        /// RELEASED / SELECTED / RESERVED_NOT_SELECTED
+        /// </summary>
+        public string status_type { get; set; }
+
+        /// <summary>
+        /// 休假類型
+        /// FULL / HALF_AM / HALF_PM / NONE
+        /// </summary>
+        public string dayoff_type { get; set; }
+
+        /// <summary>是否任選假</summary>
+        public string is_any_date { get; set; }
+
+        /// <summary>休假來源類型 RESERVED / RELEASED_SOURCE / HOLE_FILL</summary>
+        public string dayoff_source_type { get; set; }
+
+        /// <summary>option GUID</summary>
+        public string option_guid { get; set; }
+
+        /// <summary>item GUID</summary>
+        public string item_guid { get; set; }
+    }
+
+    /// <summary>
+    /// 指定日期的休假狀況總覽
+    /// </summary>
+    public class DayoffDateStatusSummaryDto
+    {
+        public string form_guid { get; set; }
+        public string form_name { get; set; }
+        public string date { get; set; }
+
+        // =========================
+        // 當日休假額度
+        // =========================
+        public string am_max_dayoff_count { get; set; }
+        public string pm_max_dayoff_count { get; set; }
+
+        // =========================
+        // 當日已選休假統計
+        // =========================
+        public string selected_full_count { get; set; }
+        public string selected_half_am_count { get; set; }
+        public string selected_half_pm_count { get; set; }
+        public string selected_total_count { get; set; }
+
+        // =========================
+        // 當日釋出統計
+        // =========================
+        public string released_full_count { get; set; }
+        public string released_half_am_count { get; set; }
+        public string released_half_pm_count { get; set; }
+        public string released_total_count { get; set; }
+
+        // =========================
+        // 當日預留休未選統計
+        // =========================
+        public string reserved_not_selected_count { get; set; }
+
+        // =========================
+        // 當日明細
+        // =========================
+        public List<DayoffDatePersonStatusDto> released_list { get; set; } = new List<DayoffDatePersonStatusDto>();
+        public List<DayoffDatePersonStatusDto> selected_full_list { get; set; } = new List<DayoffDatePersonStatusDto>();
+        public List<DayoffDatePersonStatusDto> selected_half_am_list { get; set; } = new List<DayoffDatePersonStatusDto>();
+        public List<DayoffDatePersonStatusDto> selected_half_pm_list { get; set; } = new List<DayoffDatePersonStatusDto>();
+        public List<DayoffDatePersonStatusDto> reserved_not_selected_list { get; set; } = new List<DayoffDatePersonStatusDto>();
+    }
+
+    /// <summary>
+    /// 指定日期的 AM / PM 休假名額使用統計
+    /// </summary>
+    public class DayOffDateQuotaUsageSummary
+    {
+        public string date { get; set; }
+
+        /// <summary>上午可休上限</summary>
+        public string am_max_dayoff_count { get; set; }
+
+        /// <summary>下午可休上限</summary>
+        public string pm_max_dayoff_count { get; set; }
+
+        /// <summary>目前上午已使用名額</summary>
+        public string am_used_count { get; set; }
+
+        /// <summary>目前下午已使用名額</summary>
+        public string pm_used_count { get; set; }
+
+        /// <summary>上午剩餘名額</summary>
+        public string am_remaining_count { get; set; }
+
+        /// <summary>下午剩餘名額</summary>
+        public string pm_remaining_count { get; set; }
+    }
+
+    /// <summary>
+    /// 單一人員可用於應休排休的 option 資料
+    /// </summary>
+    public class StaffQuotaDayoffAvailableOptionDto
+    {
+        public string option_guid { get; set; }
+        public string item_guid { get; set; }
+        public string staff_guid { get; set; }
+        public string staff_id { get; set; }
+        public string staff_name { get; set; }
+        public string date { get; set; }
+        public string week_day { get; set; }
+        public string day_type { get; set; }
+
+        public string can_select_full { get; set; }
+        public string can_select_half_am { get; set; }
+        public string can_select_half_pm { get; set; }
+
+        public string is_quota_dayoff { get; set; }
+        public string selected_type { get; set; }
+        public string quota_used { get; set; }
+        public string quota_dayoff_type { get; set; }
+
+        public string can_cancel { get; set; }
+        public string can_select { get; set; }
+        public string block_reason { get; set; }
+
+        /// <summary>
+        /// 是否為虛擬候選資料。
+        /// true：DB 尚未建立 option。
+        /// false：DB 已有正式 option。
+        /// </summary>
+        public string is_virtual { get; set; }
+    }
+
+    /// <summary>
+    /// 單一人員應休排休可用 option 清單回傳
+    /// </summary>
+    public class StaffQuotaDayoffAvailableOptionsResponse
+    {
+        /// <summary>表單 GUID</summary>
+        public string form_guid { get; set; }
+
+        /// <summary>表單名稱</summary>
+        public string form_name { get; set; }
+
+        /// <summary>人員 GUID</summary>
+        public string staff_guid { get; set; }
+
+        /// <summary>人員工號</summary>
+        public string staff_id { get; set; }
+
+        /// <summary>人員姓名</summary>
+        public string staff_name { get; set; }
+
+        /// <summary>是否已完成個人預留休處理</summary>
+        public string is_reserved_completed { get; set; }
+
+        /// <summary>應休額度統計</summary>
+        public GetStaffRemainingQuotaDayoffResponse quota_summary { get; set; }
+
+        /// <summary>公平機制統計</summary>
+        public StaffQuotaDayoffRuleSummary rule_summary { get; set; }
+
+        /// <summary>可新增 / 可修改的 quota option 清單</summary>
+        public List<StaffQuotaDayoffAvailableOptionDto> available_options { get; set; } = new List<StaffQuotaDayoffAvailableOptionDto>();
+
+        /// <summary>已選的 quota option 清單（可取消）</summary>
+        public List<StaffQuotaDayoffAvailableOptionDto> selected_options { get; set; } = new List<StaffQuotaDayoffAvailableOptionDto>();
+    }
+
+    public class StaffQuotaDayoffCalendarBatchResponse
+{
+    public string form_guid { get; set; }
+    public string form_name { get; set; }
+
+    public string total_count { get; set; }
+    public string page { get; set; }
+    public string page_size { get; set; }
+    public string total_page { get; set; }
+
+    public List<string> dates { get; set; } = new List<string>();
+    public List<StaffQuotaDayoffCalendarRowDto> rows { get; set; } = new List<StaffQuotaDayoffCalendarRowDto>();
+}
+
+    public class StaffQuotaDayoffCalendarRowDto
+    {
+        public string staff_guid { get; set; }
+        public string staff_id { get; set; }
+        public string staff_name { get; set; }
+        public string staff_simple_name { get; set; }
+        public string position { get; set; }
+
+        public GetStaffRemainingQuotaDayoffResponse quota_summary { get; set; }
+        public StaffQuotaDayoffRuleSummary rule_summary { get; set; }
+
+        public List<StaffQuotaDayoffCalendarCellDto> cells { get; set; } = new List<StaffQuotaDayoffCalendarCellDto>();
+    }
+
+    public class StaffQuotaDayoffCalendarCellDto
+    {
+        public string date { get; set; }
+        public string week_day { get; set; }
+        public string day_type { get; set; }
+
+        public string option_guid { get; set; }
+        public string is_virtual { get; set; }
+
+        public string selected_type { get; set; }
+        public string quota_used { get; set; }
+        public string quota_dayoff_type { get; set; }
+
+        public string can_select_full { get; set; }
+        public string can_select_half_am { get; set; }
+        public string can_select_half_pm { get; set; }
+        public string can_select { get; set; }
+        public string can_cancel { get; set; }
+
+        public string block_reason { get; set; }
+
+        /// <summary>
+        /// SCHEDULE / FORCE_FF / RELEASED / QUOTA_SELECTED / AVAILABLE / BLOCKED / EMPTY
+        /// </summary>
+        public string display_type { get; set; }
+
+        public string display_text { get; set; }
+    }
+
+
+    /// <summary>
+    /// 應休排休總表回傳資料
+    /// </summary>
+    public class QuotaDayoffRosterOverviewResponse
+    {
+        public string form_guid { get; set; }
+        public string form_name { get; set; }
+
+        public string total_count { get; set; }
+        public string page { get; set; }
+        public string page_size { get; set; }
+        public string total_page { get; set; }
+
+        public List<string> dates { get; set; } = new List<string>();
+        public List<QuotaDayoffRosterStaffRowDto> rows { get; set; } = new List<QuotaDayoffRosterStaffRowDto>();
+    }
+
+    /// <summary>
+    /// 應休排休總表：單一人員列資料
+    /// </summary>
+    public class QuotaDayoffRosterStaffRowDto
+    {
+        public string staff_guid { get; set; }
+        public string staff_id { get; set; }
+        public string staff_name { get; set; }
+        public string staff_simple_name { get; set; }
+        public string position { get; set; }
+
+        public GetStaffRemainingQuotaDayoffResponse quota_summary { get; set; }
+        public StaffQuotaDayoffRuleSummary rule_summary { get; set; }
+
+        public List<QuotaDayoffRosterCellDto> cells { get; set; } = new List<QuotaDayoffRosterCellDto>();
+    }
+
+    /// <summary>
+    /// 應休排休總表：單一日期格資料
+    /// </summary>
+    public class QuotaDayoffRosterCellDto
+    {
+        public string date { get; set; }
+        public string week_day { get; set; }
+        public string day_type { get; set; }
+
+        public string option_guid { get; set; }
+        public string is_virtual { get; set; }
+
+        public string selected_type { get; set; }
+        public string quota_used { get; set; }
+        public string quota_dayoff_type { get; set; }
+
+        public string can_select_full { get; set; }
+        public string can_select_half_am { get; set; }
+        public string can_select_half_pm { get; set; }
+        public string can_select { get; set; }
+        public string can_cancel { get; set; }
+
+        public string block_reason { get; set; }
+
+        /// <summary>
+        /// SCHEDULE / FORCE_FF / RELEASED / HOLE_FILL / QUOTA_SELECTED / AVAILABLE / BLOCKED / EMPTY
+        /// </summary>
+        public string display_type { get; set; }
+
+        public string display_text { get; set; }
+    }
 }

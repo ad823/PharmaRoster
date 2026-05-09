@@ -2357,10 +2357,7 @@ namespace PharmaRosterAPI
                                         sheet.Rows[i].Cell[k].ColEnd = dataTable.Columns.Count - 1;
                                         sheet.Rows[i].Cell[k].CellStyle_index = style_none_index;
                                     }
-                                    //else
-                                    //{
-                                    //    sheet.RemoveCellValue(i, k);
-                                    //}
+             
        
                                 }
                             } 
@@ -3639,6 +3636,7 @@ namespace PharmaRosterAPI
             shiftGroupClass.Members = shiftGroupClass.Members.SortByWeightAndOrderIndex();
         }
      
+
         static private void AssignSwingShift(ShiftGroupClass shiftGroupClass, RequiredShiftClass req, WorkShiftRequirementClass wr,
             List<StaffScheduleHistoryClass> scheduleHistorys, List<AssignedShiftClass> assignedShifts_add,
             List<StaffScheduleHistoryClass> histories_add, List<string> validationErrors,
@@ -3662,8 +3660,6 @@ namespace PharmaRosterAPI
         {
             AssignShiftCore(shiftGroupClass, req, wr, scheduleHistorys, assignedShifts_add, histories_add, validationErrors, leaveRequests, shift_group_guid);
         }
-
-
 
         static private void AssignShiftCore(ShiftGroupClass shiftGroupClass, RequiredShiftClass req, WorkShiftRequirementClass wr,
            List<StaffScheduleHistoryClass> scheduleHistorys, List<AssignedShiftClass> assignedShifts_add,

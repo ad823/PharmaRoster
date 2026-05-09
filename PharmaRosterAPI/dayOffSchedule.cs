@@ -3,10 +3,16 @@ using Google.Protobuf.WellKnownTypes;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
+using MyOffice;
 using MySql.Data.MySqlClient;
+using NPOI.HSSF.Util;
 using NPOI.SS.Formula.Eval;
 using NPOI.SS.Formula.Functions;
+using NPOI.SS.UserModel;
+using NPOI.SS.Util;
+using NPOI.XSSF.UserModel;
 using PharmaRosterLib;
+using PharmaRosterLib.Helpers.ImportSchedule;
 using SQLUI;
 using System;
 using System.Collections.Generic;
@@ -20,6 +26,7 @@ using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 using System.Threading.Tasks;
 using static Microsoft.Extensions.Logging.EventSource.LoggingEventSource;
 
@@ -44,8 +51,9 @@ namespace PharmaRosterAPI
                 tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<DayOffGroupClass>());
                 tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<DayOffGroupMemberClass>());
                 tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<StaffDayOffOptionLogClass>());
+                tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<DayOffReleasePoolClass>());
 
-                
+
                 returnData.Code = 200;
                 returnData.Data = tables;
                 returnData.Result = "初始化 DayOffScheduleClass 資料表完成";
@@ -415,6 +423,559 @@ namespace PharmaRosterAPI
             }
         }
 
+        private static readonly SemaphoreSlim _calculateAvailableDayoffDatesSemaphore = new SemaphoreSlim(1, 1);
+
+        /// <summary>
+        /// 計算可用休假日期，並自動補入週日 FF 與特殊日 NH
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 用於依據指定排休表單 form_name，計算並產生人員可用休假資料。
+        ///
+        /// 原有功能：
+        /// 1. 依排班資料計算特殊規則休假 option。
+        /// 2. 依特殊日、擺班、假日、夜班等規則產生 StaffDayOffOptionClass。
+        /// 3. 週日若人員沒有排班，系統自動補入 FF 強制休假。
+        ///
+        /// 本版新增：
+        /// 1. 若日期為特殊日 / 國定假日，且人員當日沒有排班，系統自動補入 NH。
+        /// 2. NH 效果等同 FF，屬於強制休假一日。
+        /// 3. 若某日同時為週日與特殊日，優先補 NH。
+        ///
+        ///
+        /// ===============================
+        /// 【自動補休規則】
+        /// ===============================
+        /// 一、週日無排班
+        /// - 自動新增 DayOffScheduleItemClass
+        /// - selected_dayoff_type = "FF"
+        /// - 自動新增 StaffDayOffOptionClass
+        /// - selected_full = "true"
+        /// - is_force_ff = "true"
+        ///
+        /// 二、特殊日 / 國定假日無排班
+        /// - 自動新增 DayOffScheduleItemClass
+        /// - selected_dayoff_type = "NH"
+        /// - is_special_day = "true"
+        /// - 自動新增 StaffDayOffOptionClass
+        /// - selected_full = "true"
+        /// - is_force_ff = "true"
+        /// - dayoff_source_type = "NATIONAL_HOLIDAY"
+        ///
+        /// 三、特殊日與週日重疊
+        /// - 優先產生 NH
+        /// - 不再產生 FF
+        ///
+        /// 四、已存在 item 的日期
+        /// - 不再自動補 FF / NH
+        ///
+        /// 五、已被預留休建議日期占用
+        /// - 不再自動補 FF / NH
+        ///
+        ///
+        /// ===============================
+        /// 【傳入參數】ValueAry
+        /// ===============================
+        /// form_name = 排休表單名稱（必填）
+        /// simple    = true / false（選填）
+        ///
+        ///
+        /// ===============================
+        /// 【Request JSON 範例】
+        /// ===============================
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026-03",
+        ///     "simple=false"
+        ///   ]
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "calculate_available_dayoff_dates",
+        ///   "Result": "計算完成，新增 item 10 筆，新增 option 10 筆，更新 item 5 筆",
+        ///   "Data": {
+        ///     "GUID": "FORM_GUID",
+        ///     "form_name": "2026-03",
+        ///     "days": []
+        ///   }
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【錯誤回傳 JSON 範例】
+        /// ===============================
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "calculate_available_dayoff_dates",
+        ///   "Result": "找不到表單名稱(2026-03)"
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【注意事項】
+        /// ===============================
+        /// 1. 本 API 會寫入資料庫。
+        /// 2. 本 API 有單機 SemaphoreSlim 鎖，一次只允許一個使用者執行。
+        /// 3. NH 與 FF 都屬於強制休假，不應再被使用者手動選擇或釋出。
+        /// 4. 前端若要顯示 NH，可依：
+        ///    - item.selected_dayoff_type == "NH"
+        ///    - 或 option.dayoff_source_type == "NATIONAL_HOLIDAY"
+        ///    判斷。
+        /// </remarks>
+        /// <param name="returnData">returnData 物件，使用 ValueAry 傳入 form_name / simple。</param>
+        /// <returns>回傳計算後的排休表單資料。</returns>
+        [HttpPost("calculate_available_dayoff_dates")]
+        public string calculate_available_dayoff_dates([FromBody] returnData returnData)
+        {
+            init(returnData);
+            var timer = new MyTimerBasic();
+            returnData.Method = "calculate_available_dayoff_dates";
+
+            bool entered = _calculateAvailableDayoffDatesSemaphore.Wait(0);
+            if (!entered)
+            {
+                returnData.Code = -200;
+                returnData.Result = "目前已有使用者正在執行計算，請稍後再試";
+                returnData.TimeTaken = $"{timer}";
+                return returnData.JsonSerializationt();
+            }
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string simple = GetVal("simple");
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_specialDayClass = MethodClass.GetSQLControl<SpecialDayClass>();
+
+                object[] obj_dayOffScheduleForm = sql_dayOffScheduleFormClass
+                    .GetRowsByDefult(null, "form_name", form_name)
+                    .FirstOrDefault();
+
+                if (obj_dayOffScheduleForm == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass dayOffScheduleForm = obj_dayOffScheduleForm.SQLToClass<DayOffScheduleFormClass>();
+
+                List<object[]> obj_dayOffScheduleDays = sql_dayOffScheduleDayClass.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
+                List<object[]> obj_dayOffScheduleItem = sql_dayOffScheduleItemClass.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
+                List<object[]> obj_staffDayOffOption = sql_staffDayOffOptionClass.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
+
+                List<DayOffScheduleDayClass> dayOffScheduleDayClasses = obj_dayOffScheduleDays.SQLToClass<DayOffScheduleDayClass>();
+                List<DayOffScheduleItemClass> dayOffScheduleItemClasses = obj_dayOffScheduleItem.SQLToClass<DayOffScheduleItemClass>();
+                List<StaffDayOffOptionClass> staffDayOffOptionClasses = obj_staffDayOffOption.SQLToClass<StaffDayOffOptionClass>();
+
+                List<SpecialDayClass> specialDayClasses = sql_specialDayClass
+                    .GetAllRows(null)
+                    .SQLToClass<SpecialDayClass>();
+
+                HashSet<string> specialDaySet = specialDayClasses
+                    .Where(x => x != null && x.date.StringIsEmpty() == false)
+                    .Select(x => x.date.StringToDateTime().ToDateString('-'))
+                    .Where(x => x.StringIsEmpty() == false)
+                    .ToHashSet();
+
+                HashSet<string> existsOptionKeySet = staffDayOffOptionClasses
+                    .Where(x => x != null)
+                    .Select(x =>
+                    {
+                        string dt = x.date.StringToDateTime().ToDateString('-');
+                        return $"{x.item_guid}|{x.staff_guid}|{dt}";
+                    })
+                    .ToHashSet();
+
+                dayOffScheduleForm.days.LockAdd(dayOffScheduleDayClasses);
+
+                if (simple == true.ToString().ToLower())
+                {
+                    returnData.Code = 200;
+                    returnData.Data = dayOffScheduleForm;
+                    returnData.Result = "取得資料成功";
+                    return returnData.JsonSerializationt(true);
+                }
+
+                foreach (var day in dayOffScheduleDayClasses)
+                {
+                    day.items = dayOffScheduleItemClasses
+                        .Where(x => x.day_guid == day.GUID)
+                        .ToList();
+
+                    foreach (var item in day.items)
+                    {
+                        item.option = staffDayOffOptionClasses
+                            .Where(x => x.staff_guid == item.staff_guid && x.GUID == item.option_guid)
+                            .FirstOrDefault();
+                    }
+                }
+
+                Dictionary<string, List<DayOffScheduleItemClass>> staffItemDict = dayOffScheduleItemClasses
+                    .Where(x => x != null && x.staff_guid.StringIsEmpty() == false)
+                    .GroupBy(x => x.staff_guid)
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                Dictionary<string, DayOffScheduleItemClass> itemKeyIndex = dayOffScheduleItemClasses
+                    .Where(x => x != null && x.staff_guid.StringIsEmpty() == false && x.date.StringIsEmpty() == false)
+                    .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime().ToDateString('-')}")
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                Dictionary<string, List<DayOffScheduleItemClass>> itemIndex =
+                    staffItemDict
+                        .SelectMany(kv => kv.Value.Select(item => new { staffGuid = kv.Key, item }))
+                        .Where(x => x.item != null && x.item.date.StringIsEmpty() == false)
+                        .GroupBy(x => $"{x.staffGuid}|{x.item.date.StringToDateTime().ToDateString('-')}")
+                        .ToDictionary(g => g.Key, g => g.Select(x => x.item).ToList());
+
+                List<StaffDayOffOptionClass> staffDayOffOptions_add = new List<StaffDayOffOptionClass>();
+                List<DayOffScheduleItemClass> dayOffScheduleItems_add = new List<DayOffScheduleItemClass>();
+                List<DayOffScheduleItemClass> dayOffScheduleItems_update = new List<DayOffScheduleItemClass>();
+
+                string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+
+                HashSet<string> reservedSuggestedDateSet = new HashSet<string>();
+
+                void AddSuggestedDatesToReservedSet(StaffDayOffOptionClass opt)
+                {
+                    if (opt == null) return;
+                    if (opt.staff_guid.StringIsEmpty()) return;
+
+                    if (opt.suggested_dates_list != null)
+                    {
+                        foreach (var d in opt.suggested_dates_list)
+                        {
+                            DateTime dt = d.StringToDateTime();
+                            if (dt == DateTime.MinValue) continue;
+                            reservedSuggestedDateSet.Add($"{opt.staff_guid}|{dt.ToDateString('-')}");
+                        }
+                    }
+
+                    DateTime mainDt = opt.date.StringToDateTime();
+                    if (mainDt != DateTime.MinValue)
+                    {
+                        reservedSuggestedDateSet.Add($"{opt.staff_guid}|{mainDt.ToDateString('-')}");
+                    }
+                }
+
+                bool HasSchedule(DayOffScheduleItemClass item)
+                {
+                    if (item == null) return false;
+
+                    WorkShiftRequirementClass req = item.workShiftRequirement;
+                    if (req == null) return false;
+                    if (req.disabled) return false;
+                    if (req.RequiredCountBase <= 0) return false;
+
+                    return true;
+                }
+
+                StaffDayOffOptionClass BuildForceFFOption(DayOffScheduleItemClass item, DateTime dt)
+                {
+                    string offDate = dt.ToDateString('-');
+
+                    if (dt.DayOfWeek == DayOfWeek.Saturday) item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt);
+                    if (dt.DayOfWeek == DayOfWeek.Sunday) item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt);
+
+                    item.selected_dayoff_type = "FF";
+
+                    var option = new StaffDayOffOptionClass();
+                    option.GUID = Guid.NewGuid().ToString();
+                    option.form_guid = item.form_guid;
+                    option.item_guid = item.GUID;
+                    option.staff_guid = item.staff_guid;
+                    option.date = offDate;
+                    option.suggested_dates_list = new List<string>() { offDate };
+                    option.is_any_date = "false";
+                    option.assigned_shift = "OFF";
+
+                    if (dt.DayOfWeek == DayOfWeek.Saturday)
+                    {
+                        option.can_full = "false";
+                        option.can_half_am = "true";
+                        option.can_half_pm = "false";
+
+                        option.selected_full = "false";
+                        option.selected_half_am = "true";
+                        option.selected_half_pm = "false";
+                    }
+                    else
+                    {
+                        option.can_full = "true";
+                        option.can_half_am = "false";
+                        option.can_half_pm = "false";
+
+                        option.selected_full = "true";
+                        option.selected_half_am = "false";
+                        option.selected_half_pm = "false";
+                    }
+
+                    option.is_forbidden = "false";
+                    option.is_force_ff = "true";
+                    option.force_ff_at = now;
+                    option.updated_at = now;
+                    option.released_at = DateTime.MinValue.ToDateTimeString();
+
+                    if (option.dayoff_source_type.StringIsEmpty())
+                        option.dayoff_source_type = "FORCE_FF";
+
+                    return option;
+                }
+
+                StaffDayOffOptionClass BuildForceNHOption(DayOffScheduleItemClass item, DateTime dt)
+                {
+                    string offDate = dt.ToDateString('-');
+
+                    item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt);
+                    item.selected_dayoff_type = "NH";
+                    item.is_special_day = "true";
+
+                    var option = new StaffDayOffOptionClass();
+                    option.GUID = Guid.NewGuid().ToString();
+                    option.form_guid = item.form_guid;
+                    option.item_guid = item.GUID;
+                    option.staff_guid = item.staff_guid;
+                    option.date = offDate;
+                    option.suggested_dates_list = new List<string>() { offDate };
+                    option.is_any_date = "false";
+                    option.assigned_shift = "OFF";
+
+                    option.can_full = "true";
+                    option.can_half_am = "false";
+                    option.can_half_pm = "false";
+
+                    option.selected_full = "true";
+                    option.selected_half_am = "false";
+                    option.selected_half_pm = "false";
+
+                    option.is_forbidden = "false";
+                    option.is_force_ff = "true";
+                    option.force_ff_at = now;
+                    option.updated_at = now;
+                    option.released_at = DateTime.MinValue.ToDateTimeString();
+                    option.dayoff_source_type = "NATIONAL_HOLIDAY";
+
+                    return option;
+                }
+
+                var staffList = dayOffScheduleItemClasses
+                    .Where(x => x != null && x.staff_guid.StringIsEmpty() == false)
+                    .GroupBy(x => x.staff_guid)
+                    .Select(g => new
+                    {
+                        staff_guid = g.Key,
+                        staff_id = g.First().staff_id,
+                        staff_name = g.First().staff_name,
+                        staff_simple_name = g.First().staff_simple_name,
+                        position = g.First().position
+                    })
+                    .ToList();
+
+                foreach (var staffGuid in staffItemDict.Keys.ToList())
+                {
+                    var staffItems = staffItemDict[staffGuid]
+                        .Where(x => x != null && x.date.StringIsEmpty() == false)
+                        .OrderBy(x => x.date.StringToDateTime())
+                        .ToList();
+
+                    foreach (var item in staffItems)
+                    {
+                        if (item == null) continue;
+
+                        if (item.option_guid.StringIsEmpty() == false)
+                        {
+                            if (item.option != null) AddSuggestedDatesToReservedSet(item.option);
+                            continue;
+                        }
+
+                        if (!HasSchedule(item)) continue;
+
+                        StaffDayOffOptionClass staffDayOffOptionClass = null;
+
+                        if (staffDayOffOptionClass == null) staffDayOffOptionClass = BuildStaffDayOffSpecialDayOption(item, itemIndex);
+                        if (staffDayOffOptionClass == null) staffDayOffOptionClass = BuildStaffDayOffSwingOption(item, itemIndex);
+                        if (staffDayOffOptionClass == null) staffDayOffOptionClass = BuildStaffDayOffHolidayOption(item, itemIndex);
+                        if (staffDayOffOptionClass == null) staffDayOffOptionClass = BuildStaffDayOffMidnightOption(item, itemIndex);
+
+                        if (staffDayOffOptionClass == null) continue;
+
+                        if (staffDayOffOptionClass.force_ff_at.Check_Date_String() == false)
+                            staffDayOffOptionClass.force_ff_at = DateTime.MinValue.ToDateString();
+
+                        string optionDate = staffDayOffOptionClass.date.StringToDateTime().ToDateString('-');
+                        string optionKey = $"{staffDayOffOptionClass.item_guid}|{staffDayOffOptionClass.staff_guid}|{optionDate}";
+
+                        if (existsOptionKeySet.Contains(optionKey)) continue;
+
+                        existsOptionKeySet.Add(optionKey);
+
+                        item.option_guid = staffDayOffOptionClass.GUID;
+                        item.option = staffDayOffOptionClass;
+
+                        dayOffScheduleItems_update.Add(item);
+                        staffDayOffOptions_add.Add(staffDayOffOptionClass);
+                        AddSuggestedDatesToReservedSet(staffDayOffOptionClass);
+                    }
+                }
+
+                var forceOffDays = dayOffScheduleDayClasses
+                    .Where(d =>
+                    {
+                        DateTime dt = d.date.StringToDateTime();
+                        if (dt == DateTime.MinValue) return false;
+
+                        string dateKey = dt.ToDateString('-');
+
+                        return dt.DayOfWeek == DayOfWeek.Sunday || specialDaySet.Contains(dateKey);
+                    })
+                    .OrderBy(d => d.date.StringToDateTime())
+                    .ToList();
+
+                foreach (var day in forceOffDays)
+                {
+                    DateTime dayDt = day.date.StringToDateTime();
+                    if (dayDt == DateTime.MinValue) continue;
+
+                    string dt = dayDt.ToDateString('-');
+                    bool isSpecialDay = specialDaySet.Contains(dt);
+
+                    foreach (var staff in staffList)
+                    {
+                        if (staff.staff_guid.StringIsEmpty()) continue;
+
+                        string keyStaffDate = $"{staff.staff_guid}|{dt}";
+
+                        if (itemKeyIndex.ContainsKey(keyStaffDate)) continue;
+                        if (reservedSuggestedDateSet.Contains(keyStaffDate)) continue;
+
+                        var newItem = new DayOffScheduleItemClass();
+                        newItem.GUID = Guid.NewGuid().ToString();
+                        newItem.form_guid = dayOffScheduleForm.GUID;
+                        newItem.day_guid = day.GUID;
+                        newItem.option_guid = "";
+                        newItem.date = dt;
+                        newItem.is_special_day = isSpecialDay ? "true" : "false";
+
+                        newItem.staff_guid = staff.staff_guid;
+                        newItem.staff_id = staff.staff_id;
+                        newItem.staff_name = staff.staff_name;
+                        newItem.staff_simple_name = staff.staff_simple_name;
+                        newItem.position = staff.position;
+
+                        newItem.shift_requirement = BuildHolidayOffShiftRequirementJson(dayDt);
+                        newItem.created_at = now;
+                        newItem.updated_at = now;
+
+                        StaffDayOffOptionClass forceOpt;
+
+                        if (isSpecialDay)
+                        {
+                            forceOpt = BuildForceNHOption(newItem, dayDt);
+                        }
+                        else
+                        {
+                            forceOpt = BuildForceFFOption(newItem, dayDt);
+                        }
+
+                        newItem.option_guid = forceOpt.GUID;
+                        newItem.option = forceOpt;
+
+                        dayOffScheduleItems_add.Add(newItem);
+                        staffDayOffOptions_add.Add(forceOpt);
+
+                        dayOffScheduleItemClasses.Add(newItem);
+                        staffDayOffOptionClasses.Add(forceOpt);
+                        day.items.Add(newItem);
+
+                        itemKeyIndex[keyStaffDate] = newItem;
+
+                        if (!staffItemDict.ContainsKey(staff.staff_guid))
+                            staffItemDict[staff.staff_guid] = new List<DayOffScheduleItemClass>();
+
+                        staffItemDict[staff.staff_guid].Add(newItem);
+
+                        if (!itemIndex.ContainsKey(keyStaffDate))
+                            itemIndex[keyStaffDate] = new List<DayOffScheduleItemClass>();
+
+                        itemIndex[keyStaffDate].Add(newItem);
+
+                        existsOptionKeySet.Add($"{newItem.GUID}|{newItem.staff_guid}|{dt}");
+                    }
+                }
+
+                if (dayOffScheduleItems_add.Count > 0)
+                {
+                    sql_dayOffScheduleItemClass.AddRows(null, dayOffScheduleItems_add.ClassToSQL<DayOffScheduleItemClass>());
+                }
+
+                if (staffDayOffOptions_add.Count > 0)
+                {
+                    sql_staffDayOffOptionClass.AddRows(null, staffDayOffOptions_add.ClassToSQL<StaffDayOffOptionClass>());
+                }
+
+                if (dayOffScheduleItems_update.Count > 0)
+                {
+                    sql_dayOffScheduleItemClass.UpdateByDefulteExtra(null, dayOffScheduleItems_update.ClassToSQL<DayOffScheduleItemClass>());
+                }
+
+                foreach (var day in dayOffScheduleDayClasses)
+                {
+                    day.items = dayOffScheduleItemClasses
+                        .Where(x => x.day_guid == day.GUID)
+                        .OrderBy(x => x.date.StringToDateTime())
+                        .ThenBy(x => x.staff_id)
+                        .ToList();
+
+                    foreach (var item in day.items)
+                    {
+                        item.option = staffDayOffOptionClasses
+                            .Where(x => x.staff_guid == item.staff_guid && x.GUID == item.option_guid)
+                            .FirstOrDefault();
+                    }
+                }
+
+                dayOffScheduleForm.days = dayOffScheduleDayClasses
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                returnData.Code = 200;
+                returnData.Data = dayOffScheduleForm;
+                returnData.Result =
+                    $"計算完成，新增 item {dayOffScheduleItems_add.Count} 筆，新增 option {staffDayOffOptions_add.Count} 筆，更新 item {dayOffScheduleItems_update.Count} 筆";
+                returnData.TimeTaken = $"{timer}";
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                returnData.TimeTaken = $"{timer}";
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                if (entered)
+                {
+                    _calculateAvailableDayoffDatesSemaphore.Release();
+                }
+            }
+        }
+
         /// <summary>
         /// 刪除指定的排休表單（delete_form）
         /// </summary>
@@ -509,6 +1070,8 @@ namespace PharmaRosterAPI
                 var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
                 var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffReleasePool = MethodClass.GetSQLControl<DayOffReleasePoolClass>();
 
                 object[] obj_dayOffScheduleForm = sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
 
@@ -523,15 +1086,18 @@ namespace PharmaRosterAPI
 
                 List<object[]> obj_dayOffScheduleDays = sql_dayOffScheduleDayClass.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
                 List<object[]> obj_dayOffScheduleItem = sql_dayOffScheduleItemClass.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
+                List<object[]> obj_staffDayOffOption = sql_staffDayOffOptionClass.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
+                List<object[]> obj_dayOffReleasePool = sql_dayOffReleasePool.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
 
                 sql_dayOffScheduleFormClass.DeleteExtra(null, obj_dayOffScheduleForm);
                 sql_dayOffScheduleDayClass.DeleteExtra(null, obj_dayOffScheduleDays);
                 sql_dayOffScheduleItemClass.DeleteExtra(null, obj_dayOffScheduleItem);
-
+                sql_staffDayOffOptionClass.DeleteExtra(null, obj_staffDayOffOption);
+                sql_dayOffReleasePool.DeleteExtra(null, obj_dayOffReleasePool);
                 // === 3. 成功回傳 ===
                 returnData.Code = 200;
                 returnData.Data = dayOffScheduleForm;
-                returnData.Result = $"刪除資料成功,共{obj_dayOffScheduleDays.Count}個日期,共{obj_dayOffScheduleItem.Count}筆Items";
+                returnData.Result = $"刪除資料成功,共{obj_dayOffScheduleDays.Count}個日期,共{obj_dayOffScheduleItem.Count}筆Items,共{obj_staffDayOffOption.Count}筆Options";
                 return returnData.JsonSerializationt(true);
             }
             catch (Exception ex)
@@ -795,6 +1361,8 @@ namespace PharmaRosterAPI
             }
         }
 
+    
+
         /// <summary>
         /// 查詢排休表單「任選一天放假」總天數統計（get_any_date_quota_summary）
         /// </summary>
@@ -948,588 +1516,6 @@ namespace PharmaRosterAPI
             finally
             {
                 returnData.Result += timer.ToString();
-            }
-        }
-
-        /// <summary>
-        /// 計算排休表單可用放假日，並建立系統預設/特殊規則選項（含：週日無排班 → 自動建立 FF 強制休假）。
-        /// </summary>
-        /// <remarks>
-        /// ===============================
-        /// 【API 說明】
-        /// ===============================
-        /// 本 API 用於排休表單 DayOffScheduleForm 的「放假選項(option)」計算與補齊，並依規則自動新增 StaffDayOffOption：
-        ///
-        /// (A) 讀取表單資料：
-        /// 1) 依 form_name 取得對應的 DayOffScheduleFormClass
-        /// 2) 讀取該表單的 days、items、staff_dayoff_option
-        ///
-        /// (B) 若 simple=true：
-        /// - 直接回傳表單資料（不計算、不新增 option）
-        ///
-        /// (C) 若 simple=false（預設）：
-        /// - 針對每個 item 計算/建立特殊規則 option（例如：特定日、補休、假日、小夜/大夜規則等）
-        /// - ✅ 新增功能：若週日無排班 → 自動建立 FF 強制休假 option
-        ///
-        /// ===============================
-        /// 【新增功能：週日無排班 → 自動設定 FF 強制休假】
-        /// ===============================
-        /// 規則：
-        /// 1) 僅處理星期日 (DayOfWeek.Sunday)
-        /// 2) 若該 item「有排班需求」→ 不新增 FF
-        /// 3) 若該 item「已存在 option」（不論是不是 FF）→ 不覆蓋、不修改
-        /// 4) 僅在「該 item 完全沒有 option」時新增 FF option
-        ///
-        /// 【排班需求判定（依 WorkShiftRequirementClass）】
-        /// - item.workShiftRequirement == null → 視為無排班
-        /// - req.disabled == true → 視為無排班
-        /// - req.RequiredCountBase <= 0 → 視為無排班
-        /// - req.shift_type 為空 → 視為無排班
-        /// - 其餘情況 → 視為有排班（不新增 FF）
-        ///
-        /// 【FF option 寫入內容】
-        /// - assigned_shift = "OFF"
-        /// - can_full = true、can_half_am = false、can_half_pm = false
-        /// - selected_full = true（強制整天假）
-        /// - is_force_ff = true（新增欄位）
-        /// - force_ff_at = now（新增欄位）
-        ///
-        /// ===============================
-        /// 【重要防呆：週日 item 已有 option 不覆蓋】
-        /// ===============================
-        /// 若 item 已存在 option（包含但不限於：
-        /// - item.option != null 且 item.option.GUID 有值
-        /// - item.option_guid 不為空
-        /// - DB 已存在 option key
-        /// ）
-        /// 則本 API 不會覆蓋該 item（即使該 option 不是 FF）
-        ///
-        /// ===============================
-        /// 【URL】
-        /// ===============================
-        /// POST /phar_roster_api/dayOffSchedule/calculate_available_dayoff_dates
-        ///
-        /// ===============================
-        /// 【Method】
-        /// ===============================
-        /// POST
-        ///
-        /// ===============================
-        /// 【傳入參數】(ValueAry)
-        /// ===============================
-        /// form_name = 排休表單名稱（必填）
-        /// simple    = 是否簡化回傳（選填）
-        ///            - true  : 僅回傳 form 及 days/items，不進行 option 新增計算
-        ///            - false : 進行 option 計算與新增（預設）
-        ///
-        /// ===============================
-        /// 【JSON 傳入範例】
-        /// ===============================
-        /// (1) 正常計算（預設）
-        /// {
-        ///   "ValueAry": [
-        ///     "form_name=2026年01月排休表"
-        ///   ]
-        /// }
-        ///
-        /// (2) 簡化回傳（不新增 option）
-        /// {
-        ///   "ValueAry": [
-        ///     "form_name=2026年01月排休表",
-        ///     "simple=true"
-        ///   ]
-        /// }
-        ///
-        /// ===============================
-        /// 【資料新增規則】
-        /// ===============================
-        /// 本 API 會新增 StaffDayOffOptionClass 至 staff_dayoff_option 資料表：
-        /// 1) 特殊規則 option（由下列 builder 產生）
-        ///    - BuildStaffDayOffSpecialDayOption()
-        ///    - BuildStaffDayOffSwingOption()
-        ///    - BuildStaffDayOffHolidayOption()
-        ///    - BuildStaffDayOffMidnightOption()
-        /// 2) ✅ 週日無排班強制休假 FF option
-        ///
-        /// 並同步更新對應 DayOffScheduleItemClass.option_guid
-        ///
-        /// ===============================
-        /// 【避免重複新增機制】
-        /// ===============================
-        /// 使用 existsOptionKeySet HashSet 做唯一性控管：
-        /// UniqueKey = item_guid|staff_guid|yyyy-MM-dd
-        /// - DB 已存在 option → 不新增
-        /// - 同一次執行產生的 option → 不重複新增
-        ///
-        /// ===============================
-        /// 【成功回傳 JSON 範例】
-        /// ===============================
-        /// {
-        ///   "Code": 200,
-        ///   "Method": "calculate_available_dayoff_dates",
-        ///   "Result": "新增排休資料成功,共12筆(含週日無排班→FF強制)",
-        ///   "Data": {
-        ///     "GUID": "FORM_GUID_001",
-        ///     "form_name": "2026年01月排休表",
-        ///     "days": [
-        ///       {
-        ///         "GUID": "DAY_GUID_001",
-        ///         "items": [
-        ///           {
-        ///             "GUID": "ITEM_GUID_001",
-        ///             "staff_guid": "STAFF_GUID_001",
-        ///             "date": "2026-01-04",
-        ///             "option_guid": "OPTION_GUID_FF_001"
-        ///           }
-        ///         ]
-        ///       }
-        ///     ]
-        ///   }
-        /// }
-        ///
-        /// ===============================
-        /// 【失敗回傳 JSON 範例】
-        /// ===============================
-        /// (1) 找不到表單
-        /// {
-        ///   "Code": -200,
-        ///   "Method": "calculate_available_dayoff_dates",
-        ///   "Result": "找不到表單名稱(2026年01月排休表)",
-        ///   "Data": null
-        /// }
-        ///
-        /// (2) 例外錯誤
-        /// {
-        ///   "Code": -200,
-        ///   "Method": "calculate_available_dayoff_dates",
-        ///   "Result": "Exception message ...",
-        ///   "Data": null
-        /// }
-        ///
-        /// ===============================
-        /// 【備註】
-        /// ===============================
-        /// 1) 本 API 只會新增 option，不會刪除既有 option。
-        /// 2) 週日 FF 僅在 item 完全沒有 option 才新增，避免覆蓋人工選擇或既有規則。
-        /// 3) 若你未來要允許「週日 option 存在但選擇為空」時仍強制 FF，可以再擴充判斷條件。
-        /// </remarks>
-        /// <param name="returnData">
-        /// returnData 物件，主要使用 ValueAry 作為參數輸入。
-        /// </param>
-        /// <returns>
-        /// 回傳 returnData.JsonSerializationt() 的 JSON 字串。
-        /// </returns>
-        /// <summary>
-        /// 計算排休表單可用放假日，並建立系統預設/特殊規則選項。
-        /// </summary>
-        /// <remarks>
-        /// 規則：
-        /// 1. 先計算特殊規則建議休假日
-        /// 2. 再補週六、週日 item
-        /// 3. 僅對「無 item 且未被特殊規則指定建議休假日」的週六/週日補 item
-        /// 4. 補出的 item 同時建立 FF option
-        /// </remarks>
-        /// <param name="returnData">returnData 物件，主要使用 ValueAry 作為參數輸入。</param>
-        /// <returns>回傳 returnData.JsonSerializationt() 的 JSON 字串。</returns>
-        [HttpPost("calculate_available_dayoff_dates")]
-        public string calculate_available_dayoff_dates([FromBody] returnData returnData)
-        {
-            init(returnData);
-            var timer = new MyTimerBasic();
-            returnData.Method = "calculate_available_dayoff_dates";
-            try
-            {
-                string GetVal(string key) =>
-                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
-                    ?.Split('=')[1];
-
-                string form_name = GetVal("form_name");
-                string simple = GetVal("simple");
-
-                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
-                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
-                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
-                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
-
-                object[] obj_dayOffScheduleForm = sql_dayOffScheduleFormClass
-                    .GetRowsByDefult(null, "form_name", form_name)
-                    .FirstOrDefault();
-
-                if (obj_dayOffScheduleForm == null)
-                {
-                    returnData.Code = -200;
-                    returnData.Result = $"找不到表單名稱({form_name})";
-                    return returnData.JsonSerializationt();
-                }
-
-                DayOffScheduleFormClass dayOffScheduleForm = obj_dayOffScheduleForm.SQLToClass<DayOffScheduleFormClass>();
-
-                List<object[]> obj_dayOffScheduleDays = sql_dayOffScheduleDayClass.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
-                List<object[]> obj_dayOffScheduleItem = sql_dayOffScheduleItemClass.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
-                List<object[]> obj_staffDayOffOption = sql_staffDayOffOptionClass.GetRowsByDefult(null, "form_guid", dayOffScheduleForm.GUID);
-
-                List<DayOffScheduleDayClass> dayOffScheduleDayClasses = obj_dayOffScheduleDays.SQLToClass<DayOffScheduleDayClass>();
-                List<DayOffScheduleItemClass> dayOffScheduleItemClasses = obj_dayOffScheduleItem.SQLToClass<DayOffScheduleItemClass>();
-                List<StaffDayOffOptionClass> staffDayOffOptionClasses = obj_staffDayOffOption.SQLToClass<StaffDayOffOptionClass>();
-
-                HashSet<string> existsOptionKeySet = staffDayOffOptionClasses
-                    .Where(x => x != null)
-                    .Select(x =>
-                    {
-                        string dt = x.date.StringToDateTime().ToDateString('-');
-                        return $"{x.item_guid}|{x.staff_guid}|{dt}";
-                    })
-                    .ToHashSet();
-
-                dayOffScheduleForm.days.LockAdd(dayOffScheduleDayClasses);
-
-                if (simple == true.ToString().ToLower())
-                {
-                    returnData.Code = 200;
-                    returnData.Data = dayOffScheduleForm;
-                    returnData.Result = "取得資料成功";
-                    return returnData.JsonSerializationt(true);
-                }
-
-                // =========================================================
-                // 先綁既有 option
-                // =========================================================
-                foreach (var day in dayOffScheduleDayClasses)
-                {
-                    day.items = dayOffScheduleItemClasses
-                        .Where(x => x.day_guid == day.GUID)
-                        .ToList();
-
-                    foreach (var item in day.items)
-                    {
-                        item.option = staffDayOffOptionClasses
-                            .Where(x => x.staff_guid == item.staff_guid && x.GUID == item.option_guid)
-                            .FirstOrDefault();
-                    }
-                }
-
-                // =========================================================
-                // 建立索引
-                // =========================================================
-                Dictionary<string, List<DayOffScheduleItemClass>> staffItemDict = dayOffScheduleItemClasses
-                    .Where(x => x != null && x.staff_guid.StringIsEmpty() == false)
-                    .GroupBy(x => x.staff_guid)
-                    .ToDictionary(g => g.Key, g => g.ToList());
-
-                Dictionary<string, DayOffScheduleItemClass> itemKeyIndex = dayOffScheduleItemClasses
-                    .Where(x => x != null && x.staff_guid.StringIsEmpty() == false && x.date.StringIsEmpty() == false)
-                    .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime().ToDateString('-')}")
-                    .ToDictionary(g => g.Key, g => g.First());
-
-                Dictionary<string, List<DayOffScheduleItemClass>> itemIndex =
-                    staffItemDict
-                        .SelectMany(kv => kv.Value.Select(item => new { staffGuid = kv.Key, item }))
-                        .Where(x => x.item != null && x.item.date.StringIsEmpty() == false)
-                        .GroupBy(x => $"{x.staffGuid}|{x.item.date.StringToDateTime().ToDateString('-')}")
-                        .ToDictionary(g => g.Key, g => g.Select(x => x.item).ToList());
-
-                List<StaffDayOffOptionClass> staffDayOffOptions_add = new List<StaffDayOffOptionClass>();
-                List<DayOffScheduleItemClass> dayOffScheduleItems_add = new List<DayOffScheduleItemClass>();
-                List<DayOffScheduleItemClass> dayOffScheduleItems_update = new List<DayOffScheduleItemClass>();
-
-                string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-
-                // =========================================================
-                // 特殊規則已保留日期集合
-                // key = staff_guid|yyyy-MM-dd
-                // =========================================================
-                HashSet<string> reservedSuggestedDateSet = new HashSet<string>();
-
-                void AddSuggestedDatesToReservedSet(StaffDayOffOptionClass opt)
-                {
-                    if (opt == null) return;
-                    if (opt.staff_guid.StringIsEmpty()) return;
-
-                    if (opt.suggested_dates_list != null)
-                    {
-                        foreach (var d in opt.suggested_dates_list)
-                        {
-                            DateTime dt = d.StringToDateTime();
-                            if (dt == DateTime.MinValue) continue;
-                            reservedSuggestedDateSet.Add($"{opt.staff_guid}|{dt.ToDateString('-')}");
-                        }
-                    }
-
-                    DateTime mainDt = opt.date.StringToDateTime();
-                    if (mainDt != DateTime.MinValue)
-                    {
-                        reservedSuggestedDateSet.Add($"{opt.staff_guid}|{mainDt.ToDateString('-')}");
-                    }
-                }
-
-                bool HasSchedule(DayOffScheduleItemClass item)
-                {
-                    if (item == null) return false;
-
-                    WorkShiftRequirementClass req = item.workShiftRequirement;
-                    if (req == null) return false;
-                    if (req.disabled) return false;
-                    if (req.RequiredCountBase <= 0) return false;
-                    if (req.shift_type.StringIsEmpty()) return false;
-
-                    return true;
-                }
-
-             
-
-                StaffDayOffOptionClass BuildForceFFOption(DayOffScheduleItemClass item, DateTime dt)
-                {
-                    string offDate = dt.ToDateString('-');
-                    if (dt.DayOfWeek == DayOfWeek.Saturday) item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt);
-                    if (dt.DayOfWeek == DayOfWeek.Sunday) item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt);
-                    item.selected_dayoff_type = "FF"; // 若你前端有使用，可留；不需要也可空字串
-                                                      // FF 一律整天假        
-
-                    var option = new StaffDayOffOptionClass();
-                    option.GUID = Guid.NewGuid().ToString();
-                    option.form_guid = item.form_guid;
-                    option.item_guid = item.GUID;
-                    option.staff_guid = item.staff_guid;
-                    option.date = offDate;
-                    option.suggested_dates_list = new List<string>() { offDate };
-                    option.is_any_date = "false";
-                    option.assigned_shift = "OFF";
-
-                    // 週六半天、週日全天
-                    if (dt.DayOfWeek == DayOfWeek.Saturday)
-                    {
-                        option.can_full = "false";
-                        option.can_half_am = "true";
-                        option.can_half_pm = "false";
-                        option.selected_full = "false";
-                        option.selected_half_am = "true";
-                        option.selected_half_pm = "false";
-                        option.is_force_ff = "false";
-                    }
-                    else
-                    {
-                        option.can_full = "true";
-                        option.can_half_am = "false";
-                        option.can_half_pm = "false";
-                        option.selected_full = "true";
-                        option.selected_half_am = "false";
-                        option.selected_half_pm = "false";
-                        option.is_force_ff = "true";
-                    }
-
-                    option.is_forbidden = "false";
-                    option.is_force_ff = "true";
-                    option.force_ff_at = now;
-                    option.updated_at = now;
-                    option.released_at = DateTime.MinValue.ToDateTimeString();
-                    return option;
-                }
-
-                // =========================================================
-                // staff 清單
-                // =========================================================
-                var staffList = dayOffScheduleItemClasses
-                    .Where(x => x != null && x.staff_guid.StringIsEmpty() == false)
-                    .GroupBy(x => x.staff_guid)
-                    .Select(g => new
-                    {
-                        staff_guid = g.Key,
-                        staff_id = g.First().staff_id,
-                        staff_name = g.First().staff_name,
-                        staff_simple_name = g.First().staff_simple_name,
-                        position = g.First().position
-                    })
-                    .ToList();
-
-                // =========================================================
-                // 先跑特殊規則
-                // =========================================================
-                foreach (var staffGuid in staffItemDict.Keys.ToList())
-                {
-                    var staffItems = staffItemDict[staffGuid]
-                        .Where(x => x != null && x.date.StringIsEmpty() == false)
-                        .OrderBy(x => x.date.StringToDateTime())
-                        .ToList();
-                
-                    foreach (var item in staffItems)
-                    {
-                        //if (staffGuid != "06faaad9-6ee2-4034-98fd-602710a288b4")
-                        //{
-                        //    continue;
-                        //}
-                        if (item == null) continue;
-
-                        if (item.option_guid.StringIsEmpty() == false)
-                        {
-                            if (item.option != null) AddSuggestedDatesToReservedSet(item.option);
-                            continue;
-                        }
-
-                        if (!HasSchedule(item)) continue;
-
-                        StaffDayOffOptionClass staffDayOffOptionClass = null;
-
-                        if (staffDayOffOptionClass == null) staffDayOffOptionClass = BuildStaffDayOffSpecialDayOption(item, itemIndex);
-                        if (staffDayOffOptionClass == null) staffDayOffOptionClass = BuildStaffDayOffSwingOption(item, itemIndex);
-                        if (staffDayOffOptionClass == null) staffDayOffOptionClass = BuildStaffDayOffHolidayOption(item, itemIndex);
-                        if (staffDayOffOptionClass == null) staffDayOffOptionClass = BuildStaffDayOffMidnightOption(item, itemIndex);
-
-                        if (staffDayOffOptionClass == null) continue;
-
-                        if (staffDayOffOptionClass.force_ff_at.Check_Date_String() == false) staffDayOffOptionClass.force_ff_at = DateTime.MinValue.ToDateString();
-
-                        string optionDate = staffDayOffOptionClass.date.StringToDateTime().ToDateString('-');
-                        string optionKey = $"{staffDayOffOptionClass.item_guid}|{staffDayOffOptionClass.staff_guid}|{optionDate}";
-
-                        if (existsOptionKeySet.Contains(optionKey)) continue;
-
-                        existsOptionKeySet.Add(optionKey);
-
-                        item.option_guid = staffDayOffOptionClass.GUID;
-                        item.option = staffDayOffOptionClass;
-
-                        dayOffScheduleItems_update.Add(item);
-                        staffDayOffOptions_add.Add(staffDayOffOptionClass);
-                        AddSuggestedDatesToReservedSet(staffDayOffOptionClass);
-                    }
-                }
-
-                // =========================================================
-                // 再補週六、週日 item + FF option
-                // 條件：
-                // 1. 該人該日沒有 item
-                // 2. 該人該日沒有被特殊規則指定建議休假日
-                // =========================================================
-                var holidayDays = dayOffScheduleDayClasses
-                    .Where(d =>
-                    {
-                        DateTime dt = d.date.StringToDateTime();
-                        return dt != DateTime.MinValue &&
-                               (dt.DayOfWeek == DayOfWeek.Saturday || dt.DayOfWeek == DayOfWeek.Sunday);
-                    })
-                    .OrderBy(d => d.date.StringToDateTime())
-                    .ToList();
-
-                foreach (var day in holidayDays)
-                {
-                    DateTime dayDt = day.date.StringToDateTime();
-                    if (dayDt == DateTime.MinValue) continue;
-
-                    string dt = dayDt.ToDateString('-');
-
-                    foreach (var staff in staffList)
-                    {
-                        if (staff.staff_guid.StringIsEmpty()) continue;
-
-                        string keyStaffDate = $"{staff.staff_guid}|{dt}";
-                        //if (staff.staff_guid != "06faaad9-6ee2-4034-98fd-602710a288b4")
-                        //{
-                        //    continue;
-                        //}
-                        // 已有 item -> 不補
-                        if (itemKeyIndex.ContainsKey(keyStaffDate)) continue;
-
-                        // 已被特殊規則指定建議休假日 -> 不補
-                        if (reservedSuggestedDateSet.Contains(keyStaffDate)) continue;
-
-                        var newItem = new DayOffScheduleItemClass();
-                        newItem.GUID = Guid.NewGuid().ToString();
-                        newItem.form_guid = dayOffScheduleForm.GUID;
-                        newItem.day_guid = day.GUID;
-                        newItem.option_guid = "";
-                        newItem.date = dt;
-                        newItem.is_special_day = "false";
-
-                        newItem.staff_guid = staff.staff_guid;
-                        newItem.staff_id = staff.staff_id;
-                        newItem.staff_name = staff.staff_name;
-                        newItem.staff_simple_name = staff.staff_simple_name;
-                        newItem.position = staff.position;
-
-                        newItem.shift_requirement = BuildHolidayOffShiftRequirementJson(dayDt);
-                        newItem.created_at = now;
-                        newItem.updated_at = now;
-
-                        var ffOpt = BuildForceFFOption(newItem, dayDt);
-
-                        newItem.option_guid = ffOpt.GUID;
-                        newItem.option = ffOpt;
-
-                        dayOffScheduleItems_add.Add(newItem);
-                        staffDayOffOptions_add.Add(ffOpt);
-
-                        dayOffScheduleItemClasses.Add(newItem);
-                        staffDayOffOptionClasses.Add(ffOpt);
-                        day.items.Add(newItem);
-
-                        itemKeyIndex[keyStaffDate] = newItem;
-
-                        if (!staffItemDict.ContainsKey(staff.staff_guid))
-                            staffItemDict[staff.staff_guid] = new List<DayOffScheduleItemClass>();
-                        staffItemDict[staff.staff_guid].Add(newItem);
-
-                        if (!itemIndex.ContainsKey(keyStaffDate))
-                            itemIndex[keyStaffDate] = new List<DayOffScheduleItemClass>();
-                        itemIndex[keyStaffDate].Add(newItem);
-
-                        existsOptionKeySet.Add($"{newItem.GUID}|{newItem.staff_guid}|{dt}");
-                    }
-                }
-
-                // =========================================================
-                // DB 寫入
-                // =========================================================
-                if (dayOffScheduleItems_add.Count > 0)
-                {
-                    sql_dayOffScheduleItemClass.AddRows(null, dayOffScheduleItems_add.ClassToSQL<DayOffScheduleItemClass>());
-                }
-
-                if (staffDayOffOptions_add.Count > 0)
-                {
-                    sql_staffDayOffOptionClass.AddRows(null, staffDayOffOptions_add.ClassToSQL<StaffDayOffOptionClass>());
-                }
-
-                if (dayOffScheduleItems_update.Count > 0)
-                {
-                    sql_dayOffScheduleItemClass.UpdateByDefulteExtra(null, dayOffScheduleItems_update.ClassToSQL<DayOffScheduleItemClass>());
-                }
-
-                // =========================================================
-                // 回傳前重新綁定
-                // =========================================================
-                foreach (var day in dayOffScheduleDayClasses)
-                {
-                    day.items = dayOffScheduleItemClasses
-                        .Where(x => x.day_guid == day.GUID)
-                        .OrderBy(x => x.date.StringToDateTime())
-                        .ThenBy(x => x.staff_id)
-                        .ToList();
-
-                    foreach (var item in day.items)
-                    {
-                        item.option = staffDayOffOptionClasses
-                            .Where(x => x.staff_guid == item.staff_guid && x.GUID == item.option_guid)
-                            .FirstOrDefault();
-                    }
-                }
-
-                dayOffScheduleForm.days = dayOffScheduleDayClasses
-                    .OrderBy(x => x.date.StringToDateTime())
-                    .ToList();
-
-                returnData.Code = 200;
-                returnData.Data = dayOffScheduleForm;
-                returnData.Result =
-                    $"計算完成，新增 item {dayOffScheduleItems_add.Count} 筆，新增 option {staffDayOffOptions_add.Count} 筆，更新 item {dayOffScheduleItems_update.Count} 筆";
-                returnData.TimeTaken = $"{timer}";
-                return returnData.JsonSerializationt(true);
-            }
-            catch (Exception ex)
-            {
-                returnData.Code = -200;
-                returnData.Result = ex.Message;
-                returnData.TimeTaken = $"{timer}";
-                return returnData.JsonSerializationt();
             }
         }
 
@@ -1976,7 +1962,1051 @@ namespace PharmaRosterAPI
             }
         }
 
-    
+        /// <summary>
+        /// 查詢單一人員於指定排休表單中的排休狀況摘要（公平機制版 get_staff_dayoff_status_summary）
+        /// </summary>
+        /// <remarks>
+        /// ## 🌐 API URL
+        /// POST /phar_roster_api/dayOffSchedule/get_staff_dayoff_status_summary
+        ///
+        /// ## 📘 功能說明
+        /// 查詢單一人員於指定排休表單中的：
+        /// 1. 應休 / 已休 / 剩餘應休
+        /// 2. 週六未排班次數
+        /// 3. 任選假次數
+        /// 4. 釋出全日 / 半日次數
+        /// 5. 週六排休已使用次數與上限（公平機制）
+        /// 6. 下午半日排休已使用次數與上限（公平機制）
+        /// 7. 每日明細
+        ///
+        /// ## 同步最新規則
+        /// 1. 選擇休假本身不影響應休
+        /// 2. 應休只看：
+        ///    - 每個週六未上班 +0.5
+        ///    - is_any_date = true +1
+        ///    - 釋出 FULL +1
+        ///    - 釋出 HALF_AM / HALF_PM +0.5
+        ///
+        /// 3. 已休只看：
+        ///    - selected_full = true → +1
+        ///    - selected_half_am = true → +0.5
+        ///    - selected_half_pm = true → +0.5
+        ///
+        /// 4. 公平機制統計：
+        ///    - pm_selected_count 只算 is_quota_dayoff=true 且 quota_dayoff_type=WEEKDAY_HALF_PM
+        ///    - weekend_selected_count 只算 is_quota_dayoff=true 且 quota_dayoff_type=SATURDAY_HALF_AM
+        ///    - pm_selected_limit 預設 2
+        ///    - weekend_selected_limit 預設 1；若有週六/週日補休來源（暫以週末釋出判定）則 +1
+        /// </remarks>
+        /// <param name="returnData">returnData 物件，主要使用 ValueAry 作為參數輸入。</param>
+        /// <returns>回傳 JSON 字串。</returns>
+        [HttpPost("get_staff_dayoff_status_summary")]
+        public string get_staff_dayoff_status_summary([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "/phar_roster_api/dayOffSchedule/get_staff_dayoff_status_summary";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                    .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_guid = GetVal("staff_guid");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_name";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (staff_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 staff_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass
+                    .GetRowsByDefult(null, "form_name", form_name)
+                    .FirstOrDefault();
+
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                List<DayOffScheduleDayClass> days = sql_dayOffScheduleDayClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                List<DayOffScheduleItemClass> allItems = sql_dayOffScheduleItemClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>();
+
+                List<StaffDayOffOptionClass> allOptions = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>();
+
+                List<DayOffScheduleItemClass> items = allItems
+                    .Where(x => x.staff_guid == staff_guid)
+                    .ToList();
+
+                List<StaffDayOffOptionClass> options = allOptions
+                    .Where(x => x.staff_guid == staff_guid)
+                    .ToList();
+
+                Dictionary<string, DayOffScheduleItemClass> itemByDate = items
+                    .Where(x => x != null && x.date.StringIsEmpty() == false)
+                    .GroupBy(x => x.date.StringToDateTime().ToDateString('-'))
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                Dictionary<string, StaffDayOffOptionClass> optionByDate = options
+                    .Where(x => x != null && x.date.StringIsEmpty() == false)
+                    .GroupBy(x => x.date.StringToDateTime().ToDateString('-'))
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                bool HasSchedule(DayOffScheduleItemClass item)
+                {
+                    if (item == null) return false;
+
+                    WorkShiftRequirementClass req = item.workShiftRequirement;
+                    if (req == null) return false;
+                    if (req.disabled) return false;
+                    if (req.RequiredCountBase <= 0) return false;
+                    if (req.shift_type.StringIsEmpty()) return false;
+
+                    return true;
+                }
+
+                double quota = 0;
+                double used = 0;
+
+                int saturdayNoScheduleCount = 0;
+                int anyDateCount = 0;
+                int releaseFullCount = 0;
+                int releaseHalfCount = 0;
+                int weekendSelectedCount = 0;
+                int weekendSelectedLimit = 1;
+                int pmSelectedCount = 0;
+                int pmSelectedLimit = 2;
+
+                StaffDayoffStatusSummaryDto dto = new StaffDayoffStatusSummaryDto();
+                dto.form_guid = form.GUID;
+                dto.form_name = form.form_name;
+                dto.staff_guid = staff_guid;
+
+                var firstItem = items.FirstOrDefault();
+                if (firstItem != null)
+                {
+                    dto.staff_id = firstItem.staff_id;
+                    dto.staff_name = firstItem.staff_name;
+                }
+
+                // ============================================
+                // 額外週六上限（簡化版）
+                // 若有週六/週日釋出來源，週六上限 +1
+                // ============================================
+                foreach (var op in options)
+                {
+                    if (op == null) continue;
+
+                    DateTime opDate = op.date.StringToDateTime();
+                    if (opDate == DateTime.MinValue) continue;
+
+                    if ((op.is_released == "true" || op.is_any_date == "true") &&
+                        (opDate.DayOfWeek == DayOfWeek.Saturday || opDate.DayOfWeek == DayOfWeek.Sunday))
+                    {
+                        weekendSelectedLimit += 1;
+                        break; // 目前規則只額外 +1 次
+                    }
+                }
+
+                foreach (var day in days)
+                {
+                    string dt = day.date.StringToDateTime().ToDateString('-');
+
+                    itemByDate.TryGetValue(dt, out var item);
+                    optionByDate.TryGetValue(dt, out var option);
+
+                    DateTime dayDate = day.date.StringToDateTime();
+                    bool isSaturday = dayDate.DayOfWeek == DayOfWeek.Saturday;
+                    bool isSunday = dayDate.DayOfWeek == DayOfWeek.Sunday;
+                    bool isWeekend = isSaturday || isSunday;
+                    bool hasSchedule = HasSchedule(item);
+
+                    double quotaDelta = 0;
+                    double usedDelta = 0;
+
+                    string sourceType = "";
+                    string isAnyDate = "false";
+                    string selectedFull = "false";
+                    string selectedHalfAm = "false";
+                    string selectedHalfPm = "false";
+                    string isReleased = "false";
+                    string releasedDayoffType = "";
+                    string isHoleFill = "false";
+                    string isWeekendSelectedCounted = "false";
+                    string isPmSelectedCounted = "false";
+
+                    if (option != null)
+                    {
+                        option.NormalizeSelection();
+
+                        sourceType = option.dayoff_source_type ?? "";
+                        isAnyDate = option.is_any_date ?? "false";
+                        selectedFull = option.selected_full ?? "false";
+                        selectedHalfAm = option.selected_half_am ?? "false";
+                        selectedHalfPm = option.selected_half_pm ?? "false";
+                        isReleased = option.is_released ?? "false";
+                        releasedDayoffType = option.released_dayoff_type ?? "";
+                        isHoleFill = ((sourceType ?? "").Trim().ToUpper() == "HOLE_FILL") ? "true" : "false";
+
+                        // 1. is_any_date = true → 應休 +1
+                        if (option.is_any_date == "true")
+                        {
+                            quotaDelta += 1;
+                            anyDateCount++;
+                        }
+
+                        // 2. 釋出 → 依 released_dayoff_type 計算應休
+                        if (option.is_released == "true")
+                        {
+                            string releasedType = (option.released_dayoff_type ?? "").Trim().ToUpper();
+
+                            if (releasedType == "FULL")
+                            {
+                                quotaDelta += 1;
+                                releaseFullCount++;
+                            }
+                            else if (releasedType == "HALF_AM" || releasedType == "HALF_PM")
+                            {
+                                quotaDelta += 0.5;
+                                releaseHalfCount++;
+                            }
+                        }
+
+                        // 3. 已休只看選擇（修正 bug：selected_full 要算 usedDelta）
+                        if (option.selected_full == "true")
+                        {
+                            if (option.is_force_ff != "true")
+                            {
+                                //usedDelta += 1;
+                            }
+                        }
+                        else
+                        {
+                            if(option.dayoff_source_type != "RELEASED_SOURCE")
+                            {
+                                if (option.selected_half_am == "true") usedDelta += 0.5;
+                                if (option.selected_half_pm == "true") usedDelta += 0.5;
+                            }
+                         
+                        }
+
+                        // 4. 公平機制：週六已使用次數
+                        if (option.is_quota_dayoff == "true" &&
+                            (option.quota_dayoff_type ?? "").Trim().ToUpper() == "SATURDAY_HALF_AM")
+                        {
+                            weekendSelectedCount++;
+                            if (isSaturday) isWeekendSelectedCounted = "true";
+                        }
+
+                        // 5. 公平機制：下午半日已使用次數
+                        if (option.is_quota_dayoff == "true" &&
+                            (option.quota_dayoff_type ?? "").Trim().ToUpper() == "WEEKDAY_HALF_PM")
+                        {
+                            pmSelectedCount++;
+                            isPmSelectedCounted = "true";
+                        }
+                    }
+
+                    // 6. 每個週六未上班 → 應休 +0.5
+                    if (isSaturday && !hasSchedule)
+                    {
+                        quotaDelta += 0.5;
+                        saturdayNoScheduleCount++;
+                    }
+
+                    quota += quotaDelta;
+                    used += usedDelta;
+
+                    StaffDayoffDailyStatusDto daily = new StaffDayoffDailyStatusDto();
+                    daily.date = dt;
+                    daily.is_saturday = isSaturday ? "true" : "false";
+                    daily.is_sunday = isSunday ? "true" : "false";
+                    daily.is_weekend = isWeekend ? "true" : "false";
+                    daily.has_schedule = hasSchedule ? "true" : "false";
+                    daily.assigned_shift = item?.workShiftRequirement?.shift_type ?? "";
+                    daily.dayoff_source_type = sourceType;
+                    daily.is_any_date = isAnyDate;
+                    daily.selected_full = selectedFull;
+                    daily.selected_half_am = selectedHalfAm;
+                    daily.selected_half_pm = selectedHalfPm;
+                    daily.is_released = isReleased;
+                    daily.released_dayoff_type = releasedDayoffType;
+                    daily.is_hole_fill = isHoleFill;
+                    daily.is_weekend_selected_counted = isWeekendSelectedCounted;
+                    daily.is_pm_selected_counted = isPmSelectedCounted;
+                    daily.quota_delta = quotaDelta.ToString("0.##");
+                    daily.used_delta = usedDelta.ToString("0.##");
+
+                    dto.daily_status.Add(daily);
+                }
+
+                dto.quota_dayoff = quota.ToString("0.##");
+                dto.used_dayoff = used.ToString("0.##");
+                dto.remaining_dayoff = (quota - used).ToString("0.##");
+                dto.saturday_no_schedule_count = saturdayNoScheduleCount.ToString();
+                dto.any_date_count = anyDateCount.ToString();
+                dto.release_full_count = releaseFullCount.ToString();
+                dto.release_half_count = releaseHalfCount.ToString();
+                dto.weekend_selected_count = weekendSelectedCount.ToString();
+                dto.weekend_selected_limit = weekendSelectedLimit.ToString();
+                dto.pm_selected_count = pmSelectedCount.ToString();
+                dto.pm_selected_limit = pmSelectedLimit.ToString();
+
+                returnData.Code = 200;
+                returnData.Result = "取得人員排休狀況成功";
+                returnData.Data = dto;
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 查詢指定表單中某一天的休假整體狀況（get_dayoff_date_status_summary）
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 用於依據指定表單名稱(form_name)與日期(date)，
+        /// 查詢該日的整體休假狀況，包含：
+        /// 1. 當日休假額度（上午 / 下午）
+        /// 2. 當日有多少人及有誰釋出額度
+        /// 3. 當日有多少人及有誰已選擇休假（上午 / 下午 / 整日）
+        /// 4. 當日有多少人及有誰有預留休但尚未選擇
+        ///
+        ///
+        /// ===============================
+        /// 【主要用途】
+        /// ===============================
+        /// 1. 前端顯示某日休假全貌
+        /// 2. 主管檢視當日排休 / 釋出 / 預留狀況
+        /// 3. 作為當日排休檢視頁、看板或彈窗資料來源
+        ///
+        ///
+        /// ===============================
+        /// 【資料來源】
+        /// ===============================
+        /// 1. DayOffScheduleDayClass
+        ///    - am_max_dayoff_count
+        ///    - pm_max_dayoff_count
+        ///
+        /// 2. StaffDayOffOptionClass
+        ///    - is_released
+        ///    - released_dayoff_type
+        ///    - selected_full
+        ///    - selected_half_am
+        ///    - selected_half_pm
+        ///    - is_any_date
+        ///    - suggested_dates_list
+        ///    - dayoff_source_type
+        ///
+        /// 3. DayOffScheduleItemClass
+        ///    - staff_guid
+        ///    - staff_id
+        ///    - staff_name
+        ///
+        ///
+        /// ===============================
+        /// 【統計規則】
+        /// ===============================
+        /// 一、當日休假額度
+        /// - 上午休假額度 = DayOffScheduleDayClass.am_max_dayoff_count
+        /// - 下午休假額度 = DayOffScheduleDayClass.pm_max_dayoff_count
+        ///
+        /// 二、當日釋出額度
+        /// 符合以下條件者列入：
+        /// - option.date = 指定日期
+        /// - option.is_released = "true"
+        ///
+        /// 並依 released_dayoff_type 分類：
+        /// - FULL
+        /// - HALF_AM
+        /// - HALF_PM
+        ///
+        /// 三、當日已選休假
+        /// 符合以下條件者列入：
+        /// - option.date = 指定日期
+        /// - selected_full / selected_half_am / selected_half_pm 為 true
+        ///
+        /// 四、當日有預留休但尚未選擇
+        /// 符合以下條件者列入：
+        /// 1. option.date = 指定日期
+        ///    或 suggested_dates_list 包含指定日期
+        /// 2. option.dayoff_source_type != "HOLE_FILL"
+        /// 3. option.selected_full != "true"
+        /// 4. option.selected_half_am != "true"
+        /// 5. option.selected_half_pm != "true"
+        /// 6. option.is_released != "true"
+        ///
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/get_dayoff_date_status_summary
+        ///
+        /// ===============================
+        /// 【Method】
+        /// ===============================
+        /// POST
+        ///
+        /// ===============================
+        /// 【傳入參數】(ValueAry)
+        /// ===============================
+        /// form_name = 排休表單名稱（必填）
+        /// date      = 指定日期（必填，yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss）
+        ///
+        ///
+        /// ===============================
+        /// 【JSON 傳入範例】
+        /// ===============================
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "date=2026-03-10"
+        ///   ]
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "get_dayoff_date_status_summary",
+        ///   "Result": "取得當日休假狀況成功",
+        ///   "Data": {
+        ///     "form_guid": "FORM_GUID_001",
+        ///     "form_name": "2026年03月排休表",
+        ///     "date": "2026-03-10",
+        ///     "am_max_dayoff_count": "3",
+        ///     "pm_max_dayoff_count": "3",
+        ///     "selected_full_count": "1",
+        ///     "selected_half_am_count": "2",
+        ///     "selected_half_pm_count": "1",
+        ///     "selected_total_count": "4",
+        ///     "released_full_count": "0",
+        ///     "released_half_am_count": "1",
+        ///     "released_half_pm_count": "2",
+        ///     "released_total_count": "3",
+        ///     "reserved_not_selected_count": "5",
+        ///     "released_list": [
+        ///       {
+        ///         "staff_guid": "STAFF_GUID_001",
+        ///         "staff_id": "P001",
+        ///         "staff_name": "王小明",
+        ///         "status_type": "RELEASED",
+        ///         "dayoff_type": "HALF_PM",
+        ///         "is_any_date": "false",
+        ///         "dayoff_source_type": "RELEASED_SOURCE",
+        ///         "option_guid": "OPTION_GUID_001",
+        ///         "item_guid": "ITEM_GUID_001"
+        ///       }
+        ///     ],
+        ///     "selected_full_list": [],
+        ///     "selected_half_am_list": [],
+        ///     "selected_half_pm_list": [],
+        ///     "reserved_not_selected_list": []
+        ///   }
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【失敗回傳 JSON 範例】
+        /// ===============================
+        /// (1) 未提供參數
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_dayoff_date_status_summary",
+        ///   "Result": "未提供 date",
+        ///   "Data": null
+        /// }
+        ///
+        /// (2) 找不到表單
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_dayoff_date_status_summary",
+        ///   "Result": "找不到表單名稱(2026年03月排休表)",
+        ///   "Data": null
+        /// }
+        ///
+        /// (3) 找不到日期
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_dayoff_date_status_summary",
+        ///   "Result": "找不到日期資料(2026-03-10)",
+        ///   "Data": null
+        /// }
+        ///
+        /// (4) 例外錯誤
+        /// {
+        ///   "Code": -500,
+        ///   "Method": "get_dayoff_date_status_summary",
+        ///   "Result": "Exception message ...",
+        ///   "Data": null
+        /// }
+        /// </remarks>
+        /// <param name="returnData">returnData 物件，主要使用 ValueAry 作為參數輸入。</param>
+        /// <returns>回傳 JSON 字串。</returns>
+        [HttpPost("get_dayoff_date_status_summary")]
+        public string get_dayoff_date_status_summary([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "get_dayoff_date_status_summary";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                    .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string date = GetVal("date");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_name";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (date.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 date";
+                    return returnData.JsonSerializationt();
+                }
+
+                DateTime targetDateTime = date.StringToDateTime();
+                if (targetDateTime == DateTime.MinValue)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"日期格式錯誤({date})";
+                    return returnData.JsonSerializationt();
+                }
+
+                string targetDate = targetDateTime.ToDateString('-');
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass
+                    .GetRowsByDefult(null, "form_name", form_name)
+                    .FirstOrDefault();
+
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                DayOffScheduleDayClass day = sql_dayOffScheduleDayClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .Where(x => x.date.StringToDateTime().ToDateString('-') == targetDate)
+                    .FirstOrDefault();
+
+                if (day == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到日期資料({targetDate})";
+                    return returnData.JsonSerializationt();
+                }
+
+                List<DayOffScheduleItemClass> items = sql_dayOffScheduleItemClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>();
+
+                List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>();
+
+                // 方便從 option 找回 staff_id / staff_name
+                Dictionary<string, DayOffScheduleItemClass> itemByGuid = items
+                    .Where(x => x != null && x.GUID.StringIsEmpty() == false)
+                    .GroupBy(x => x.GUID)
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                Dictionary<string, DayOffScheduleItemClass> firstItemByStaffGuid = items
+                    .Where(x => x != null && x.staff_guid.StringIsEmpty() == false)
+                    .GroupBy(x => x.staff_guid)
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                DayoffDatePersonStatusDto BuildPersonDto(StaffDayOffOptionClass option, string statusType, string dayoffType)
+                {
+                    DayOffScheduleItemClass item = null;
+
+                    if (option != null && !option.item_guid.StringIsEmpty() && itemByGuid.ContainsKey(option.item_guid))
+                    {
+                        item = itemByGuid[option.item_guid];
+                    }
+                    else if (option != null && !option.staff_guid.StringIsEmpty() && firstItemByStaffGuid.ContainsKey(option.staff_guid))
+                    {
+                        item = firstItemByStaffGuid[option.staff_guid];
+                    }
+
+                    return new DayoffDatePersonStatusDto
+                    {
+                        staff_guid = option?.staff_guid ?? "",
+                        staff_id = item?.staff_id ?? "",
+                        staff_name = item?.staff_name ?? "",
+                        status_type = statusType,
+                        dayoff_type = dayoffType,
+                        is_any_date = option?.is_any_date ?? "false",
+                        dayoff_source_type = option?.dayoff_source_type ?? "",
+                        option_guid = option?.GUID ?? "",
+                        item_guid = option?.item_guid ?? ""
+                    };
+                }
+
+                bool MatchTargetDate(StaffDayOffOptionClass option, string dt)
+                {
+                    if (option == null) return false;
+
+                    if (option.date.StringToDateTime().ToDateString('-') == dt) return true;
+
+                    if (option.suggested_dates_list != null &&
+                        option.suggested_dates_list.Any(x => x.StringToDateTime().ToDateString('-') == dt))
+                    {
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                DayoffDateStatusSummaryDto dto = new DayoffDateStatusSummaryDto();
+                dto.form_guid = form.GUID;
+                dto.form_name = form.form_name;
+                dto.date = targetDate;
+                dto.am_max_dayoff_count = day.am_max_dayoff_count ?? "0";
+                dto.pm_max_dayoff_count = day.pm_max_dayoff_count ?? "0";
+                if (dto.reserved_not_selected_count.StringIsEmpty()) dto.reserved_not_selected_count = "0";
+                if (dto.selected_full_count.StringIsEmpty()) dto.selected_full_count = "0";
+                if (dto.selected_half_am_count.StringIsEmpty()) dto.selected_half_am_count = "0";
+                if (dto.selected_half_pm_count.StringIsEmpty()) dto.selected_half_pm_count = "0";
+
+                if (dto.released_full_count.StringIsEmpty()) dto.released_full_count = "0";
+                if (dto.released_half_am_count.StringIsEmpty()) dto.released_half_am_count = "0";
+                if (dto.released_half_pm_count.StringIsEmpty()) dto.released_half_pm_count = "0";
+                foreach (var option in options)
+                {
+                    if (option == null) continue;
+
+                    option.NormalizeSelection();
+
+                    bool matchMainDate = option.date.StringToDateTime().ToDateString('-') == targetDate;
+                    bool matchReserveDate = MatchTargetDate(option, targetDate);
+
+                    // =========================
+                    // 1. 釋出名單
+                    // =========================
+                    if (matchMainDate && option.is_released == "true")
+                    {
+                        string releasedType = (option.released_dayoff_type ?? "").Trim().ToUpper();
+
+                        if (releasedType == "FULL")
+                        {
+                            dto.released_full_count = (dto.released_full_count.StringToInt32() + 1).ToString();
+                            dto.released_list.Add(BuildPersonDto(option, "RELEASED", "FULL"));
+                        }
+                        else if (releasedType == "HALF_AM")
+                        {
+                            dto.released_half_am_count = (dto.released_half_am_count.StringToInt32() + 1).ToString();
+                            dto.released_list.Add(BuildPersonDto(option, "RELEASED", "HALF_AM"));
+                        }
+                        else if (releasedType == "HALF_PM")
+                        {
+                            dto.released_half_pm_count = (dto.released_half_pm_count.StringToInt32() + 1).ToString();
+                            dto.released_list.Add(BuildPersonDto(option, "RELEASED", "HALF_PM"));
+                        }
+                    }
+
+                    // =========================
+                    // 2. 已選休假名單
+                    // =========================
+                    if (matchMainDate && option.selected_full == "true")
+                    {
+                        dto.selected_full_count = (dto.selected_full_count.StringToInt32() + 1).ToString();
+                        dto.selected_full_list.Add(BuildPersonDto(option, "SELECTED", "FULL"));
+                    }
+
+                    if (matchMainDate && option.selected_half_am == "true")
+                    {
+                        dto.selected_half_am_count = (dto.selected_half_am_count.StringToInt32() + 1).ToString();
+                        dto.selected_half_am_list.Add(BuildPersonDto(option, "SELECTED", "HALF_AM"));
+                    }
+
+                    if (matchMainDate && option.selected_half_pm == "true")
+                    {
+                        dto.selected_half_pm_count = (dto.selected_half_pm_count.StringToInt32() + 1).ToString();
+                        dto.selected_half_pm_list.Add(BuildPersonDto(option, "SELECTED", "HALF_PM"));
+                    }
+
+                    // =========================
+                    // 3. 預留休未選名單
+                    // =========================
+                    bool noSelection =
+                        option.selected_full != "true" &&
+                        option.selected_half_am != "true" &&
+                        option.selected_half_pm != "true";
+
+                    bool isReserved =
+                        (option.dayoff_source_type ?? "").Trim().ToUpper() != "HOLE_FILL";
+
+                    bool notReleased = option.is_released != "true";
+
+                    if (matchReserveDate && noSelection && isReserved && notReleased)
+                    {
+              
+                        dto.reserved_not_selected_count = (dto.reserved_not_selected_count.StringToInt32() + 1).ToString();
+                        dto.reserved_not_selected_list.Add(BuildPersonDto(option, "RESERVED_NOT_SELECTED", "NONE"));
+                    }
+                }
+
+                dto.selected_total_count =
+                    (dto.selected_full_count.StringToInt32() +
+                     dto.selected_half_am_count.StringToInt32() +
+                     dto.selected_half_pm_count.StringToInt32()).ToString();
+
+                dto.released_total_count =
+                    (dto.released_full_count.StringToInt32() +
+                     dto.released_half_am_count.StringToInt32() +
+                     dto.released_half_pm_count.StringToInt32()).ToString();
+
+                returnData.Code = 200;
+                returnData.Result = "取得當日休假狀況成功";
+                returnData.Data = dto;
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.TimeTaken = timer.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 統一處理休假選擇與釋出控制的操作入口（最終版 set_staff_dayoff_and_release_action）
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// ✅ 功能說明
+        /// ===============================
+        /// 本 API 為前端統一操作入口，用於整合：
+        /// 1. 選擇整日休假
+        /// 2. 選擇上午半日休假
+        /// 3. 選擇下午半日休假
+        /// 4. 取消休假選擇
+        /// 5. 手動整日釋出
+        /// 6. 取消釋出
+        ///
+        /// 前端只需呼叫本 API，依 action_type 分派到對應內部功能。
+        ///
+        ///
+        /// ===============================
+        /// ✅ action_type 定義
+        /// ===============================
+        /// - SELECT_FULL
+        /// - SELECT_HALF_AM
+        /// - SELECT_HALF_PM
+        /// - CANCEL_SELECTION
+        /// - RELEASE_FULL
+        /// - CANCEL_RELEASE
+        ///
+        ///
+        /// ===============================
+        /// ✅ 規則說明
+        /// ===============================
+        /// 1. SELECT_FULL
+        ///    - 呼叫 set_staff_dayoff_selection(select_type=FULL)
+        ///
+        /// 2. SELECT_HALF_AM
+        ///    - 呼叫 set_staff_dayoff_selection(select_type=HALF_AM)
+        ///    - 後端會自動釋出 HALF_PM
+        ///
+        /// 3. SELECT_HALF_PM
+        ///    - 呼叫 set_staff_dayoff_selection(select_type=HALF_PM)
+        ///    - 後端會自動釋出 HALF_AM
+        ///
+        /// 4. CANCEL_SELECTION
+        ///    - 呼叫 set_staff_dayoff_selection(select_type=CANCEL)
+        ///
+        /// 5. RELEASE_FULL
+        ///    - 呼叫 release_dayoff_option(release_dayoff_type=FULL)
+        ///
+        /// 6. CANCEL_RELEASE
+        ///    - 呼叫 cancel_release_dayoff_option()
+        ///
+        ///
+        /// ===============================
+        /// ✅ 業務限制
+        /// ===============================
+        /// - 不允許「完全不選休，直接釋出半日」
+        /// - 半日釋出只能由 SELECT_HALF_AM / SELECT_HALF_PM 自動產生
+        /// - 若要手動開洞，只允許整日釋出（RELEASE_FULL）
+        ///
+        ///
+        /// ===============================
+        /// ✅ 參數（returnData.ValueAry）
+        /// ===============================
+        /// - form_name   : 表單名稱（必填）
+        /// - option_guid : option GUID（必填）
+        /// - action_type : 操作類型（必填）
+        /// - staff_id    : 選休假 / 取消休假時必填
+        /// - off_date    : SELECT_FULL / SELECT_HALF_AM / SELECT_HALF_PM 時必填
+        ///
+        ///
+        /// ===============================
+        /// ✅ Request JSON 範例
+        /// ===============================
+        /// (1) 選整日
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "option_guid=OPTION_GUID_001",
+        ///     "action_type=SELECT_FULL",
+        ///     "off_date=2026-03-05"
+        ///   ]
+        /// }
+        ///
+        /// (2) 選上午
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "option_guid=OPTION_GUID_001",
+        ///     "action_type=SELECT_HALF_AM",
+        ///     "off_date=2026-03-05"
+        ///   ]
+        /// }
+        ///
+        /// (3) 取消休假
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "option_guid=OPTION_GUID_001",
+        ///     "action_type=CANCEL_SELECTION"
+        ///   ]
+        /// }
+        ///
+        /// (4) 手動整日釋出
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "option_guid=OPTION_GUID_001",
+        ///     "action_type=RELEASE_FULL"
+        ///   ]
+        /// }
+        ///
+        /// (5) 取消釋出
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "option_guid=OPTION_GUID_001",
+        ///     "action_type=CANCEL_RELEASE"
+        ///   ]
+        /// }
+        /// </remarks>
+        /// <param name="returnData">通用傳入物件（ValueAry 帶參數）</param>
+        /// <returns>序列化後的 returnData JSON 字串</returns>
+        [HttpPost("set_staff_dayoff_and_release_action")]
+        public string set_staff_dayoff_and_release_action([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "set_staff_dayoff_and_release_action";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_id = GetVal("staff_id");
+                string option_guid = GetVal("option_guid");
+                string action_type = GetVal("action_type");
+                string off_date = GetVal("off_date");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return returnData.JsonSerializationt();
+                }
+                if (option_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 option_guid";
+                    return returnData.JsonSerializationt();
+                }
+                if (action_type.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 action_type";
+                    return returnData.JsonSerializationt();
+                }
+
+                action_type = action_type.Trim().ToUpperInvariant();
+
+                HashSet<string> validActions = new HashSet<string>()
+        {
+            "SELECT_FULL",
+            "SELECT_HALF_AM",
+            "SELECT_HALF_PM",
+            "CANCEL_SELECTION",
+            "RELEASE_FULL",
+            "CANCEL_RELEASE"
+        };
+
+                if (!validActions.Contains(action_type))
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "action_type 必須為 SELECT_FULL / SELECT_HALF_AM / SELECT_HALF_PM / CANCEL_SELECTION / RELEASE_FULL / CANCEL_RELEASE";
+                    return returnData.JsonSerializationt();
+                }
+
+                // ============================
+                // 選擇休假相關：必須要 staff_id
+                // ============================
+                if (action_type == "SELECT_FULL" ||
+                    action_type == "SELECT_HALF_AM" ||
+                    action_type == "SELECT_HALF_PM" ||
+                    action_type == "CANCEL_SELECTION")
+                {
+                    if (staff_id.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "此操作必須提供 staff_id";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+
+                // ============================
+                // 選擇休假：必須 off_date
+                // ============================
+                if (action_type == "SELECT_FULL" ||
+                    action_type == "SELECT_HALF_AM" ||
+                    action_type == "SELECT_HALF_PM")
+                {
+                    if (off_date.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "此操作必須提供 off_date";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+
+                returnData innerReturnData = new returnData();
+                innerReturnData.ValueAry = new List<string>();
+
+                void AddVal(string key, string value)
+                {
+                    if (value.StringIsEmpty()) return;
+                    innerReturnData.ValueAry.Add($"{key}={value}");
+                }
+
+                AddVal("form_name", form_name);
+                AddVal("staff_id", staff_id);
+                AddVal("option_guid", option_guid);
+                AddVal("off_date", off_date);
+
+                string json;
+
+                if (action_type == "SELECT_FULL")
+                {
+                    AddVal("select_type", "FULL");
+                    json = set_staff_dayoff_selection(innerReturnData);
+                }
+                else if (action_type == "SELECT_HALF_AM")
+                {
+                    AddVal("select_type", "HALF_AM");
+                    json = set_staff_dayoff_selection(innerReturnData);
+                }
+                else if (action_type == "SELECT_HALF_PM")
+                {
+                    AddVal("select_type", "HALF_PM");
+                    json = set_staff_dayoff_selection(innerReturnData);
+                }
+                else if (action_type == "CANCEL_SELECTION")
+                {
+                    AddVal("select_type", "CANCEL");
+                    cancel_release_dayoff_option(innerReturnData);
+                    AddVal("release_dayoff_type", "FULL");
+                    json = set_staff_dayoff_selection(innerReturnData);
+
+                }
+                else if (action_type == "RELEASE_FULL")
+                {
+                    AddVal("release_dayoff_type", "FULL");
+                    json = release_dayoff_option(innerReturnData);
+                }
+                else // CANCEL_RELEASE
+                {
+                    json = cancel_release_dayoff_option(innerReturnData);
+                }
+
+                return json;
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = $"Exception : {ex.Message}";
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.TimeTaken = timer.ToString();
+            }
+        }
+
+   
+
         /// <summary>
         /// 設定排休日每日最大可休人數（上午／下午）
         /// </summary>
@@ -5112,7 +6142,7 @@ namespace PharmaRosterAPI
         }
 
         /// <summary>
-        /// 儲存登入者單筆放假選擇（寫入 staff_dayoff_option），並寫入異動歷程（StaffDayOffOptionLogClass）；不異動 assigned_shift。
+        /// 儲存登入者單筆放假選擇（升級版 set_staff_dayoff_selection）
         /// </summary>
         /// <remarks>
         /// ===============================
@@ -5124,29 +6154,23 @@ namespace PharmaRosterAPI
         /// - HALF_PM：下午半天
         /// - CANCEL：取消選擇（清空）
         ///
-        /// 寫入資料表：staff_dayoff_option
-        /// - 只更新：
-        ///   selected_full / selected_half_am / selected_half_pm / date / updated_at
-        /// - ✅ assigned_shift 不異動
+        /// 本升級版已同步最新規則：
+        /// 1. 休假選擇與釋出規則同步
+        /// 2. FULL：不可保留整日釋出
+        /// 3. HALF_AM：自動確保對側 HALF_PM 釋出存在
+        /// 4. HALF_PM：自動確保對側 HALF_AM 釋出存在
+        /// 5. CANCEL：僅清空休假選擇，不自動取消釋出
         ///
-        /// ✅ 同時寫入 staff_dayoff_option_log（StaffDayOffOptionLogClass）
-        /// - 不改資料表欄位的最小修正：
-        ///   - action=CANCEL 時，log.off_date 會記錄「取消前的 option.date」，避免 off_date 空白
         ///
         /// ===============================
-        /// ✅ 權限/流程檢核
+        /// ✅ 功能內容
         /// ===============================
-        /// 1) 依 form_name 找表單
-        /// 2) 依 staff_id 找 staff（轉 staff_guid）
-        /// 3) 依 option_guid 找 option
-        /// 4) 檢核：
-        ///    - option.form_guid == form.GUID
-        ///    - option.staff_guid == staff.GUID
-        ///    - 必須「輪到該 staff 所屬組別」才能寫（open group）
-        ///    - option.is_force_ff == "true" → 不允許變更
-        ///    - option.is_forbidden == "true" → 不允許變更
-        ///    - option.is_any_date == "false" → off_date 必須在 suggested_dates_list 內
-        ///    - 依 can_full / can_half_am / can_half_pm 限制選擇
+        /// 1) 驗證 form / staff / option / group 權限
+        /// 2) 驗證 is_force_ff / is_forbidden
+        /// 3) 儲存休假選擇
+        /// 4) 同步建立 / 關閉釋出池 DayOffReleasePoolClass
+        /// 5) 寫入 staff_dayoff_option_log
+        ///
         ///
         /// ===============================
         /// ✅ 參數（returnData.ValueAry）
@@ -5157,6 +6181,30 @@ namespace PharmaRosterAPI
         /// - select_type: FULL / HALF_AM / HALF_PM / CANCEL（必填）
         /// - off_date   : 選擇日期（yyyy-MM-dd 或 yyyy-MM-dd HH:mm:ss）
         ///              - CANCEL 可不填
+        ///
+        ///
+        /// ===============================
+        /// ✅ 規則說明
+        /// ===============================
+        /// - FULL：
+        ///   - 設定整日休假
+        ///   - 若存在未被接手的 OPEN 釋出池，會自動關閉
+        ///   - 若已有被接手之 pool，禁止改為 FULL
+        ///
+        /// - HALF_AM：
+        ///   - 設定上午休假
+        ///   - 自動建立 / 保留 HALF_PM 的釋出池
+        ///   - 若原本存在不同方向的 OPEN pool，且未被接手，則自動關閉並重建
+        ///   - 若原本 pool 已被接手，禁止改方向
+        ///
+        /// - HALF_PM：
+        ///   - 設定下午休假
+        ///   - 自動建立 / 保留 HALF_AM 的釋出池
+        ///
+        /// - CANCEL：
+        ///   - 只清空 selected_full / selected_half_am / selected_half_pm
+        ///   - 不自動取消既有釋出
+        ///
         ///
         /// ===============================
         /// ✅ Request JSON 範例
@@ -5172,7 +6220,18 @@ namespace PharmaRosterAPI
         ///   ]
         /// }
         ///
-        /// (2) 取消（不需 off_date）
+        /// (2) 選上午（會自動釋出下午）
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "option_guid=OPTION_GUID_001",
+        ///     "select_type=HALF_AM",
+        ///     "off_date=2026-03-05"
+        ///   ]
+        /// }
+        ///
+        /// (3) 取消（不需 off_date）
         /// {
         ///   "ValueAry": [
         ///     "form_name=2026年03月排休表",
@@ -5257,7 +6316,7 @@ namespace PharmaRosterAPI
                         returnData.Result = $"off_date 格式錯誤: {off_date}";
                         return returnData.JsonSerializationt();
                     }
-                    off_date = dt.ToDateString('-'); // yyyy-MM-dd
+                    off_date = dt.ToDateString('-');
                 }
 
                 // ===============================
@@ -5268,7 +6327,8 @@ namespace PharmaRosterAPI
                 var sql_group = MethodClass.GetSQLControl<DayOffGroupClass>();
                 var sql_member = MethodClass.GetSQLControl<DayOffGroupMemberClass>();
                 var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
-                var sql_log = MethodClass.GetSQLControl<StaffDayOffOptionLogClass>(); // ✅ Log
+                var sql_log = MethodClass.GetSQLControl<StaffDayOffOptionLogClass>();
+                var sql_releasePool = MethodClass.GetSQLControl<DayOffReleasePoolClass>();
 
                 // ===============================
                 // 2) form
@@ -5308,7 +6368,6 @@ namespace PharmaRosterAPI
                 }
                 StaffDayOffOptionClass option = obj_option.SQLToClass<StaffDayOffOptionClass>();
 
-                // form / staff 對應檢核
                 if (!string.Equals(option.form_guid, form_guid, StringComparison.OrdinalIgnoreCase))
                 {
                     returnData.Code = -200;
@@ -5323,7 +6382,7 @@ namespace PharmaRosterAPI
                 }
 
                 // ===============================
-                // 5) 流程檢核：必須輪到該 staff 所屬組別才能寫
+                // 5) 流程檢核
                 // ===============================
                 List<object[]> obj_groups = sql_group.GetRowsByDefult(null, "form_guid", form_guid);
                 List<DayOffGroupClass> groups = obj_groups.SQLToClass<DayOffGroupClass>() ?? new List<DayOffGroupClass>();
@@ -5380,7 +6439,7 @@ namespace PharmaRosterAPI
                 }
 
                 // ===============================
-                // 6) option 狀態檢核（FF / forbidden）
+                // 6) option 狀態檢核
                 // ===============================
                 if (option.is_force_ff == "true")
                 {
@@ -5396,27 +6455,146 @@ namespace PharmaRosterAPI
                 }
 
                 // ===============================
-                // ✅ 7) BEFORE 快照（最小改動：用於 CANCEL log.off_date）
+                // 7) 快照
                 // ===============================
                 string before_date = option.date ?? "";
                 string before_selected_full = option.selected_full ?? "false";
                 string before_selected_half_am = option.selected_half_am ?? "false";
                 string before_selected_half_pm = option.selected_half_pm ?? "false";
+                string before_is_released = option.is_released ?? "false";
+                string before_released_dayoff_type = option.released_dayoff_type ?? "";
+                string before_release_pool_guid = option.release_pool_guid ?? "";
 
-                // ===============================
-                // 8) 寫入選擇（不改 assigned_shift）
-                // ===============================
                 string now = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
 
+                // ===============================
+                // 共用：抓目前 option 對應 pool
+                // ===============================
+                DayOffReleasePoolClass currentPool = null;
+                if (!option.release_pool_guid.StringIsEmpty())
+                {
+                    currentPool = sql_releasePool
+                        .GetRowsByDefult(null, "GUID", option.release_pool_guid)
+                        .SQLToClass<DayOffReleasePoolClass>()
+                        .FirstOrDefault();
+                }
+
+                List<DayOffReleasePoolClass> optionPools = sql_releasePool
+                    .GetRowsByDefult(null, "source_option_guid", option.GUID)
+                    .SQLToClass<DayOffReleasePoolClass>() ?? new List<DayOffReleasePoolClass>();
+
+                DayOffReleasePoolClass openPool = optionPools
+                    .Where(x => x.status == "OPEN")
+                    .OrderByDescending(x => x.created_at.StringToDateTime())
+                    .FirstOrDefault();
+
+                bool PoolHasClaimed(DayOffReleasePoolClass pool)
+                {
+                    if (pool == null) return false;
+                    return pool.claimed_slots.StringToInt32() > 0;
+                }
+
+                void ClosePool(DayOffReleasePoolClass pool)
+                {
+                    if (pool == null) return;
+                    pool.status = "CANCELLED";
+                    pool.updated_at = now;
+                    pool.version_no = (pool.version_no.StringToInt32() + 1).ToString();
+                    sql_releasePool.UpdateByDefulteExtra(null, pool.ClassToSQL<DayOffReleasePoolClass>());
+                }
+
+                DayOffReleasePoolClass CreatePool(string releaseType)
+                {
+                    DayOffReleasePoolClass pool = new DayOffReleasePoolClass();
+                    pool.GUID = Guid.NewGuid().ToString();
+                    pool.form_guid = option.form_guid;
+                    pool.source_option_guid = option.GUID;
+                    pool.source_item_guid = option.item_guid;
+                    pool.source_staff_guid = option.staff_guid;
+                    pool.date = option.date;
+                    pool.release_dayoff_type = releaseType;
+                    pool.total_slots = "1";
+                    pool.claimed_slots = "0";
+                    pool.remaining_slots = "1";
+                    pool.status = "OPEN";
+                    pool.version_no = "1";
+                    pool.created_at = now;
+                    pool.updated_at = now;
+
+                    sql_releasePool.AddRows(null, new List<object[]>() { pool.ClassToSQL<DayOffReleasePoolClass>() });
+                    return pool;
+                }
+
+                void EnsurePool(string releaseType)
+                {
+                    // 已有同方向 OPEN pool -> 直接沿用
+                    if (openPool != null &&
+                        string.Equals(openPool.release_dayoff_type, releaseType, StringComparison.OrdinalIgnoreCase) &&
+                        openPool.status == "OPEN")
+                    {
+                        option.is_released = "true";
+                        option.released_at = now;
+                        option.released_dayoff_type = releaseType;
+                        option.release_pool_guid = openPool.GUID;
+                        option.dayoff_source_type = "RELEASED_SOURCE";
+                        return;
+                    }
+
+                    // 若有不同方向 OPEN pool
+                    if (openPool != null &&
+                        !string.Equals(openPool.release_dayoff_type, releaseType, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (PoolHasClaimed(openPool))
+                        {
+                            throw new Exception($"目前已有已被接手的釋出池({openPool.release_dayoff_type})，不可改變休假方向");
+                        }
+
+                        ClosePool(openPool);
+                    }
+
+                    DayOffReleasePoolClass newPool = CreatePool(releaseType);
+
+                    option.is_released = "true";
+                    option.released_at = now;
+                    option.released_dayoff_type = releaseType;
+                    option.release_pool_guid = newPool.GUID;
+                    option.dayoff_source_type = "RELEASED_SOURCE";
+                }
+
+                void ClearReleaseIfPossible()
+                {
+                    if (openPool != null)
+                    {
+                        if (PoolHasClaimed(openPool))
+                        {
+                            throw new Exception("目前已有已被接手的釋出池，不可改為整日休假");
+                        }
+
+                        ClosePool(openPool);
+                    }
+
+                    option.is_released = "false";
+                    option.released_at = DateTime.MinValue.ToDateTimeString();
+                    option.released_dayoff_type = "";
+                    option.release_pool_guid = "";
+                    if ((option.dayoff_source_type ?? "").Trim().ToUpper() == "RELEASED_SOURCE")
+                    {
+                        option.dayoff_source_type = "";
+                    }
+                }
+
+                // ===============================
+                // 8) 寫入選擇 + 同步釋出
+                // ===============================
                 if (isCancel)
                 {
-                    // ✅ 取消：清空選擇（option.date 會變空）
+                    // 取消只清空選擇，不動釋出
                     option.ClearSelection();
                     option.updated_at = now;
+                    option.NormalizeSelection();
                 }
                 else
                 {
-                    // is_any_date=false 時，off_date 必須落在 suggested_dates
                     if (option.is_any_date != "true")
                     {
                         var list = option.suggested_dates_list ?? new List<string>();
@@ -5451,11 +6629,32 @@ namespace PharmaRosterAPI
                     }
 
                     option.NormalizeSelection();
+
+                    lock (_dayoffReleasePoolLock)
+                    {
+                        if (select_type == "FULL")
+                        {
+                            // FULL：不可保留 OPEN 釋出池
+                            ClearReleaseIfPossible();
+                        }
+                        else if (select_type == "HALF_AM")
+                        {
+                            // 上午休 -> 自動釋出下午
+                            EnsurePool("HALF_PM");
+                        }
+                        else if (select_type == "HALF_PM")
+                        {
+                            // 下午休 -> 自動釋出上午
+                            EnsurePool("HALF_AM");
+                        }
+                    }
+
                     option.updated_at = now;
+                    option.NormalizeSelection();
                 }
 
                 // ===============================
-                // 9) 更新 DB（只更新 option 本身）
+                // 9) 更新 DB
                 // ===============================
                 sql_option.UpdateByDefulteExtra(null, new List<object[]>
         {
@@ -5463,30 +6662,22 @@ namespace PharmaRosterAPI
         });
 
                 // ===============================
-                // ✅ 10) 寫入 Log（最小改動核心：CANCEL 時 off_date 記 before_date）
+                // 10) 寫入 Log
                 // ===============================
                 try
                 {
                     var log = new StaffDayOffOptionLogClass();
 
-                    // 必填欄位（依你資料表實際欄位調整）
                     log.GUID = Guid.NewGuid().ToString();
                     log.form_guid = form_guid;
                     log.option_guid = option.GUID;
                     log.staff_guid = staff_guid;
-
-                    // 若你 log 表有 staff_id / stage / action / off_date
                     log.staff_id = staff_id;
                     log.stage = stage;
                     log.action = select_type;
-
-                    // ✅ 最小改動修正點：
-                    // CANCEL 時 option.date 已清空，所以用 before_date 記錄「取消哪一天」
-                    // 非 CANCEL 則記錄這次選擇後的 option.date（等同 off_date）
                     log.off_date = (select_type == "CANCEL") ? before_date : (option.date ?? "");
 
-                    // 如果你的 log 表有 before/after 欄位（有就寫、沒有也不影響你可刪掉）
-                    // ↓↓↓ 若你沒有這些欄位，請直接刪除這段，避免編譯錯
+                    // 若你的 log class 沒有這些欄位，請刪掉
                     log.before_selected_full = before_selected_full;
                     log.before_selected_half_am = before_selected_half_am;
                     log.before_selected_half_pm = before_selected_half_pm;
@@ -5494,6 +6685,15 @@ namespace PharmaRosterAPI
                     log.after_selected_full = option.selected_full ?? "false";
                     log.after_selected_half_am = option.selected_half_am ?? "false";
                     log.after_selected_half_pm = option.selected_half_pm ?? "false";
+
+                    //// 若你的 log class 沒有這些欄位，請刪掉
+                    //log.before_is_released = before_is_released;
+                    //log.before_released_dayoff_type = before_released_dayoff_type;
+                    //log.before_release_pool_guid = before_release_pool_guid;
+
+                    //log.after_is_released = option.is_released ?? "false";
+                    //log.after_released_dayoff_type = option.released_dayoff_type ?? "";
+                    //log.after_release_pool_guid = option.release_pool_guid ?? "";
 
                     log.created_at = now;
 
@@ -5504,16 +6704,28 @@ namespace PharmaRosterAPI
                 }
                 catch
                 {
-                    // ✅ log 寫入失敗不阻擋主流程（避免影響使用者儲存）
-                    // 你若想嚴格：可改成 throw
+                    // log 失敗不阻擋主流程
                 }
 
                 // ===============================
                 // 11) 回傳
                 // ===============================
+                DayOffReleasePoolClass poolAfter = null;
+                if (!option.release_pool_guid.StringIsEmpty())
+                {
+                    poolAfter = sql_releasePool
+                        .GetRowsByDefult(null, "GUID", option.release_pool_guid)
+                        .SQLToClass<DayOffReleasePoolClass>()
+                        .FirstOrDefault();
+                }
+
                 returnData.Code = 200;
                 returnData.Result = "success";
-                returnData.Data = option;
+                returnData.Data = new
+                {
+                    option,
+                    release_pool = poolAfter
+                };
                 return returnData.JsonSerializationt(true);
             }
             catch (Exception ex)
@@ -5527,6 +6739,2887 @@ namespace PharmaRosterAPI
                 returnData.TimeTaken = timer.ToString();
             }
         }
+
+        /// <summary>
+        /// 使用應休額度進行排休選擇（含公平機制與當日名額限制版 set_staff_quota_dayoff_selection）
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 用於讓單一人員使用自己的應休額度進行排休。
+        ///
+        /// 本版已同時加入：
+        /// 1. 個人應休總額度限制
+        /// 2. 下午半日次數限制
+        /// 3. 週六排休次數限制
+        /// 4. 當日 AM / PM 休假名額上限限制
+        ///
+        ///
+        /// ===============================
+        /// 【功能用途】
+        /// ===============================
+        /// 1. 平日整日休假
+        /// 2. 平日上午半日休假
+        /// 3. 平日下午半日休假
+        /// 4. 週六上午半日休假
+        /// 5. 週日整日休假
+        /// 6. 取消已選的應休排休
+        ///
+        ///
+        /// ===============================
+        /// 【排休規則】
+        /// ===============================
+        /// 一、平日休假
+        /// - FULL      → 消耗 1 日應休額度
+        /// - HALF_AM   → 消耗 0.5 日應休額度
+        /// - HALF_PM   → 消耗 0.5 日應休額度
+        ///
+        /// 二、週六休假
+        /// - 只允許 HALF_AM
+        /// - 消耗 0.5 日應休額度
+        /// - 不允許 FULL
+        /// - 不允許 HALF_PM
+        ///
+        /// 三、週日休假
+        /// - 只允許 FULL
+        /// - 消耗 1 日應休額度
+        /// - 不允許 HALF_AM
+        /// - 不允許 HALF_PM
+        ///
+        /// 四、CANCEL
+        /// - 取消該筆應休排休
+        /// - 清空 selected_full / selected_half_am / selected_half_pm
+        /// - is_quota_dayoff = false
+        /// - quota_used = 0
+        /// - quota_dayoff_type = 空字串
+        ///
+        ///
+        /// ===============================
+        /// 【公平機制限制】
+        /// ===============================
+        /// 一、下午半日排休限制
+        /// - 只統計 is_quota_dayoff = true 且 quota_dayoff_type = WEEKDAY_HALF_PM
+        /// - 每人最多 2 次
+        ///
+        /// 二、週六排休限制
+        /// - 只統計 is_quota_dayoff = true 且 quota_dayoff_type = SATURDAY_HALF_AM
+        /// - 每人預設最多 1 次
+        /// - 若有額外補休來源（目前簡化版：存在週六/週日釋出來源），則上限 +1 次
+        ///
+        /// 三、總額度限制
+        /// - 已使用應休額度 + 本次消耗
+        /// - 不可超過該人員的總應休額度
+        ///
+        ///
+        /// ===============================
+        /// 【當日名額限制】
+        /// ===============================
+        /// 本 API 除了檢查個人額度與公平機制，
+        /// 還會檢查該日整體休假名額上限：
+        ///
+        /// 1. 若本次選 FULL：
+        ///    - 需同時檢查上午名額與下午名額
+        ///    - 上午不可超過 am_max_dayoff_count
+        ///    - 下午不可超過 pm_max_dayoff_count
+        ///
+        /// 2. 若本次選 HALF_AM：
+        ///    - 需檢查上午名額
+        ///    - 上午不可超過 am_max_dayoff_count
+        ///
+        /// 3. 若本次選 HALF_PM：
+        ///    - 需檢查下午名額
+        ///    - 下午不可超過 pm_max_dayoff_count
+        ///
+        ///
+        /// ===============================
+        /// 【名額占用規則】
+        /// ===============================
+        /// 一、上午名額占用
+        /// 符合以下任一即占用上午名額：
+        /// - selected_full = true
+        /// - selected_half_am = true
+        ///
+        /// 二、下午名額占用
+        /// 符合以下任一即占用下午名額：
+        /// - selected_full = true
+        /// - selected_half_pm = true
+        ///
+        /// 三、名額統計以整張表單所有人為準
+        /// 並非只計算單一人員
+        ///
+        /// 四、若本次為修改同一筆 option
+        /// 系統會先扣除該筆原本已占用的名額，再檢查新選擇是否超限
+        ///
+        ///
+        /// ===============================
+        /// 【不可操作的 option】
+        /// ===============================
+        /// 以下 option 不可用於應休排休：
+        /// 1. 系統強制放假（is_force_ff = true）
+        /// 2. 被禁止操作（is_forbidden = true）
+        /// 3. 填洞休假（dayoff_source_type = HOLE_FILL）
+        /// 4. 已釋出中的 option（is_released = true）
+        ///
+        ///
+        /// ===============================
+        /// 【quota_dayoff_type 定義】
+        /// ===============================
+        /// - WEEKDAY_FULL
+        /// - WEEKDAY_HALF_AM
+        /// - WEEKDAY_HALF_PM
+        /// - SATURDAY_HALF_AM
+        /// - SUNDAY_FULL
+        ///
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/set_staff_quota_dayoff_selection
+        ///
+        /// ===============================
+        /// 【Method】
+        /// ===============================
+        /// POST
+        ///
+        /// ===============================
+        /// 【傳入參數】(ValueAry)
+        /// ===============================
+        /// form_name   = 表單名稱（必填）
+        /// staff_id    = 人員工號（必填）
+        /// option_guid = option GUID（必填）
+        /// select_type = FULL / HALF_AM / HALF_PM / CANCEL（必填）
+        /// off_date    = 日期（選擇 FULL / HALF_AM / HALF_PM 時必填）
+        ///
+        ///
+        /// ===============================
+        /// 【JSON 傳入範例】
+        /// ===============================
+        /// (1) 平日整日休假
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "option_guid=OPTION_GUID_001",
+        ///     "select_type=FULL",
+        ///     "off_date=2026-03-12"
+        ///   ]
+        /// }
+        ///
+        /// (2) 平日下午半日休假
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "option_guid=OPTION_GUID_002",
+        ///     "select_type=HALF_PM",
+        ///     "off_date=2026-03-11"
+        ///   ]
+        /// }
+        ///
+        /// (3) 週六上午半日休假
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "option_guid=OPTION_GUID_003",
+        ///     "select_type=HALF_AM",
+        ///     "off_date=2026-03-14"
+        ///   ]
+        /// }
+        ///
+        /// (4) 取消應休排休
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345",
+        ///     "option_guid=OPTION_GUID_001",
+        ///     "select_type=CANCEL"
+        ///   ]
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "success",
+        ///   "Data": {
+        ///     "option": {
+        ///       "GUID": "OPTION_GUID_001",
+        ///       "staff_guid": "STAFF_GUID_001",
+        ///       "selected_full": "true",
+        ///       "selected_half_am": "false",
+        ///       "selected_half_pm": "false",
+        ///       "is_quota_dayoff": "true",
+        ///       "quota_used": "1",
+        ///       "quota_dayoff_type": "WEEKDAY_FULL"
+        ///     },
+        ///     "quota_summary": {
+        ///       "staff_guid": "STAFF_GUID_001",
+        ///       "quota_total": "5.5",
+        ///       "quota_used_total": "2",
+        ///       "quota_remaining": "3.5"
+        ///     },
+        ///     "rule_summary": {
+        ///       "quota_total": "5.5",
+        ///       "quota_used_total": "2",
+        ///       "quota_remaining": "3.5",
+        ///       "pm_half_used_count": "1",
+        ///       "saturday_used_count": "1",
+        ///       "pm_half_limit_count": "2",
+        ///       "saturday_limit_count": "2",
+        ///       "has_extra_saturday_limit": "true"
+        ///     },
+        ///     "date_quota_summary": {
+        ///       "date": "2026-03-12",
+        ///       "am_max_dayoff_count": "3",
+        ///       "pm_max_dayoff_count": "3",
+        ///       "am_used_count": "2",
+        ///       "pm_used_count": "2",
+        ///       "am_remaining_count": "1",
+        ///       "pm_remaining_count": "1"
+        ///     }
+        ///   }
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【失敗回傳 JSON 範例】
+        /// ===============================
+        /// (1) 週六錯誤選擇
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "週六只允許 HALF_AM",
+        ///   "Data": null
+        /// }
+        ///
+        /// (2) 週日錯誤選擇
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "週日只允許 FULL",
+        ///   "Data": null
+        /// }
+        ///
+        /// (3) 下午半日已達上限
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "下午半日排休已達上限 2 次",
+        ///   "Data": null
+        /// }
+        ///
+        /// (4) 週六排休已達上限
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "週六排休已達上限 1 次",
+        ///   "Data": null
+        /// }
+        ///
+        /// (5) 當日上午休假名額已滿
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "當日上午休假名額已滿",
+        ///   "Data": null
+        /// }
+        ///
+        /// (6) 當日下午休假名額已滿
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "當日下午休假名額已滿",
+        ///   "Data": null
+        /// }
+        ///
+        /// (7) 整日休假但上午名額不足
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "當日上午休假名額已滿，無法選擇整日休假",
+        ///   "Data": null
+        /// }
+        ///
+        /// (8) 整日休假但下午名額不足
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "當日下午休假名額已滿，無法選擇整日休假",
+        ///   "Data": null
+        /// }
+        ///
+        /// (9) 應休額度不足
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "剩餘應休額度不足",
+        ///   "Data": null
+        /// }
+        ///
+        /// (10) 例外錯誤
+        /// {
+        ///   "Code": -500,
+        ///   "Method": "set_staff_quota_dayoff_selection",
+        ///   "Result": "Exception message ...",
+        ///   "Data": null
+        /// }
+        /// </remarks>
+        /// <param name="returnData">returnData 物件，主要使用 ValueAry 作為參數輸入。</param>
+        /// <returns>回傳 JSON 字串。</returns>
+        /// <summary>
+        /// 使用應休額度進行排休選擇（支援虛擬 option、含公平機制與當日名額限制）
+        /// </summary>
+        [HttpPost("set_staff_quota_dayoff_selection")]
+        public string set_staff_quota_dayoff_selection([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "set_staff_quota_dayoff_selection";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_id = GetVal("staff_id");
+                string option_guid = GetVal("option_guid");
+                string select_type = GetVal("select_type");
+                string off_date = GetVal("off_date");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (staff_id.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 staff_id";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (select_type.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 select_type";
+                    return returnData.JsonSerializationt();
+                }
+
+                select_type = select_type.Trim().ToUpperInvariant();
+                bool isCancel = select_type == "CANCEL";
+
+                if (!isCancel)
+                {
+                    if (select_type != "FULL" && select_type != "HALF_AM" && select_type != "HALF_PM")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "select_type 必須為 FULL / HALF_AM / HALF_PM / CANCEL";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (off_date.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "未輸入 off_date";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    DateTime checkDate = off_date.StringToDateTime();
+                    if (checkDate == DateTime.MinValue)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"off_date 格式錯誤: {off_date}";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    off_date = checkDate.ToDateString('-');
+                }
+                else
+                {
+                    if (option_guid.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "取消應休排休必須提供 option_guid";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+
+                var sql_form = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_staff = MethodClass.GetSQLControl<StaffClass>();
+                var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_item = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+
+                object[] obj_form = sql_form.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                object[] obj_staff = sql_staff.GetRowsByDefult(null, "staff_id", staff_id).FirstOrDefault();
+                if (obj_staff == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到 staff_id={staff_id}";
+                    return returnData.JsonSerializationt();
+                }
+
+                StaffClass staff = obj_staff.SQLToClass<StaffClass>();
+
+                StaffDayOffOptionClass option = null;
+
+                // =========================================================
+                // 取得或建立 option
+                // - 有 option_guid：更新既有 option
+                // - 無 option_guid：依 staff + off_date 查找，找不到才建立 quota option
+                // =========================================================
+                if (option_guid.StringIsEmpty() == false)
+                {
+                    object[] obj_option = sql_option.GetRowsByDefult(null, "GUID", option_guid).FirstOrDefault();
+                    if (obj_option == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"找不到 option_guid={option_guid}";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    option = obj_option.SQLToClass<StaffDayOffOptionClass>();
+                }
+                else
+                {
+                    string targetDate = off_date.StringToDateTime().ToDateString('-');
+
+                    option = sql_option.GetRowsByDefult(null, "form_guid", form.GUID)
+                        .SQLToClass<StaffDayOffOptionClass>()
+                        .Where(x =>
+                            x != null &&
+                            x.staff_guid == staff.GUID &&
+                            x.date.StringToDateTime().ToDateString('-') == targetDate)
+                        .FirstOrDefault();
+
+                    if (option == null)
+                    {
+                        string nowCreate = DateTime.Now.ToDateTimeString();
+
+                        option = new StaffDayOffOptionClass();
+                        option.GUID = Guid.NewGuid().ToString();
+                        option.form_guid = form.GUID;
+                        option.staff_guid = staff.GUID;
+                        option.item_guid = "";
+                        option.date = targetDate;
+                        option.suggested_dates_list = new List<string>() { targetDate };
+
+                        option.can_full = "true";
+                        option.can_half_am = "true";
+                        option.can_half_pm = "true";
+
+                        option.selected_full = "false";
+                        option.selected_half_am = "false";
+                        option.selected_half_pm = "false";
+
+                        option.is_any_date = "false";
+                        option.is_forbidden = "false";
+                        option.is_released = "false";
+                        option.is_force_ff = "false";
+                        option.force_ff_at = DateTime.MinValue.ToDateTimeString();
+                        option.released_at = DateTime.MinValue.ToDateTimeString();
+
+                        option.is_quota_dayoff = "false";
+                        option.quota_used = "0";
+                        option.quota_dayoff_type = "";
+
+                        option.dayoff_source_type = "QUOTA_DAYOFF";
+                        option.updated_at = nowCreate;
+
+                        sql_option.AddRows(null, new List<object[]>
+                {
+                    option.ClassToSQL<StaffDayOffOptionClass>()
+                });
+                    }
+                }
+
+                if (option == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "取得 option 失敗";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.form_guid != form.GUID)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "此 option 不屬於該 form_name";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.staff_guid != staff.GUID)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "此 option 不屬於該 staff_id";
+                    return returnData.JsonSerializationt();
+                }
+
+                option.NormalizeSelection();
+
+                if (option.is_force_ff == "true")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "系統強制放假(FF)不可操作";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.is_forbidden == "true")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "此 option 已被禁止操作";
+                    return returnData.JsonSerializationt();
+                }
+
+                if ((option.dayoff_source_type ?? "").Trim().ToUpper() == "HOLE_FILL")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "填洞休假不可作為應休排休操作";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.is_released == "true")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "已釋出中的 option 不可作為應休排休操作";
+                    return returnData.JsonSerializationt();
+                }
+
+                string now = DateTime.Now.ToDateTimeString();
+
+                // =========================================================
+                // CANCEL：取消該筆應休排休
+                // =========================================================
+                if (isCancel)
+                {
+                    if (option.is_quota_dayoff != "true")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "此筆不是應休排休，無法取消";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    option.ClearSelection();
+                    option.is_quota_dayoff = "false";
+                    option.quota_used = "0";
+                    option.quota_dayoff_type = "";
+                    option.updated_at = now;
+                    option.NormalizeSelection();
+
+                    sql_option.UpdateByDefulteExtra(null, option.ClassToSQL<StaffDayOffOptionClass>());
+
+                    var quotaSummaryAfterCancel = GetStaffRemainingQuotaDayoff(form.GUID, staff.GUID);
+                    var ruleSummaryAfterCancel = GetStaffQuotaDayoffRuleSummary(form.GUID, staff.GUID);
+
+                    DayOffDateQuotaUsageSummary dateSummaryAfterCancel = null;
+                    if (!option.date.StringIsEmpty())
+                    {
+                        dateSummaryAfterCancel = GetDayOffDateQuotaUsageSummary(
+                            form.GUID,
+                            option.date.StringToDateTime().ToDateString('-')
+                        );
+                    }
+
+                    returnData.Code = 200;
+                    returnData.Result = "success";
+                    returnData.Data = new
+                    {
+                        option,
+                        quota_summary = quotaSummaryAfterCancel,
+                        rule_summary = ruleSummaryAfterCancel,
+                        date_quota_summary = dateSummaryAfterCancel
+                    };
+                    return returnData.JsonSerializationt(true);
+                }
+
+                DateTime dttargetDate = off_date.StringToDateTime();
+                if (dttargetDate == DateTime.MinValue)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"off_date 格式錯誤: {off_date}";
+                    return returnData.JsonSerializationt();
+                }
+
+                // =========================================================
+                // 排除有排班的日期
+                // =========================================================
+                List<DayOffScheduleItemClass> items = sql_item
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>()
+                    .Where(x =>
+                        x != null &&
+                        x.staff_guid == staff.GUID &&
+                        x.date.StringToDateTime().ToDateString('-') == off_date)
+                    .ToList();
+
+                bool HasSchedule(DayOffScheduleItemClass item)
+                {
+                    if (item == null) return false;
+
+                    WorkShiftRequirementClass req = item.workShiftRequirement;
+                    if (req == null) return false;
+                    if (req.disabled) return false;
+                    if (req.RequiredCountBase <= 0) return false;
+                    if (req.shift_type.StringIsEmpty()) return false;
+
+                    return true;
+                }
+
+                if (items.Any(x => HasSchedule(x)))
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "該日已有排班，不可選擇應休排休";
+                    return returnData.JsonSerializationt();
+                }
+
+                double consume = 0;
+                string quotaDayoffType = "";
+
+                // =========================================================
+                // 日期規則
+                // =========================================================
+                if (dttargetDate.DayOfWeek == DayOfWeek.Saturday)
+                {
+                    if (select_type != "HALF_AM")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "週六只允許 HALF_AM";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    consume = 0.5;
+                    quotaDayoffType = "SATURDAY_HALF_AM";
+                }
+                else if (dttargetDate.DayOfWeek == DayOfWeek.Sunday)
+                {
+                    if (select_type != "FULL")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "週日只允許 FULL";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    consume = 1;
+                    quotaDayoffType = "SUNDAY_FULL";
+                }
+                else
+                {
+                    if (select_type == "FULL")
+                    {
+                        consume = 1;
+                        quotaDayoffType = "WEEKDAY_FULL";
+                    }
+                    else if (select_type == "HALF_AM")
+                    {
+                        consume = 0.5;
+                        quotaDayoffType = "WEEKDAY_HALF_AM";
+                    }
+                    else if (select_type == "HALF_PM")
+                    {
+                        consume = 0.5;
+                        quotaDayoffType = "WEEKDAY_HALF_PM";
+                    }
+                }
+
+                // =========================================================
+                // 原本已使用額度與類型
+                // 編輯同一筆時，需補回原本已扣額度與次數
+                // =========================================================
+                double originalQuotaUsed = 0;
+                string originalQuotaType = "";
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    originalQuotaUsed = option.quota_used.StringToDouble();
+                    originalQuotaType = (option.quota_dayoff_type ?? "").Trim().ToUpper();
+                }
+
+                // =========================================================
+                // 公平機制檢查
+                // =========================================================
+                StaffQuotaDayoffRuleSummary ruleSummary = GetStaffQuotaDayoffRuleSummary(form.GUID, staff.GUID);
+
+                int pmHalfUsedCount = ruleSummary.pm_half_used_count.StringToInt32();
+                int pmHalfLimitCount = ruleSummary.pm_half_limit_count.StringToInt32();
+
+                int saturdayUsedCount = ruleSummary.saturday_used_count.StringToInt32();
+                int saturdayLimitCount = ruleSummary.saturday_limit_count.StringToInt32();
+
+                if (originalQuotaType == "WEEKDAY_HALF_PM")
+                {
+                    pmHalfUsedCount -= 1;
+                }
+
+                if (originalQuotaType == "SATURDAY_HALF_AM")
+                {
+                    saturdayUsedCount -= 1;
+                }
+
+                if (quotaDayoffType == "WEEKDAY_HALF_PM")
+                {
+                    if (pmHalfUsedCount >= pmHalfLimitCount)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"下午半日排休已達上限 {pmHalfLimitCount} 次";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+
+                if (quotaDayoffType == "SATURDAY_HALF_AM")
+                {
+                    if (saturdayUsedCount >= saturdayLimitCount)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"週六排休已達上限 {saturdayLimitCount} 次";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+
+                // =========================================================
+                // 當日 AM / PM 名額檢查
+                // =========================================================
+                DayOffDateQuotaUsageSummary dateSummary = GetDayOffDateQuotaUsageSummary(form.GUID, off_date);
+                if (dateSummary == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到日期資料({off_date})";
+                    return returnData.JsonSerializationt();
+                }
+
+                int amUsed = dateSummary.am_used_count.StringToInt32();
+                int pmUsed = dateSummary.pm_used_count.StringToInt32();
+                int amMax = dateSummary.am_max_dayoff_count.StringToInt32();
+                int pmMax = dateSummary.pm_max_dayoff_count.StringToInt32();
+
+                // 扣掉自己原本占用，避免修改時誤擋
+                if (option.selected_full == "true")
+                {
+                    amUsed -= 1;
+                    pmUsed -= 1;
+                }
+                else
+                {
+                    if (option.selected_half_am == "true") amUsed -= 1;
+                    if (option.selected_half_pm == "true") pmUsed -= 1;
+                }
+
+                if (select_type == "FULL")
+                {
+                    if (amUsed + 1 > amMax)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "當日上午休假名額已滿，無法選擇整日休假";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (pmUsed + 1 > pmMax)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "當日下午休假名額已滿，無法選擇整日休假";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+                else if (select_type == "HALF_AM")
+                {
+                    if (amUsed + 1 > amMax)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "當日上午休假名額已滿";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+                else if (select_type == "HALF_PM")
+                {
+                    if (pmUsed + 1 > pmMax)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "當日下午休假名額已滿";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+
+                // =========================================================
+                // 總應休額度檢查
+                // =========================================================
+                GetStaffRemainingQuotaDayoffResponse quotaSummary = GetStaffRemainingQuotaDayoff(form.GUID, staff.GUID);
+
+                double remaining = quotaSummary.quota_remaining.StringToDouble();
+                double availableForThisEdit = remaining + originalQuotaUsed;
+
+                if (availableForThisEdit < consume)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "剩餘應休額度不足";
+                    return returnData.JsonSerializationt();
+                }
+
+                // =========================================================
+                // 寫入選擇
+                // =========================================================
+                string err = "";
+                bool ok = false;
+
+                if (select_type == "FULL")
+                {
+                    ok = option.TrySelectFullDay(off_date, out err);
+                }
+                else if (select_type == "HALF_AM")
+                {
+                    ok = option.TrySelectHalfAM(off_date, out err);
+                }
+                else if (select_type == "HALF_PM")
+                {
+                    ok = option.TrySelectHalfPM(off_date, out err);
+                }
+
+                if (!ok)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = err;
+                    return returnData.JsonSerializationt();
+                }
+
+                option.is_quota_dayoff = "true";
+                option.quota_used = consume.ToString("0.##");
+                option.quota_dayoff_type = quotaDayoffType;
+
+                // 若原本是虛擬候選選上來的，正式標示為 QUOTA_DAYOFF
+                if (option.dayoff_source_type.StringIsEmpty() ||
+                    option.dayoff_source_type == "QUOTA_CANDIDATE")
+                {
+                    option.dayoff_source_type = "QUOTA_DAYOFF";
+                }
+
+                option.updated_at = now;
+                option.NormalizeSelection();
+
+                sql_option.UpdateByDefulteExtra(null, option.ClassToSQL<StaffDayOffOptionClass>());
+
+                GetStaffRemainingQuotaDayoffResponse quotaSummaryAfter = GetStaffRemainingQuotaDayoff(form.GUID, staff.GUID);
+                StaffQuotaDayoffRuleSummary ruleSummaryAfter = GetStaffQuotaDayoffRuleSummary(form.GUID, staff.GUID);
+                DayOffDateQuotaUsageSummary dateSummaryAfter = GetDayOffDateQuotaUsageSummary(form.GUID, off_date);
+
+                returnData.Code = 200;
+                returnData.Result = "success";
+                returnData.Data = new
+                {
+                    option,
+                    quota_summary = quotaSummaryAfter,
+                    rule_summary = ruleSummaryAfter,
+                    date_quota_summary = dateSummaryAfter
+                };
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.TimeTaken = timer.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 查詢單一人員可用於應休排休的 option 清單（get_staff_quota_dayoff_available_options）
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 用於查詢單一人員在指定排休表單中：
+        /// 1. 哪些 option 可用來做「應休額度排休」
+        /// 2. 哪些 option 已經被選為「應休額度排休」
+        /// 3. 每筆 option 目前可選擇的休假類型（FULL / HALF_AM / HALF_PM）
+        /// 4. 每筆 option 是否可取消
+        /// 5. 應休額度統計與公平機制統計
+        ///
+        /// 本 API 的主要用途是提供前端：
+        /// - 取得應休排休用的 option_guid
+        /// - 顯示可選清單
+        /// - 顯示已選清單（可取消）
+        /// - 直接知道每一天目前可不可選，以及不可選原因
+        ///
+        ///
+        /// ===============================
+        /// 【核心規則】
+        /// ===============================
+        /// 一、應休排休與預留休無關
+        /// - 本 API 不再以「預留休是否完成」作為應休排休的前置條件
+        /// - 使用者是否可以做應休排休，只看：
+        ///   1. 日期規則
+        ///   2. 個人應休額度是否足夠
+        ///   3. 公平機制是否超限
+        ///   4. 當日 AM / PM 名額是否已滿
+        ///
+        /// 二、option_guid 來源
+        /// - option_guid 不由前端自行推算
+        /// - 前端應直接使用本 API 回傳的 available_options / selected_options 中的 option_guid
+        ///
+        /// 三、取消操作來源
+        /// - selected_options 內每筆資料皆提供 option_guid
+        /// - 前端可直接以該筆 option_guid 呼叫取消 API
+        ///
+        ///
+        /// ===============================
+        /// 【available_options（可用清單）定義】
+        /// ===============================
+        /// 會列出該人員在此表單下，所有可作為「應休排休候選」的 option。
+        ///
+        /// 基本資料來源條件：
+        /// 1. 屬於指定 form_guid + staff_guid
+        /// 2. 具有有效日期
+        ///
+        /// 以下 option 不可作為應休排休：
+        /// 1. dayoff_source_type = HOLE_FILL
+        /// 2. is_released = true
+        /// 3. is_force_ff = true
+        /// 4. is_forbidden = true
+        ///
+        /// 但即使列在 available_options 中，實際能不能選，仍需再看：
+        /// - 當日是平日 / 週六 / 週日
+        /// - 個人應休剩餘額度
+        /// - 公平機制限制
+        /// - 當日 AM / PM 剩餘名額
+        ///
+        ///
+        /// ===============================
+        /// 【selected_options（已選清單）定義】
+        /// ===============================
+        /// 符合以下條件的 option 會列入已選清單：
+        /// 1. is_quota_dayoff = true
+        /// 2. selected_full / selected_half_am / selected_half_pm 至少一個為 true
+        ///
+        /// 主要用途：
+        /// - 顯示目前已選的應休排休
+        /// - 提供 option_guid 給前端逐筆取消
+        ///
+        ///
+        /// ===============================
+        /// 【日期可選規則】
+        /// ===============================
+        /// 一、平日
+        /// - 可選 FULL
+        /// - 可選 HALF_AM
+        /// - 可選 HALF_PM
+        ///
+        /// 二、週六
+        /// - 只允許 HALF_AM
+        /// - 不允許 FULL
+        /// - 不允許 HALF_PM
+        ///
+        /// 三、週日
+        /// - 只允許 FULL
+        /// - 不允許 HALF_AM
+        /// - 不允許 HALF_PM
+        ///
+        ///
+        /// ===============================
+        /// 【個人應休額度規則】
+        /// ===============================
+        /// 本 API 會依 quota_summary 判斷：
+        /// - quota_total
+        /// - quota_used_total
+        /// - quota_remaining
+        ///
+        /// 若剩餘應休額度不足：
+        /// - FULL 不可選
+        /// - HALF_AM / HALF_PM 不可選
+        ///
+        /// 並會將對應的 can_select_xxx 設為 false
+        ///
+        ///
+        /// ===============================
+        /// 【公平機制規則】
+        /// ===============================
+        /// 一、下午半日限制
+        /// - 只統計 is_quota_dayoff = true 且 quota_dayoff_type = WEEKDAY_HALF_PM
+        /// - 每人最多 2 次
+        ///
+        /// 二、週六限制
+        /// - 只統計 is_quota_dayoff = true 且 quota_dayoff_type = SATURDAY_HALF_AM
+        /// - 每人預設最多 1 次
+        /// - 若有額外週六資格，則可增加為 2 次
+        ///
+        /// 三、本 API 會回傳 rule_summary：
+        /// - pm_half_used_count
+        /// - saturday_used_count
+        /// - pm_half_limit_count
+        /// - saturday_limit_count
+        /// - has_extra_saturday_limit
+        ///
+        /// 並依此決定該 option 的 can_select_half_pm / can_select_half_am 是否可用
+        ///
+        ///
+        /// ===============================
+        /// 【當日名額限制】
+        /// ===============================
+        /// 本 API 會再依指定日期的整體休假名額做判斷：
+        /// - am_max_dayoff_count
+        /// - pm_max_dayoff_count
+        ///
+        /// 名額占用規則：
+        /// 一、上午名額占用
+        /// - selected_full = true
+        /// - selected_half_am = true
+        ///
+        /// 二、下午名額占用
+        /// - selected_full = true
+        /// - selected_half_pm = true
+        ///
+        /// 三、名額判斷以整張表單所有人為準，不只看單一人員
+        ///
+        /// 四、若這筆 option 原本已經有選擇，系統會先扣除自己原本占用的名額，再判斷是否還能修改
+        ///
+        /// 例如：
+        /// - 平日 FULL 需同時有上午與下午名額
+        /// - HALF_AM 需有上午名額
+        /// - HALF_PM 需有下午名額
+        ///
+        ///
+        /// ===============================
+        /// 【欄位說明】
+        /// ===============================
+        /// 一、available_options 每筆重點欄位
+        /// - option_guid
+        /// - date
+        /// - day_type
+        /// - can_select_full
+        /// - can_select_half_am
+        /// - can_select_half_pm
+        /// - can_select
+        /// - block_reason
+        ///
+        /// 二、selected_options 每筆重點欄位
+        /// - option_guid
+        /// - selected_type
+        /// - quota_used
+        /// - quota_dayoff_type
+        /// - can_cancel
+        ///
+        /// 三、前端建議用法
+        /// - available_options：做新增 / 修改選擇
+        /// - selected_options：做已選列表與取消操作
+        ///
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/get_staff_quota_dayoff_available_options
+        ///
+        /// ===============================
+        /// 【Method】
+        /// ===============================
+        /// POST
+        ///
+        /// ===============================
+        /// 【傳入參數】(ValueAry)
+        /// ===============================
+        /// form_name = 表單名稱（必填）
+        /// staff_id  = 人員工號（必填）
+        ///
+        ///
+        /// ===============================
+        /// 【JSON 傳入範例】
+        /// ===============================
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "staff_id=A12345"
+        ///   ]
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【成功回傳 JSON 範例】
+        /// ===============================
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "get_staff_quota_dayoff_available_options",
+        ///   "Result": "取得應休排休可用清單成功",
+        ///   "Data": {
+        ///     "form_guid": "FORM_GUID_001",
+        ///     "form_name": "2026年03月排休表",
+        ///     "staff_guid": "STAFF_GUID_001",
+        ///     "staff_id": "A12345",
+        ///     "staff_name": "王小明",
+        ///     "is_reserved_completed": "true",
+        ///     "quota_summary": {
+        ///       "staff_guid": "STAFF_GUID_001",
+        ///       "quota_total": "5.5",
+        ///       "quota_used_total": "1.5",
+        ///       "quota_remaining": "4"
+        ///     },
+        ///     "rule_summary": {
+        ///       "quota_total": "5.5",
+        ///       "quota_used_total": "1.5",
+        ///       "quota_remaining": "4",
+        ///       "pm_half_used_count": "1",
+        ///       "saturday_used_count": "1",
+        ///       "pm_half_limit_count": "2",
+        ///       "saturday_limit_count": "2",
+        ///       "has_extra_saturday_limit": "true"
+        ///     },
+        ///     "available_options": [
+        ///       {
+        ///         "option_guid": "OPTION_GUID_001",
+        ///         "item_guid": "ITEM_GUID_001",
+        ///         "staff_guid": "STAFF_GUID_001",
+        ///         "staff_id": "A12345",
+        ///         "staff_name": "王小明",
+        ///         "date": "2026-03-12",
+        ///         "week_day": "Wed",
+        ///         "day_type": "WEEKDAY",
+        ///         "can_select_full": "true",
+        ///         "can_select_half_am": "true",
+        ///         "can_select_half_pm": "false",
+        ///         "is_quota_dayoff": "false",
+        ///         "selected_type": "NONE",
+        ///         "quota_used": "0",
+        ///         "quota_dayoff_type": "",
+        ///         "can_cancel": "false",
+        ///         "can_select": "true",
+        ///         "block_reason": ""
+        ///       }
+        ///     ],
+        ///     "selected_options": [
+        ///       {
+        ///         "option_guid": "OPTION_GUID_002",
+        ///         "item_guid": "ITEM_GUID_002",
+        ///         "staff_guid": "STAFF_GUID_001",
+        ///         "staff_id": "A12345",
+        ///         "staff_name": "王小明",
+        ///         "date": "2026-03-14",
+        ///         "week_day": "Sat",
+        ///         "day_type": "SATURDAY",
+        ///         "can_select_full": "false",
+        ///         "can_select_half_am": "true",
+        ///         "can_select_half_pm": "false",
+        ///         "is_quota_dayoff": "true",
+        ///         "selected_type": "HALF_AM",
+        ///         "quota_used": "0.5",
+        ///         "quota_dayoff_type": "SATURDAY_HALF_AM",
+        ///         "can_cancel": "true",
+        ///         "can_select": "true",
+        ///         "block_reason": ""
+        ///       }
+        ///     ]
+        ///   }
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【失敗回傳 JSON 範例】
+        /// ===============================
+        /// (1) 未提供 form_name
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_staff_quota_dayoff_available_options",
+        ///   "Result": "未輸入 form_name",
+        ///   "Data": null
+        /// }
+        ///
+        /// (2) 未提供 staff_id
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_staff_quota_dayoff_available_options",
+        ///   "Result": "未輸入 staff_id",
+        ///   "Data": null
+        /// }
+        ///
+        /// (3) 找不到表單
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_staff_quota_dayoff_available_options",
+        ///   "Result": "找不到表單名稱(2026年03月排休表)",
+        ///   "Data": null
+        /// }
+        ///
+        /// (4) 找不到人員
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_staff_quota_dayoff_available_options",
+        ///   "Result": "找不到 staff_id=A12345",
+        ///   "Data": null
+        /// }
+        ///
+        /// (5) 例外錯誤
+        /// {
+        ///   "Code": -500,
+        ///   "Method": "get_staff_quota_dayoff_available_options",
+        ///   "Result": "Exception message ...",
+        ///   "Data": null
+        /// }
+        /// </remarks>
+        /// <param name="returnData">returnData 物件，主要使用 ValueAry 作為參數輸入。</param>
+        /// <returns>回傳 JSON 字串。</returns>
+        [HttpPost("get_staff_quota_dayoff_available_options")]
+        public string get_staff_quota_dayoff_available_options([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "get_staff_quota_dayoff_available_options";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_id = GetVal("staff_id");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (staff_id.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 staff_id";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_form = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_staff = MethodClass.GetSQLControl<StaffClass>();
+                var sql_day = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_item = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+
+                object[] obj_form = sql_form.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                object[] obj_staff = sql_staff.GetRowsByDefult(null, "staff_id", staff_id).FirstOrDefault();
+                if (obj_staff == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到 staff_id={staff_id}";
+                    return returnData.JsonSerializationt();
+                }
+
+                StaffClass staff = obj_staff.SQLToClass<StaffClass>();
+
+                List<DayOffScheduleDayClass> days = sql_day
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                List<StaffDayOffOptionClass> options = sql_option
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>()
+                    .Where(x => x != null && x.staff_guid == staff.GUID)
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                List<DayOffScheduleItemClass> items = sql_item
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>()
+                    .Where(x => x != null && x.staff_guid == staff.GUID)
+                    .ToList();
+
+                Dictionary<string, DayOffScheduleItemClass> itemByDate = items
+                    .Where(x => x != null && x.date.StringIsEmpty() == false)
+                    .GroupBy(x => x.date.StringToDateTime().ToDateString('-'))
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                Dictionary<string, StaffDayOffOptionClass> optionByDate = options
+                    .Where(x => x != null && x.date.StringIsEmpty() == false)
+                    .GroupBy(x => x.date.StringToDateTime().ToDateString('-'))
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                var quotaSummary = GetStaffRemainingQuotaDayoff(form.GUID, staff.GUID);
+                var ruleSummary = GetStaffQuotaDayoffRuleSummary(form.GUID, staff.GUID);
+
+                bool HasSchedule(DayOffScheduleItemClass item)
+                {
+                    if (item == null) return false;
+
+                    WorkShiftRequirementClass req = item.workShiftRequirement;
+                    if (req == null) return false;
+                    if (req.disabled) return false;
+                    if (req.RequiredCountBase <= 0) return false;
+                    if (req.shift_type.StringIsEmpty()) return false;
+
+                    return true;
+                }
+
+                string WeekDayText(DateTime dt)
+                {
+                    if (dt.DayOfWeek == DayOfWeek.Monday) return "Mon";
+                    if (dt.DayOfWeek == DayOfWeek.Tuesday) return "Tue";
+                    if (dt.DayOfWeek == DayOfWeek.Wednesday) return "Wed";
+                    if (dt.DayOfWeek == DayOfWeek.Thursday) return "Thu";
+                    if (dt.DayOfWeek == DayOfWeek.Friday) return "Fri";
+                    if (dt.DayOfWeek == DayOfWeek.Saturday) return "Sat";
+                    return "Sun";
+                }
+
+                string DayType(DateTime dt)
+                {
+                    if (dt.DayOfWeek == DayOfWeek.Saturday) return "SATURDAY";
+                    if (dt.DayOfWeek == DayOfWeek.Sunday) return "SUNDAY";
+                    return "WEEKDAY";
+                }
+
+                string SelectedType(StaffDayOffOptionClass option)
+                {
+                    if (option == null) return "NONE";
+                    if (option.selected_full == "true") return "FULL";
+                    if (option.selected_half_am == "true") return "HALF_AM";
+                    if (option.selected_half_pm == "true") return "HALF_PM";
+                    return "NONE";
+                }
+
+                StaffDayOffOptionClass BuildVirtualOption(DateTime dt)
+                {
+                    string date = dt.ToDateString('-');
+
+                    return new StaffDayOffOptionClass
+                    {
+                        GUID = "",
+                        form_guid = form.GUID,
+                        item_guid = "",
+                        staff_guid = staff.GUID,
+                        date = date,
+
+                        can_full = "true",
+                        can_half_am = "true",
+                        can_half_pm = "true",
+
+                        selected_full = "false",
+                        selected_half_am = "false",
+                        selected_half_pm = "false",
+
+                        is_any_date = "false",
+                        is_forbidden = "false",
+                        is_released = "false",
+                        is_force_ff = "false",
+
+                        is_quota_dayoff = "false",
+                        quota_used = "0",
+                        quota_dayoff_type = "",
+
+                        dayoff_source_type = "QUOTA_CANDIDATE"
+                    };
+                }
+
+                StaffQuotaDayoffAvailableOptionDto BuildDto(StaffDayOffOptionClass option)
+                {
+                    option.NormalizeSelection();
+
+                    DateTime dt = option.date.StringToDateTime();
+                    string dayType = DayType(dt);
+
+                    bool canFull = false;
+                    bool canHalfAm = false;
+                    bool canHalfPm = false;
+                    bool canSelect = true;
+                    string blockReason = "";
+
+                    string selectedType = SelectedType(option);
+
+                    if ((option.dayoff_source_type ?? "").Trim().ToUpper() == "HOLE_FILL")
+                    {
+                        canSelect = false;
+                        blockReason = "填洞休假不可作為應休排休操作";
+                    }
+                    else if (option.is_released == "true")
+                    {
+                        canSelect = false;
+                        blockReason = "已釋出中的 option 不可作為應休排休操作";
+                    }
+                    else if (option.is_force_ff == "true")
+                    {
+                        canSelect = false;
+                        blockReason = "系統強制放假(FF)不可操作";
+                    }
+                    else if (option.is_forbidden == "true")
+                    {
+                        canSelect = false;
+                        blockReason = "此 option 已被禁止操作";
+                    }
+
+                    if (dayType == "WEEKDAY")
+                    {
+                        canFull = true;
+                        canHalfAm = true;
+                        canHalfPm = true;
+                    }
+                    else if (dayType == "SATURDAY")
+                    {
+                        canFull = false;
+                        canHalfAm = true;
+                        canHalfPm = false;
+                    }
+                    else if (dayType == "SUNDAY")
+                    {
+                        canFull = true;
+                        canHalfAm = false;
+                        canHalfPm = false;
+                    }
+
+                    int pmHalfUsedCount = ruleSummary.pm_half_used_count.StringToInt32();
+                    int pmHalfLimitCount = ruleSummary.pm_half_limit_count.StringToInt32();
+
+                    int saturdayUsedCount = ruleSummary.saturday_used_count.StringToInt32();
+                    int saturdayLimitCount = ruleSummary.saturday_limit_count.StringToInt32();
+
+                    double quotaRemaining = quotaSummary.quota_remaining.StringToDouble();
+
+                    string originalQuotaType = (option.quota_dayoff_type ?? "").Trim().ToUpper();
+                    double originalQuotaUsed = 0;
+
+                    if (option.is_quota_dayoff == "true")
+                    {
+                        originalQuotaUsed = option.quota_used.StringToDouble();
+
+                        if (originalQuotaType == "WEEKDAY_HALF_PM")
+                            pmHalfUsedCount -= 1;
+
+                        if (originalQuotaType == "SATURDAY_HALF_AM")
+                            saturdayUsedCount -= 1;
+                    }
+
+                    double availableForThisEdit = quotaRemaining + originalQuotaUsed;
+
+                    DayOffDateQuotaUsageSummary dateSummary = GetDayOffDateQuotaUsageSummary(form.GUID, option.date);
+
+                    int amUsed = 0;
+                    int pmUsed = 0;
+                    int amMax = 0;
+                    int pmMax = 0;
+
+                    if (dateSummary != null)
+                    {
+                        amUsed = dateSummary.am_used_count.StringToInt32();
+                        pmUsed = dateSummary.pm_used_count.StringToInt32();
+                        amMax = dateSummary.am_max_dayoff_count.StringToInt32();
+                        pmMax = dateSummary.pm_max_dayoff_count.StringToInt32();
+
+                        if (option.selected_full == "true")
+                        {
+                            amUsed -= 1;
+                            pmUsed -= 1;
+                        }
+                        else
+                        {
+                            if (option.selected_half_am == "true") amUsed -= 1;
+                            if (option.selected_half_pm == "true") pmUsed -= 1;
+                        }
+                    }
+
+                    bool AllowByAM(int add) => (amUsed + add) <= amMax;
+                    bool AllowByPM(int add) => (pmUsed + add) <= pmMax;
+
+                    if (!canSelect)
+                    {
+                        canFull = false;
+                        canHalfAm = false;
+                        canHalfPm = false;
+                    }
+                    else
+                    {
+                        if (dayType == "WEEKDAY")
+                        {
+                            canFull = canFull && availableForThisEdit >= 1 && AllowByAM(1) && AllowByPM(1);
+                            canHalfAm = canHalfAm && availableForThisEdit >= 0.5 && AllowByAM(1);
+                            canHalfPm = canHalfPm && availableForThisEdit >= 0.5 && AllowByPM(1) && pmHalfUsedCount < pmHalfLimitCount;
+                        }
+                        else if (dayType == "SATURDAY")
+                        {
+                            canFull = false;
+                            canHalfPm = false;
+                            canHalfAm = canHalfAm &&
+                                        availableForThisEdit >= 0.5 &&
+                                        AllowByAM(1) &&
+                                        saturdayUsedCount < saturdayLimitCount;
+                        }
+                        else if (dayType == "SUNDAY")
+                        {
+                            canHalfAm = false;
+                            canHalfPm = false;
+                            canFull = canFull && availableForThisEdit >= 1 && AllowByAM(1) && AllowByPM(1);
+                        }
+
+                        if (!canFull && !canHalfAm && !canHalfPm)
+                        {
+                            if (availableForThisEdit < 0.5)
+                            {
+                                blockReason = "剩餘應休額度不足";
+                            }
+                            else if (dayType == "SATURDAY" && saturdayUsedCount >= saturdayLimitCount)
+                            {
+                                blockReason = $"週六排休已達上限 {saturdayLimitCount} 次";
+                            }
+                            else if (dayType == "WEEKDAY" && pmHalfUsedCount >= pmHalfLimitCount && AllowByAM(1) == false)
+                            {
+                                blockReason = "當日上午休假名額已滿";
+                            }
+                            else if (dayType == "WEEKDAY" && pmHalfUsedCount >= pmHalfLimitCount)
+                            {
+                                blockReason = $"下午半日排休已達上限 {pmHalfLimitCount} 次";
+                            }
+                            else if (!AllowByAM(1) && !AllowByPM(1))
+                            {
+                                blockReason = "當日休假名額已滿";
+                            }
+                            else if (!AllowByAM(1))
+                            {
+                                blockReason = "當日上午休假名額已滿";
+                            }
+                            else if (!AllowByPM(1))
+                            {
+                                blockReason = "當日下午休假名額已滿";
+                            }
+
+                            canSelect = false;
+                        }
+                    }
+
+                    return new StaffQuotaDayoffAvailableOptionDto
+                    {
+                        option_guid = option.GUID ?? "",
+                        item_guid = option.item_guid ?? "",
+                        staff_guid = option.staff_guid ?? "",
+                        staff_id = staff.staff_id ?? "",
+                        staff_name = staff.staff_name ?? "",
+                        date = dt == DateTime.MinValue ? "" : dt.ToDateString('-'),
+                        week_day = dt == DateTime.MinValue ? "" : WeekDayText(dt),
+                        day_type = dt == DateTime.MinValue ? "" : dayType,
+
+                        can_select_full = canFull ? "true" : "false",
+                        can_select_half_am = canHalfAm ? "true" : "false",
+                        can_select_half_pm = canHalfPm ? "true" : "false",
+
+                        is_quota_dayoff = option.is_quota_dayoff ?? "false",
+                        selected_type = selectedType,
+                        quota_used = option.quota_used ?? "0",
+                        quota_dayoff_type = option.quota_dayoff_type ?? "",
+
+                        can_cancel = (option.is_quota_dayoff == "true" && selectedType != "NONE") ? "true" : "false",
+                        can_select = canSelect ? "true" : "false",
+                        block_reason = blockReason,
+                        is_virtual = option.GUID.StringIsEmpty() ? "true" : "false"
+                    };
+                }
+
+                StaffQuotaDayoffAvailableOptionsResponse response = new StaffQuotaDayoffAvailableOptionsResponse();
+                response.form_guid = form.GUID;
+                response.form_name = form.form_name;
+                response.staff_guid = staff.GUID;
+                response.staff_id = staff.staff_id;
+                response.staff_name = staff.staff_name;
+                response.is_reserved_completed = "true";
+                response.quota_summary = quotaSummary;
+                response.rule_summary = ruleSummary;
+
+                foreach (var day in days)
+                {
+                    DateTime dt = day.date.StringToDateTime();
+                    if (dt == DateTime.MinValue) continue;
+
+                    string dateKey = dt.ToDateString('-');
+
+                    itemByDate.TryGetValue(dateKey, out var item);
+                    optionByDate.TryGetValue(dateKey, out var option);
+
+                    // 有排班，排除在應休候選之外
+                    if (HasSchedule(item)) continue;
+
+                    if (option == null)
+                    {
+                        var virtualOption = BuildVirtualOption(dt);
+                        response.available_options.Add(BuildDto(virtualOption));
+                        continue;
+                    }
+
+                    option.NormalizeSelection();
+
+                    bool isSelectedQuota = option.is_quota_dayoff == "true" &&
+                                           (option.selected_full == "true" ||
+                                            option.selected_half_am == "true" ||
+                                            option.selected_half_pm == "true");
+
+                    if (isSelectedQuota)
+                    {
+                        response.selected_options.Add(BuildDto(option));
+                        continue;
+                    }
+
+                    // 不可作為應休候選的既有 option 直接排除
+                    if ((option.dayoff_source_type ?? "").Trim().ToUpper() == "HOLE_FILL") continue;
+                    if (option.is_released == "true") continue;
+                    if (option.is_force_ff == "true") continue;
+                    if (option.is_forbidden == "true") continue;
+
+                    response.available_options.Add(BuildDto(option));
+                }
+
+                response.available_options = response.available_options
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ThenBy(x => x.option_guid)
+                    .ToList();
+
+                response.selected_options = response.selected_options
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ThenBy(x => x.option_guid)
+                    .ToList();
+
+                returnData.Code = 200;
+                returnData.Result = "取得應休排休可用清單成功";
+                returnData.Data = response;
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.TimeTaken = timer.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 查詢應休排休總表（批次優化版 get_quota_dayoff_roster_overview）
+        /// </summary>
+        /// <remarks>
+        /// ===============================
+        /// 【API 說明】
+        /// ===============================
+        /// 本 API 專門提供「應休排休總表」使用。
+        ///
+        /// 本 API 不更動原本 get_form。
+        ///
+        /// get_form：
+        /// - 維持原本排班、預留休、釋出、強制休假等資料顯示。
+        ///
+        /// get_quota_dayoff_roster_overview：
+        /// - 專門提供多人 × 日期的應休排休總表。
+        /// - 回傳每位人員每日是否可選應休。
+        /// - 回傳已選應休。
+        /// - 回傳不可選原因。
+        /// - 回傳應休額度、公平機制、週六次數、下午半日次數。
+        ///
+        /// set_staff_quota_dayoff_selection：
+        /// - 實際新增、修改、取消應休排休。
+        ///
+        ///
+        /// ===============================
+        /// 【效能優化說明】
+        /// ===============================
+        /// 舊版容易慢的原因：
+        ///
+        /// 1. 每一格重複計算當日 AM / PM 名額。
+        /// 2. 每一位人員重複呼叫 GetStaffRemainingQuotaDayoff。
+        /// 3. 每一位人員重複呼叫 GetStaffQuotaDayoffRuleSummary。
+        ///
+        /// 本版改為：
+        ///
+        /// 1. 一次讀取整張表單 days。
+        /// 2. 一次讀取整張表單 items。
+        /// 3. 一次讀取整張表單 options。
+        /// 4. 一次建立 dateQuotaDict。
+        /// 5. 一次建立 quotaSummaryDict。
+        /// 6. 一次建立 ruleSummaryDict。
+        /// 7. 主迴圈只查 Dictionary，不再重複查詢與重算。
+        ///
+        ///
+        /// ===============================
+        /// 【URL】
+        /// ===============================
+        /// POST /phar_roster_api/dayOffSchedule/get_quota_dayoff_roster_overview
+        ///
+        ///
+        /// ===============================
+        /// 【傳入參數 ValueAry】
+        /// ===============================
+        /// form_name = 表單名稱（必填）
+        /// page      = 頁碼（選填，預設 1）
+        /// page_size = 每頁人員數（選填，預設 20）
+        /// staff_ids = 指定人員工號清單（選填，多筆以逗號分隔）
+        ///
+        ///
+        /// ===============================
+        /// 【Request 範例】
+        /// ===============================
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026-03",
+        ///     "page=1",
+        ///     "page_size=20"
+        ///   ]
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【Request 範例：指定人員】
+        /// ===============================
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026-03",
+        ///     "staff_ids=1120468,1130614"
+        ///   ]
+        /// }
+        ///
+        ///
+        /// ===============================
+        /// 【display_type 定義】
+        /// ===============================
+        /// SCHEDULE
+        /// - 該日已有排班
+        ///
+        /// FORCE_FF
+        /// - 系統強制休假
+        ///
+        /// RELEASED
+        /// - 已釋出
+        ///
+        /// HOLE_FILL
+        /// - 填洞休假
+        ///
+        /// QUOTA_SELECTED
+        /// - 已選應休排休
+        ///
+        /// AVAILABLE
+        /// - 可選應休排休
+        ///
+        /// BLOCKED
+        /// - 不可選
+        ///
+        /// EMPTY
+        /// - 空白
+        ///
+        ///
+        /// ===============================
+        /// 【可選判斷規則】
+        /// ===============================
+        /// 平日：
+        /// - FULL：需要剩餘應休 >= 1，且上午、下午皆有名額。
+        /// - HALF_AM：需要剩餘應休 >= 0.5，且上午有名額。
+        /// - HALF_PM：需要剩餘應休 >= 0.5，且下午有名額，且未超過下午半日上限。
+        ///
+        /// 週六：
+        /// - 只允許 HALF_AM。
+        /// - 需要剩餘應休 >= 0.5。
+        /// - 上午有名額。
+        /// - 未超過週六上限。
+        ///
+        /// 週日：
+        /// - 只允許 FULL。
+        /// - 需要剩餘應休 >= 1。
+        /// - 上午、下午皆有名額。
+        ///
+        ///
+        /// ===============================
+        /// 【前端使用建議】
+        /// ===============================
+        /// 1. 應休排休總表使用本 API。
+        /// 2. 原本排班表仍使用 get_form。
+        /// 3. 前端不要自行計算額度、名額、次數。
+        /// 4. 前端只看 can_select_xxx、display_type、block_reason。
+        /// 5. 若 option_guid="" 且 is_virtual="true"，仍可呼叫 set_staff_quota_dayoff_selection。
+        /// 6. 每次新增、修改、取消成功後，重新呼叫本 API。
+        ///
+        /// </remarks>
+        /// <param name="returnData">returnData 物件，使用 ValueAry 傳入 form_name / page / page_size / staff_ids。</param>
+        /// <returns>回傳應休排休總表 JSON。</returns>
+        [HttpPost("get_quota_dayoff_roster_overview")]
+        public string get_quota_dayoff_roster_overview([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "get_quota_dayoff_roster_overview";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_ids_text = GetVal("staff_ids");
+                string page_text = GetVal("page");
+                string page_size_text = GetVal("page_size");
+
+                int page = page_text.StringToInt32();
+                int pageSize = page_size_text.StringToInt32();
+
+                if (page <= 0) page = 1;
+                if (pageSize <= 0) pageSize = 20;
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_form = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_day = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_item = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+                object[] obj_form = sql_form.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                List<DayOffScheduleDayClass> days = sql_day
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .Where(x => x != null)
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                List<DayOffScheduleItemClass> allItems = sql_item
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>();
+
+                List<StaffDayOffOptionClass> allOptions = sql_option
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>();
+
+                allItems = allItems ?? new List<DayOffScheduleItemClass>();
+                allOptions = allOptions ?? new List<StaffDayOffOptionClass>();
+
+                List<string> staffIdFilter = new List<string>();
+                if (!staff_ids_text.StringIsEmpty())
+                {
+                    staffIdFilter = staff_ids_text
+                        .Split(',')
+                        .Select(x => x.Trim())
+                        .Where(x => x.StringIsEmpty() == false)
+                        .ToList();
+                }
+
+                var allStaffs = allItems
+                    .Where(x => x != null && x.staff_guid.StringIsEmpty() == false)
+                    .GroupBy(x => x.staff_guid)
+                    .Select(g => new
+                    {
+                        staff_guid = g.Key,
+                        staff_id = g.First().staff_id,
+                        staff_name = g.First().staff_name,
+                        staff_simple_name = g.First().staff_simple_name,
+                        position = g.First().position
+                    })
+                    .OrderBy(x => x.staff_id)
+                    .ToList();
+
+                if (staffIdFilter.Count > 0)
+                {
+                    allStaffs = allStaffs
+                        .Where(x => staffIdFilter.Contains(x.staff_id))
+                        .ToList();
+                }
+
+                int totalCount = allStaffs.Count;
+                int totalPage = (int)Math.Ceiling(totalCount / (double)pageSize);
+
+                var pageStaffs = allStaffs
+                    .Skip((page - 1) * pageSize)
+                    .Take(pageSize)
+                    .ToList();
+
+                List<string> dateKeys = days
+                    .Select(x => x.date.StringToDateTime().ToDateString('-'))
+                    .Where(x => x.StringIsEmpty() == false)
+                    .ToList();
+
+                Dictionary<string, DayOffDateQuotaUsageSummary> dateQuotaDict =
+                    BuildDateQuotaUsageSummaryDict(days, allOptions);
+
+                Dictionary<string, DayOffScheduleItemClass> itemsByStaffDate = allItems
+                    .Where(x =>
+                        x != null &&
+                        x.staff_guid.StringIsEmpty() == false &&
+                        x.date.StringIsEmpty() == false)
+                    .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime().ToDateString('-')}")
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                Dictionary<string, StaffDayOffOptionClass> optionsByStaffDate = allOptions
+                    .Where(x =>
+                        x != null &&
+                        x.staff_guid.StringIsEmpty() == false &&
+                        x.date.StringIsEmpty() == false)
+                    .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime().ToDateString('-')}")
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                // 批次建立每人應休額度統計
+                Dictionary<string, GetStaffRemainingQuotaDayoffResponse> quotaSummaryDict =
+                    BuildStaffQuotaSummaryDict(form.GUID, days, allItems, allOptions);
+
+                // 批次建立每人公平機制統計
+                Dictionary<string, StaffQuotaDayoffRuleSummary> ruleSummaryDict =
+                    BuildStaffRuleSummaryDict(form.GUID, allOptions, quotaSummaryDict);
+
+                QuotaDayoffRosterOverviewResponse response = new QuotaDayoffRosterOverviewResponse();
+                response.form_guid = form.GUID;
+                response.form_name = form.form_name;
+                response.total_count = totalCount.ToString();
+                response.page = page.ToString();
+                response.page_size = pageSize.ToString();
+                response.total_page = totalPage.ToString();
+                response.dates = dateKeys;
+
+                bool HasSchedule(DayOffScheduleItemClass item)
+                {
+                    if (item == null) return false;
+
+                    WorkShiftRequirementClass req = item.workShiftRequirement;
+                    if (req == null) return false;
+                    if (req.disabled) return false;
+                    if (req.RequiredCountBase <= 0) return false;
+                    if (req.shift_type.StringIsEmpty()) return false;
+
+                    return true;
+                }
+
+                string WeekDayText(DateTime dt)
+                {
+                    if (dt.DayOfWeek == DayOfWeek.Monday) return "Mon";
+                    if (dt.DayOfWeek == DayOfWeek.Tuesday) return "Tue";
+                    if (dt.DayOfWeek == DayOfWeek.Wednesday) return "Wed";
+                    if (dt.DayOfWeek == DayOfWeek.Thursday) return "Thu";
+                    if (dt.DayOfWeek == DayOfWeek.Friday) return "Fri";
+                    if (dt.DayOfWeek == DayOfWeek.Saturday) return "Sat";
+                    return "Sun";
+                }
+
+                string DayType(DateTime dt)
+                {
+                    if (dt.DayOfWeek == DayOfWeek.Saturday) return "SATURDAY";
+                    if (dt.DayOfWeek == DayOfWeek.Sunday) return "SUNDAY";
+                    return "WEEKDAY";
+                }
+
+                string SelectedType(StaffDayOffOptionClass option)
+                {
+                    if (option == null) return "NONE";
+                    if (option.selected_full == "true") return "FULL";
+                    if (option.selected_half_am == "true") return "HALF_AM";
+                    if (option.selected_half_pm == "true") return "HALF_PM";
+                    return "NONE";
+                }
+
+                foreach (var staff in pageStaffs)
+                {
+                    string staffGuid = staff.staff_guid;
+
+                    quotaSummaryDict.TryGetValue(staffGuid, out var quotaSummary);
+                    ruleSummaryDict.TryGetValue(staffGuid, out var ruleSummary);
+
+                    if (quotaSummary == null)
+                    {
+                        quotaSummary = new GetStaffRemainingQuotaDayoffResponse
+                        {
+                            staff_guid = staffGuid,
+                            quota_total = "0",
+                            quota_used_total = "0",
+                            quota_remaining = "0"
+                        };
+                    }
+
+                    if (ruleSummary == null)
+                    {
+                        ruleSummary = new StaffQuotaDayoffRuleSummary
+                        {
+                            quota_total = quotaSummary.quota_total,
+                            quota_used_total = quotaSummary.quota_used_total,
+                            quota_remaining = quotaSummary.quota_remaining,
+                            pm_half_used_count = "0",
+                            saturday_used_count = "0",
+                            pm_half_limit_count = "2",
+                            saturday_limit_count = "1",
+                            has_extra_saturday_limit = "false"
+                        };
+                    }
+
+                    double quotaRemaining = quotaSummary.quota_remaining.StringToDouble();
+
+                    int pmHalfUsedCount = ruleSummary.pm_half_used_count.StringToInt32();
+                    int pmHalfLimitCount = ruleSummary.pm_half_limit_count.StringToInt32();
+
+                    int saturdayUsedCount = ruleSummary.saturday_used_count.StringToInt32();
+                    int saturdayLimitCount = ruleSummary.saturday_limit_count.StringToInt32();
+
+                    QuotaDayoffRosterStaffRowDto row = new QuotaDayoffRosterStaffRowDto();
+                    row.staff_guid = staff.staff_guid;
+                    row.staff_id = staff.staff_id;
+                    row.staff_name = staff.staff_name;
+                    row.staff_simple_name = staff.staff_simple_name;
+                    row.position = staff.position;
+                    row.quota_summary = quotaSummary;
+                    row.rule_summary = ruleSummary;
+
+                    foreach (var day in days)
+                    {
+                        DateTime dt = day.date.StringToDateTime();
+                        if (dt == DateTime.MinValue) continue;
+
+                        string dateKey = dt.ToDateString('-');
+                        string staffDateKey = $"{staffGuid}|{dateKey}";
+                        string dayType = DayType(dt);
+
+                        itemsByStaffDate.TryGetValue(staffDateKey, out var item);
+                        optionsByStaffDate.TryGetValue(staffDateKey, out var option);
+                        dateQuotaDict.TryGetValue(dateKey, out var dateSummary);
+
+                        QuotaDayoffRosterCellDto cell = new QuotaDayoffRosterCellDto();
+                        cell.date = dateKey;
+                        cell.week_day = WeekDayText(dt);
+                        cell.day_type = dayType;
+                        cell.option_guid = "";
+                        cell.is_virtual = "true";
+                        cell.selected_type = "NONE";
+                        cell.quota_used = "0";
+                        cell.quota_dayoff_type = "";
+                        cell.can_select_full = "false";
+                        cell.can_select_half_am = "false";
+                        cell.can_select_half_pm = "false";
+                        cell.can_select = "false";
+                        cell.can_cancel = "false";
+                        cell.block_reason = "";
+                        cell.display_type = "EMPTY";
+                        cell.display_text = "-";
+
+                        if (HasSchedule(item))
+                        {
+                            cell.display_type = "SCHEDULE";
+                            cell.display_text = item?.workShiftRequirement?.shift_type ?? "班";
+                            cell.block_reason = "該日已有排班，不可選擇應休排休";
+                            row.cells.Add(cell);
+                            continue;
+                        }
+
+                        if (option != null)
+                        {
+                            option.NormalizeSelection();
+
+                            string selectedType = SelectedType(option);
+
+                            cell.option_guid = option.GUID;
+                            cell.is_virtual = "false";
+                            cell.selected_type = selectedType;
+                            cell.quota_used = option.quota_used ?? "0";
+                            cell.quota_dayoff_type = option.quota_dayoff_type ?? "";
+                            cell.can_cancel =
+                                (option.is_quota_dayoff == "true" && selectedType != "NONE")
+                                ? "true"
+                                : "false";
+
+                            if (option.is_force_ff == "true")
+                            {
+                                cell.display_type = "FORCE_FF";
+                                cell.display_text = "FF";
+                                cell.block_reason = "系統強制放假";
+                                row.cells.Add(cell);
+                                continue;
+                            }
+
+                            if (option.is_released == "true")
+                            {
+                                cell.display_type = "RELEASED";
+                                cell.display_text = option.released_dayoff_type ?? "釋";
+                                cell.block_reason = "已釋出中的 option 不可作為應休排休操作";
+                                row.cells.Add(cell);
+                                continue;
+                            }
+
+                            if ((option.dayoff_source_type ?? "").Trim().ToUpper() == "HOLE_FILL")
+                            {
+                                cell.display_type = "HOLE_FILL";
+                                cell.display_text = selectedType == "NONE" ? "洞" : selectedType;
+                                cell.block_reason = "填洞休假不可作為應休排休操作";
+                                row.cells.Add(cell);
+                                continue;
+                            }
+
+                            if (option.is_quota_dayoff == "true" && selectedType != "NONE")
+                            {
+                                cell.display_type = "QUOTA_SELECTED";
+                                cell.display_text = selectedType;
+                                row.cells.Add(cell);
+                                continue;
+                            }
+
+                            if (option.is_forbidden == "true")
+                            {
+                                cell.display_type = "BLOCKED";
+                                cell.display_text = "-";
+                                cell.block_reason = "此 option 已被禁止操作";
+                                row.cells.Add(cell);
+                                continue;
+                            }
+                        }
+
+                        int amUsed = 0;
+                        int pmUsed = 0;
+                        int amMax = 0;
+                        int pmMax = 0;
+
+                        if (dateSummary != null)
+                        {
+                            amUsed = dateSummary.am_used_count.StringToInt32();
+                            pmUsed = dateSummary.pm_used_count.StringToInt32();
+                            amMax = dateSummary.am_max_dayoff_count.StringToInt32();
+                            pmMax = dateSummary.pm_max_dayoff_count.StringToInt32();
+                        }
+
+                        bool AllowByAM(int add) => (amUsed + add) <= amMax;
+                        bool AllowByPM(int add) => (pmUsed + add) <= pmMax;
+
+                        bool canFull = false;
+                        bool canHalfAM = false;
+                        bool canHalfPM = false;
+
+                        if (dayType == "WEEKDAY")
+                        {
+                            canFull = quotaRemaining >= 1 && AllowByAM(1) && AllowByPM(1);
+                            canHalfAM = quotaRemaining >= 0.5 && AllowByAM(1);
+                            canHalfPM = quotaRemaining >= 0.5 && AllowByPM(1) && pmHalfUsedCount < pmHalfLimitCount;
+                        }
+                        else if (dayType == "SATURDAY")
+                        {
+                            canFull = false;
+                            canHalfPM = false;
+                            canHalfAM =
+                                quotaRemaining >= 0.5 &&
+                                AllowByAM(1) &&
+                                saturdayUsedCount < saturdayLimitCount;
+                        }
+                        else if (dayType == "SUNDAY")
+                        {
+                            canFull = quotaRemaining >= 1 && AllowByAM(1) && AllowByPM(1);
+                            canHalfAM = false;
+                            canHalfPM = false;
+                        }
+
+                        cell.can_select_full = canFull ? "true" : "false";
+                        cell.can_select_half_am = canHalfAM ? "true" : "false";
+                        cell.can_select_half_pm = canHalfPM ? "true" : "false";
+
+                        bool anyCanSelect = canFull || canHalfAM || canHalfPM;
+                        cell.can_select = anyCanSelect ? "true" : "false";
+
+                        if (anyCanSelect)
+                        {
+                            cell.display_type = "AVAILABLE";
+                            cell.display_text = "";
+                        }
+                        else
+                        {
+                            cell.display_type = "BLOCKED";
+                            cell.display_text = "-";
+
+                            if (quotaRemaining < 0.5)
+                            {
+                                cell.block_reason = "剩餘應休額度不足";
+                            }
+                            else if (dayType == "SATURDAY" && saturdayUsedCount >= saturdayLimitCount)
+                            {
+                                cell.block_reason = $"週六排休已達上限 {saturdayLimitCount} 次";
+                            }
+                            else if (dayType == "WEEKDAY" && pmHalfUsedCount >= pmHalfLimitCount && !AllowByAM(1))
+                            {
+                                cell.block_reason = "當日上午休假名額已滿";
+                            }
+                            else if (dayType == "WEEKDAY" && pmHalfUsedCount >= pmHalfLimitCount)
+                            {
+                                cell.block_reason = $"下午半日排休已達上限 {pmHalfLimitCount} 次";
+                            }
+                            else if (!AllowByAM(1) && !AllowByPM(1))
+                            {
+                                cell.block_reason = "當日休假名額已滿";
+                            }
+                            else if (!AllowByAM(1))
+                            {
+                                cell.block_reason = "當日上午休假名額已滿";
+                            }
+                            else if (!AllowByPM(1))
+                            {
+                                cell.block_reason = "當日下午休假名額已滿";
+                            }
+                        }
+
+                        row.cells.Add(cell);
+                    }
+
+                    response.rows.Add(row);
+                }
+
+                returnData.Code = 200;
+                returnData.Result = "取得應休排休總表成功";
+                returnData.Data = response;
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+            finally
+            {
+                returnData.TimeTaken = timer.ToString();
+            }
+        }
+
+        /// <summary>
+        /// 下載排休月曆 PDF
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途
+        /// 本 API 用於產生「排休月曆 PDF」。
+        /// 版型為月曆格式，一格代表一天，格內顯示當日休假人員。
+        ///
+        /// ## 顯示規則
+        /// - 整日休假：顯示簡名，例如：邵
+        /// - 上午休假：顯示簡名 + AM，例如：邵AM
+        /// - 下午休假：顯示簡名 + PM，例如：邵PM
+        /// - 同一天多人休假以「、」分隔，例如：邵AM、李PM、呂、湯AM
+        ///
+        /// ## 排除規則
+        /// 以下資料不顯示：
+        /// - is_released = true
+        /// - is_force_ff = true
+        /// - dayoff_source_type = NATIONAL_HOLIDAY
+        /// - dayoff_source_type = FORCE_FF
+        /// - item.selected_dayoff_type = FF
+        /// - item.selected_dayoff_type = NH
+        ///
+        /// ## Request JSON 範例
+        /// ```json
+        /// {
+        ///   "ValueAry": [
+        ///     "form_name=2026-04"
+        ///   ]
+        /// }
+        /// ```
+        ///
+        /// ## 成功回傳
+        /// PDF 檔案串流。
+        ///
+        /// </remarks>
+        /// <param name="returnData">returnData，ValueAry 需包含 form_name。</param>
+        /// <returns>PDF 檔案串流。</returns>
+        [HttpPost("download_dayoff_calendar_pdf")]
+        public IActionResult download_dayoff_calendar_pdf([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "download_dayoff_calendar_pdf";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string form_name = GetVal("form_name") ?? "";
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return new JsonResult(returnData);
+                }
+
+                var sql_form = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_day = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_item = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+                object[] obj_form = sql_form.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return new JsonResult(returnData);
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                List<DayOffScheduleDayClass> days = sql_day
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .Where(x => x != null)
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                if (days.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"表單({form_name})沒有日期資料";
+                    return new JsonResult(returnData);
+                }
+
+                List<DayOffScheduleItemClass> items = sql_item
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                List<StaffDayOffOptionClass> options = sql_option
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                DateTime firstFormDate = days.First().date.StringToDateTime();
+                int year = firstFormDate.Year;
+                int month = firstFormDate.Month;
+
+                DateTime firstDayOfMonth = new DateTime(year, month, 1);
+                DateTime lastDayOfMonth = new DateTime(year, month, DateTime.DaysInMonth(year, month));
+
+                Dictionary<string, DayOffScheduleItemClass> itemByGuid = items
+                    .Where(x => x != null && !x.GUID.StringIsEmpty())
+                    .GroupBy(x => x.GUID)
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                Dictionary<string, string> staffSimpleNameDict = items
+                    .Where(x => x != null && !x.staff_guid.StringIsEmpty())
+                    .GroupBy(x => x.staff_guid)
+                    .ToDictionary(
+                        g => g.Key,
+                        g =>
+                        {
+                            string simple = g.First().staff_simple_name;
+                            if (!simple.StringIsEmpty()) return simple;
+
+                            string name = g.First().staff_name;
+                            if (!name.StringIsEmpty()) return name.Substring(name.Length - 1, 1);
+
+                            return "";
+                        });
+
+                try
+                {
+                    List<StaffClass> staffClasses = staff.GetStaffs(new List<string>() { "pageSize=10000" }).staffClasses;
+
+                    foreach (var st in staffClasses)
+                    {
+                        if (st == null) continue;
+                        if (st.GUID.StringIsEmpty()) continue;
+                        if (staffSimpleNameDict.ContainsKey(st.GUID)) continue;
+
+                        string simple = st.staff_simple_name;
+                        if (simple.StringIsEmpty() && !st.staff_name.StringIsEmpty())
+                        {
+                            simple = st.staff_name.Substring(st.staff_name.Length - 1, 1);
+                        }
+
+                        staffSimpleNameDict[st.GUID] = simple;
+                    }
+                }
+                catch
+                {
+                }
+
+                bool IsTrue(string value)
+                {
+                    return (value ?? "").Trim().ToLower() == "true";
+                }
+
+                bool HasSelectedDayoff(StaffDayOffOptionClass opt)
+                {
+                    if (opt == null) return false;
+
+                    opt.NormalizeSelection();
+
+                    return IsTrue(opt.selected_full) ||
+                           IsTrue(opt.selected_half_am) ||
+                           IsTrue(opt.selected_half_pm);
+                }
+
+                string GetDayoffSuffix(StaffDayOffOptionClass opt)
+                {
+                    if (opt == null) return "";
+
+                    opt.NormalizeSelection();
+
+                    if (IsTrue(opt.selected_full)) return "";
+                    if (IsTrue(opt.selected_half_am)) return "AM";
+                    if (IsTrue(opt.selected_half_pm)) return "PM";
+
+                    return "";
+                }
+
+                bool ShouldExcludeOption(StaffDayOffOptionClass opt)
+                {
+                    if (opt == null) return true;
+
+                    string sourceType = (opt.dayoff_source_type ?? "").Trim().ToUpper();
+
+                    if (IsTrue(opt.is_released)) return true;
+                    if (IsTrue(opt.is_force_ff)) return true;
+
+                    if (sourceType == "NATIONAL_HOLIDAY") return true;
+                    if (sourceType == "FORCE_FF") return true;
+
+                    if (!opt.item_guid.StringIsEmpty() && itemByGuid.TryGetValue(opt.item_guid, out var item))
+                    {
+                        string selectedDayoffType = (item.selected_dayoff_type ?? "").Trim().ToUpper();
+
+                        if (selectedDayoffType == "FF") return true;
+                        if (selectedDayoffType == "NH") return true;
+                    }
+
+                    return false;
+                }
+
+                Dictionary<string, List<string>> dayoffTextByDate = new Dictionary<string, List<string>>();
+
+                foreach (var opt in options)
+                {
+                    if (opt == null) continue;
+                    if (!HasSelectedDayoff(opt)) continue;
+                    if (ShouldExcludeOption(opt)) continue;
+
+                    DateTime optDate = opt.date.StringToDateTime();
+                    if (optDate == DateTime.MinValue) continue;
+                    if (optDate < firstDayOfMonth || optDate > lastDayOfMonth) continue;
+
+                    staffSimpleNameDict.TryGetValue(opt.staff_guid, out string simpleName);
+
+                    if (simpleName.StringIsEmpty())
+                    {
+                        simpleName = "未知";
+                    }
+
+                    string displayText = $"{simpleName}{GetDayoffSuffix(opt)}";
+                    string dateKey = optDate.ToDateString('-');
+
+                    if (!dayoffTextByDate.ContainsKey(dateKey))
+                    {
+                        dayoffTextByDate[dateKey] = new List<string>();
+                    }
+
+                    if (!dayoffTextByDate[dateKey].Contains(displayText))
+                    {
+                        dayoffTextByDate[dateKey].Add(displayText);
+                    }
+                }
+
+                foreach (var key in dayoffTextByDate.Keys.ToList())
+                {
+                    dayoffTextByDate[key] = dayoffTextByDate[key]
+                        .OrderBy(x => x)
+                        .ToList();
+                }
+
+                int offsetToMonday = ((int)firstDayOfMonth.DayOfWeek + 6) % 7;
+                DateTime firstMonday = firstDayOfMonth.AddDays(-offsetToMonday);
+
+                int offsetToSunday = 7 - ((int)lastDayOfMonth.DayOfWeek + 6) % 7 - 1;
+                DateTime lastSunday = lastDayOfMonth.AddDays(offsetToSunday);
+
+                SheetClass sheet = new SheetClass();
+
+                if ((lastSunday - firstMonday).Days <= 35)
+                {
+                    sheet = monthly_shift_schedule_5_week_excel.xlsx.JsonDeserializet<SheetClass>();
+                }
+                else
+                {
+                    sheet = monthly_shift_schedule_6_week_excel.xlsx.JsonDeserializet<SheetClass>();
+                }
+
+                sheet.Rows[0].Cell[0].Text = $"{year}-{month}月排休表";
+
+                int weekIndex = 1;
+
+                for (DateTime d = firstMonday; d <= lastSunday; d = d.AddDays(1))
+                {
+                    int dayOfWeek = ((int)d.DayOfWeek + 6) % 7 + 1;
+
+                    if (dayOfWeek == 1 && d > firstMonday)
+                    {
+                        weekIndex++;
+                    }
+
+                    int baseRow = 2 + (weekIndex - 1) * 7;
+                    int col = dayOfWeek - 1;
+
+                    string dateKey = d.ToDateString('-');
+
+                    string headerText = d.Day.ToString();
+
+                    if (d.Month != month)
+                    {
+                        sheet.Rows[baseRow].Cell[col].Text = headerText;
+                        ClearCalendarBodyRows(sheet, baseRow, col);
+                        continue;
+                    }
+
+                    sheet.Rows[baseRow].Cell[col].Text = headerText;
+
+                    List<string> names = new List<string>();
+                    if (dayoffTextByDate.TryGetValue(dateKey, out var list))
+                    {
+                        names = list;
+                    }
+
+                    string bodyText = names.Count > 0 ? string.Join("、", names) : "";
+
+                    ClearCalendarBodyRows(sheet, baseRow, col);
+
+                    // 節省空間：全部寫在同一格，用「、」分隔
+                    sheet.Rows[baseRow + 1].Cell[col].Text = bodyText;
+                }
+
+                byte[] bytes_pdf = sheet.SaveToPDF(PdfSharp.PageSize.A4, PdfSharp.PageOrientation.Landscape);
+
+                Stream stream = new MemoryStream(bytes_pdf);
+                string contentType = "application/octet-stream";
+                string originalName = $"dayoff_calendar_{form_name}.pdf";
+                string utf8FileName = Uri.EscapeDataString(originalName);
+
+                Response.Headers.Add("Content-Disposition", $"attachment; filename=\"{originalName}\"; filename*=UTF-8''{utf8FileName}");
+                Response.Headers.Add("Access-Control-Expose-Headers", "Content-Disposition, Content-Length, Content-Type");
+
+                return File(stream, contentType);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = $"例外：{ex.Message}";
+                return new JsonResult(returnData);
+            }
+        }
+        /// <summary>
+        /// 清空月曆日期格內的內容列，只保留日期列。
+        /// baseRow 為日期列，例如第 2, 9, 16... 列。
+        /// </summary>
+        private void ClearCalendarBodyRows(SheetClass sheet, int baseRow, int col)
+        {
+            if (sheet == null) return;
+
+            for (int r = baseRow + 1; r <= baseRow + 6; r++)
+            {
+                if (r < 0) continue;
+                if (r >= sheet.Rows.Count) continue;
+                if (col < 0) continue;
+                if (col >= sheet.Rows[r].Cell.Count) continue;
+
+                sheet.Rows[r].Cell[col].Text = "";
+            }
+        }
+
+        private Dictionary<string, DayOffDateQuotaUsageSummary> BuildDateQuotaUsageSummaryDict(List<DayOffScheduleDayClass> days, List<StaffDayOffOptionClass> allOptions)
+        {
+            var dict = new Dictionary<string, DayOffDateQuotaUsageSummary>();
+
+            days = days ?? new List<DayOffScheduleDayClass>();
+            allOptions = allOptions ?? new List<StaffDayOffOptionClass>();
+
+            var optionByDate = allOptions
+                .Where(x => x != null && !x.date.StringIsEmpty())
+                .GroupBy(x => x.date.StringToDateTime().ToDateString('-'))
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            foreach (var day in days)
+            {
+                DateTime dt = day.date.StringToDateTime();
+                if (dt == DateTime.MinValue) continue;
+
+                string dateKey = dt.ToDateString('-');
+                if (dateKey.StringIsEmpty()) continue;
+
+                int amUsed = 0;
+                int pmUsed = 0;
+
+                if (optionByDate.TryGetValue(dateKey, out var options))
+                {
+                    foreach (var option in options)
+                    {
+                        if (option == null) continue;
+
+                        option.NormalizeSelection();
+
+                        if (option.selected_full == "true")
+                        {
+                            amUsed++;
+                            pmUsed++;
+                        }
+                        else
+                        {
+                            if (option.selected_half_am == "true") amUsed++;
+                            if (option.selected_half_pm == "true") pmUsed++;
+                        }
+                    }
+                }
+
+                int amMax = day.am_max_dayoff_count.StringToInt32();
+                int pmMax = day.pm_max_dayoff_count.StringToInt32();
+
+                dict[dateKey] = new DayOffDateQuotaUsageSummary
+                {
+                    date = dateKey,
+                    am_max_dayoff_count = amMax.ToString(),
+                    pm_max_dayoff_count = pmMax.ToString(),
+                    am_used_count = amUsed.ToString(),
+                    pm_used_count = pmUsed.ToString(),
+                    am_remaining_count = (amMax - amUsed).ToString(),
+                    pm_remaining_count = (pmMax - pmUsed).ToString()
+                };
+            }
+
+            return dict;
+        }
+        private Dictionary<string, GetStaffRemainingQuotaDayoffResponse> BuildStaffQuotaSummaryDict( string form_guid,  List<DayOffScheduleDayClass> days, List<DayOffScheduleItemClass> allItems,  List<StaffDayOffOptionClass> allOptions)
+        {
+            var dict = new Dictionary<string, GetStaffRemainingQuotaDayoffResponse>();
+
+            days = days ?? new List<DayOffScheduleDayClass>();
+            allItems = allItems ?? new List<DayOffScheduleItemClass>();
+            allOptions = allOptions ?? new List<StaffDayOffOptionClass>();
+
+            bool HasSchedule(DayOffScheduleItemClass item)
+            {
+                if (item == null) return false;
+
+                WorkShiftRequirementClass req = item.workShiftRequirement;
+                if (req == null) return false;
+                if (req.disabled) return false;
+                if (req.RequiredCountBase <= 0) return false;
+                if (req.shift_type.StringIsEmpty()) return false;
+
+                return true;
+            }
+
+            var staffGuids = allItems
+                .Where(x => x != null && !x.staff_guid.StringIsEmpty())
+                .Select(x => x.staff_guid)
+                .Union(allOptions.Where(x => x != null && !x.staff_guid.StringIsEmpty()).Select(x => x.staff_guid))
+                .Distinct()
+                .ToList();
+
+            var itemsByStaffDate = allItems
+                .Where(x => x != null && !x.staff_guid.StringIsEmpty() && !x.date.StringIsEmpty())
+                .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime().ToDateString('-')}")
+                .ToDictionary(g => g.Key, g => g.First());
+
+            var optionsByStaff = allOptions
+                .Where(x => x != null && !x.staff_guid.StringIsEmpty())
+                .GroupBy(x => x.staff_guid)
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            foreach (var staffGuid in staffGuids)
+            {
+                double quotaTotal = 0;
+                double quotaUsed = 0;
+
+                // 1. 週六沒有排班，強制應休 +0.5
+                foreach (var day in days)
+                {
+                    DateTime dt = day.date.StringToDateTime();
+                    if (dt == DateTime.MinValue) continue;
+
+                    if (dt.DayOfWeek != DayOfWeek.Saturday) continue;
+
+                    string dateKey = dt.ToDateString('-');
+                    string key = $"{staffGuid}|{dateKey}";
+
+                    itemsByStaffDate.TryGetValue(key, out var item);
+
+                    if (!HasSchedule(item))
+                    {
+                        quotaTotal += 0.5;
+                    }
+                }
+
+                if (optionsByStaff.TryGetValue(staffGuid, out var opts))
+                {
+                    foreach (var opt in opts)
+                    {
+                        if (opt == null) continue;
+
+                        opt.NormalizeSelection();
+
+                        // 2. 任選假 is_any_date=true，應休 +1
+                        if (opt.is_any_date == "true")
+                        {
+                            quotaTotal += 1;
+                        }
+
+                        // 3. 釋出增加應休額度
+                        if (opt.is_released == "true")
+                        {
+                            string releaseType = (opt.released_dayoff_type ?? "").Trim().ToUpper();
+
+                            if (releaseType == "FULL")
+                            {
+                                quotaTotal += 1;
+                            }
+                            else if (releaseType == "HALF_AM" || releaseType == "HALF_PM")
+                            {
+                                quotaTotal += 0.5;
+                            }
+                        }
+
+                        // 4. 已使用應休額度
+                        if (opt.is_quota_dayoff == "true")
+                        {
+                            quotaUsed += opt.quota_used.StringToDouble();
+                        }
+                    }
+                }
+
+                double quotaRemaining = quotaTotal - quotaUsed;
+                if (quotaRemaining < 0) quotaRemaining = 0;
+
+                dict[staffGuid] = new GetStaffRemainingQuotaDayoffResponse
+                {
+                    staff_guid = staffGuid,
+                    quota_total = quotaTotal.ToString("0.##"),
+                    quota_used_total = quotaUsed.ToString("0.##"),
+                    quota_remaining = quotaRemaining.ToString("0.##")
+                };
+            }
+
+            return dict;
+        }
+        private Dictionary<string, StaffQuotaDayoffRuleSummary> BuildStaffRuleSummaryDict( string form_guid, List<StaffDayOffOptionClass> allOptions, Dictionary<string, GetStaffRemainingQuotaDayoffResponse> quotaSummaryDict)
+        {
+            var dict = new Dictionary<string, StaffQuotaDayoffRuleSummary>();
+
+            allOptions = allOptions ?? new List<StaffDayOffOptionClass>();
+            quotaSummaryDict = quotaSummaryDict ?? new Dictionary<string, GetStaffRemainingQuotaDayoffResponse>();
+
+            var staffGuids = quotaSummaryDict.Keys
+                .Union(allOptions.Where(x => x != null && !x.staff_guid.StringIsEmpty()).Select(x => x.staff_guid))
+                .Distinct()
+                .ToList();
+
+            var optionsByStaff = allOptions
+                .Where(x => x != null && !x.staff_guid.StringIsEmpty())
+                .GroupBy(x => x.staff_guid)
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            foreach (var staffGuid in staffGuids)
+            {
+                int pmHalfUsedCount = 0;
+                int saturdayUsedCount = 0;
+
+                int pmHalfLimitCount = 2;
+                int saturdayLimitCount = 1;
+
+                bool hasExtraSaturdayLimit = false;
+
+                if (optionsByStaff.TryGetValue(staffGuid, out var opts))
+                {
+                    foreach (var opt in opts)
+                    {
+                        if (opt == null) continue;
+
+                        opt.NormalizeSelection();
+
+                        string quotaType = (opt.quota_dayoff_type ?? "").Trim().ToUpper();
+
+                        if (opt.is_quota_dayoff == "true")
+                        {
+                            if (quotaType == "WEEKDAY_HALF_PM")
+                            {
+                                pmHalfUsedCount++;
+                            }
+
+                            if (quotaType == "SATURDAY_HALF_AM")
+                            {
+                                saturdayUsedCount++;
+                            }
+                        }
+
+                        if (opt.is_released == "true")
+                        {
+                            DateTime dt = opt.date.StringToDateTime();
+
+                            if (dt != DateTime.MinValue &&
+                                (dt.DayOfWeek == DayOfWeek.Saturday || dt.DayOfWeek == DayOfWeek.Sunday))
+                            {
+                                hasExtraSaturdayLimit = true;
+                            }
+                        }
+                    }
+                }
+
+                if (hasExtraSaturdayLimit)
+                {
+                    saturdayLimitCount += 1;
+                }
+
+                quotaSummaryDict.TryGetValue(staffGuid, out var quotaSummary);
+
+                if (quotaSummary == null)
+                {
+                    quotaSummary = new GetStaffRemainingQuotaDayoffResponse
+                    {
+                        staff_guid = staffGuid,
+                        quota_total = "0",
+                        quota_used_total = "0",
+                        quota_remaining = "0"
+                    };
+                }
+
+                dict[staffGuid] = new StaffQuotaDayoffRuleSummary
+                {
+                    quota_total = quotaSummary.quota_total,
+                    quota_used_total = quotaSummary.quota_used_total,
+                    quota_remaining = quotaSummary.quota_remaining,
+
+                    pm_half_used_count = pmHalfUsedCount.ToString(),
+                    saturday_used_count = saturdayUsedCount.ToString(),
+
+                    pm_half_limit_count = pmHalfLimitCount.ToString(),
+                    saturday_limit_count = saturdayLimitCount.ToString(),
+
+                    has_extra_saturday_limit = hasExtraSaturdayLimit ? "true" : "false"
+                };
+            }
+
+            return dict;
+        }
+
+
+
 
         /// <summary>
         /// 查詢 staff_dayoff_option 的異動歷程（StaffDayOffOptionLogClass）。
@@ -6404,6 +10497,2398 @@ namespace PharmaRosterAPI
             }
         }
 
+        private static readonly object _dayoffReleasePoolLock = new object();
+
+        /// <summary>
+        /// 釋出指定放假選項並建立釋出池（升級版 release_dayoff_option）
+        /// </summary>
+        /// <remarks>
+        /// ## 🌐 API URL
+        /// POST /phar_roster_api/DayOffSchedule/release_dayoff_option
+        ///
+        /// ## 📘 功能說明
+        /// 將指定的 StaffDayOffOptionClass 標記為釋出，並同步建立一筆 DayOffReleasePoolClass，
+        /// 供其他人後續填洞接手。
+        ///
+        /// ## 升級版規則
+        /// 1. 釋出與休假選擇互斥
+        /// 2. 若 selected_full=true，則不可釋出 FULL
+        /// 3. 若 selected_half_am=true，則自動釋出 HALF_PM
+        /// 4. 若 selected_half_pm=true，則自動釋出 HALF_AM
+        /// 5. 若目前沒有任何休假選擇，才允許由前端指定 FULL / HALF_AM / HALF_PM
+        ///
+        /// ## 注意
+        /// - 本 API 不允許重複釋出
+        /// - 本 API 不處理接手者資料
+        /// </remarks>
+        [HttpPost("release_dayoff_option")]
+        public string release_dayoff_option([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "release_dayoff_option";
+            try
+            {
+                string GetVal(string key) =>
+                  returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                  ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string option_guid = GetVal("option_guid");
+                string release_dayoff_type = GetVal("release_dayoff_type");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_name";
+                    return returnData.JsonSerializationt();
+                }
+                if (option_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 option_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                release_dayoff_type = (release_dayoff_type ?? "").Trim().ToUpper();
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffReleasePoolClass = MethodClass.GetSQLControl<DayOffReleasePoolClass>();
+
+                object[] obj_dayOffScheduleForm = sql_dayOffScheduleFormClass
+                    .GetRowsByDefult(null, "form_name", form_name)
+                    .FirstOrDefault();
+
+                if (obj_dayOffScheduleForm == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass dayOffScheduleForm = obj_dayOffScheduleForm.SQLToClass<DayOffScheduleFormClass>();
+
+                object[] obj_option = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "GUID", option_guid)
+                    .FirstOrDefault();
+
+                if (obj_option == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到放假選項(option_guid={option_guid})";
+                    return returnData.JsonSerializationt();
+                }
+
+                StaffDayOffOptionClass option = obj_option.SQLToClass<StaffDayOffOptionClass>();
+
+                if (option.form_guid != dayOffScheduleForm.GUID)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "option 不屬於指定表單";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.is_force_ff == "true")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "系統強制放假(FF)不可釋出";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.is_released == "true")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "此放假選項已釋出，不可重複操作";
+                    return returnData.JsonSerializationt();
+                }
+
+                option.NormalizeSelection();
+
+                bool isFull = option.selected_full == "true";
+                bool isHalfAm = option.selected_half_am == "true";
+                bool isHalfPm = option.selected_half_pm == "true";
+
+                // =========================================================
+                // 自動決定合法釋出類型
+                // =========================================================
+                if (isFull)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "已選擇全日休假時不可釋出整日";
+                    return returnData.JsonSerializationt();
+                }
+                else if (isHalfAm)
+                {
+                    // 選上午休 → 自動釋出下午
+                    release_dayoff_type = "HALF_PM";
+                }
+                else if (isHalfPm)
+                {
+                    // 選下午休 → 自動釋出上午
+                    release_dayoff_type = "HALF_AM";
+                }
+                else
+                {
+                    // 沒有休假選擇時，才接受前端指定
+                    if (release_dayoff_type != "FULL" &&
+                        release_dayoff_type != "HALF_AM" &&
+                        release_dayoff_type != "HALF_PM")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "未選擇休假時，release_dayoff_type 只允許 FULL / HALF_AM / HALF_PM";
+                        return returnData.JsonSerializationt();
+                    }
+                }
+
+                string now = DateTime.Now.ToDateTimeString();
+
+                lock (_dayoffReleasePoolLock)
+                {
+                    // 防止重複建 pool
+                    bool existsPool = sql_dayOffReleasePoolClass
+                        .GetRowsByDefult(null, "source_option_guid", option.GUID)
+                        .SQLToClass<DayOffReleasePoolClass>()
+                        .Any(x => x.status == "OPEN");
+
+                    if (existsPool)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "此 option 已存在 OPEN 狀態的釋出池";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    DayOffReleasePoolClass pool = new DayOffReleasePoolClass();
+                    pool.GUID = Guid.NewGuid().ToString();
+                    pool.form_guid = option.form_guid;
+                    pool.source_option_guid = option.GUID;
+                    pool.source_item_guid = option.item_guid;
+                    pool.source_staff_guid = option.staff_guid;
+                    pool.date = option.date;
+                    pool.release_dayoff_type = release_dayoff_type;
+                    pool.total_slots = "1";
+                    pool.claimed_slots = "0";
+                    pool.remaining_slots = "1";
+                    pool.status = "OPEN";
+                    pool.version_no = "1";
+                    pool.created_at = now;
+                    pool.updated_at = now;
+
+                    // 釋出不再改動目前已選休假
+                    option.is_released = "true";
+                    option.released_at = now;
+                    option.released_dayoff_type = release_dayoff_type;
+                    option.release_pool_guid = pool.GUID;
+                    option.dayoff_source_type = "RELEASED_SOURCE";
+                    option.updated_at = now;
+
+                    option.NormalizeSelection();
+
+                    sql_dayOffReleasePoolClass.AddRows(null, new List<object[]>() { pool.ClassToSQL<DayOffReleasePoolClass>() });
+                    sql_staffDayOffOptionClass.UpdateByDefulteExtra(null, option.ClassToSQL<StaffDayOffOptionClass>());
+
+                    returnData.Code = 200;
+                    returnData.Data = new
+                    {
+                        option,
+                        release_pool = pool
+                    };
+                    returnData.Result = "釋出成功";
+                    return returnData.JsonSerializationt(true);
+                }
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 取消指定放假選項的釋出狀態（同步最新規則版 cancel_release_dayoff_option）
+        /// </summary>
+        /// <remarks>
+        /// ## 🌐 API URL  
+        /// `POST /phar_roster_api/DayOffSchedule/cancel_release_dayoff_option`
+        ///
+        /// ## 📘 功能說明  
+        /// 依據指定的放假選項 GUID (<c>option_guid</c>)，
+        /// 將該筆原始釋出 option 的釋出狀態取消，並同步關閉對應的釋出池。
+        ///
+        ///
+        /// ## ✅ 同步最新規則
+        /// 1. 取消釋出時：
+        ///    - 只清除釋出狀態
+        ///    - 不恢復、不改動原本的 selected_full / selected_half_am / selected_half_pm
+        ///
+        /// 2. 若該 option 有對應 DayOffReleasePoolClass，
+        ///    且 pool.claimed_slots > 0
+        ///    → 不可取消釋出（因為已有人接手）
+        ///
+        /// 3. 若 pool.claimed_slots = 0
+        ///    → 可取消釋出：
+        ///    - option.is_released = false
+        ///    - option.released_dayoff_type = ""
+        ///    - option.released_at = MinValue
+        ///    - option.release_pool_guid = ""
+        ///    - 若 dayoff_source_type = RELEASED_SOURCE，則清空
+        ///    - pool.status = CANCELLED
+        ///
+        ///
+        /// ## 📥 Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "cancel_release_dayoff_option",
+        ///   "ValueAry": [
+        ///     "form_name=2026年03月排休表",
+        ///     "option_guid=OPTION_GUID_001"
+        ///   ],
+        ///   "Data": {}
+        /// }
+        /// ```
+        ///
+        ///
+        /// ## 📤 成功回傳範例
+        /// ```json
+        /// {
+        ///   "Code": 200,
+        ///   "Result": "取消釋出成功",
+        ///   "Data": {
+        ///     "option": {
+        ///       "GUID": "OPTION_GUID_001",
+        ///       "selected_full": "false",
+        ///       "selected_half_am": "true",
+        ///       "selected_half_pm": "false",
+        ///       "is_released": "false",
+        ///       "released_dayoff_type": "",
+        ///       "release_pool_guid": ""
+        ///     },
+        ///     "release_pool": {
+        ///       "GUID": "POOL_GUID_001",
+        ///       "status": "CANCELLED"
+        ///     }
+        ///   }
+        /// }
+        /// ```
+        ///
+        ///
+        /// ## ❌ 錯誤回傳範例
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Result": "此釋出名額已被接手，不可取消釋出"
+        /// }
+        /// ```
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容的物件。</param>
+        /// <returns>回傳 JSON 字串。</returns>
+        [HttpPost("cancel_release_dayoff_option")]
+        public string cancel_release_dayoff_option([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "cancel_release_dayoff_option";
+
+            try
+            {
+                string GetVal(string key) =>
+                  returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                  ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string option_guid = GetVal("option_guid");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_name";
+                    return returnData.JsonSerializationt();
+                }
+                if (option_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 option_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffReleasePoolClass = MethodClass.GetSQLControl<DayOffReleasePoolClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass
+                    .GetRowsByDefult(null, "form_name", form_name)
+                    .FirstOrDefault();
+
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                object[] obj_option = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "GUID", option_guid)
+                    .FirstOrDefault();
+
+                if (obj_option == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到放假選項(option_guid={option_guid})";
+                    return returnData.JsonSerializationt();
+                }
+
+                StaffDayOffOptionClass option = obj_option.SQLToClass<StaffDayOffOptionClass>();
+
+                if (option.form_guid != form.GUID)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "option 不屬於指定表單";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.is_force_ff == "true")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "系統強制放假(FF)不可取消釋出";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.is_from_release == "true")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "此放假選項為接手釋出名額，不可使用本 API 取消";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.is_released != "true")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "此放假選項尚未釋出，無法取消";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffReleasePoolClass pool = null;
+                if (!option.release_pool_guid.StringIsEmpty())
+                {
+                    pool = sql_dayOffReleasePoolClass
+                        .GetRowsByDefult(null, "GUID", option.release_pool_guid)
+                        .SQLToClass<DayOffReleasePoolClass>()
+                        .FirstOrDefault();
+                }
+
+                if (pool == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到對應釋出池(release_pool_guid={option.release_pool_guid})";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (pool.claimed_slots.StringToInt32() > 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "此釋出名額已被接手，不可取消釋出";
+                    return returnData.JsonSerializationt();
+                }
+
+                string now = DateTime.Now.ToDateTimeString();
+
+                // ✅ 同步最新規則：取消釋出只清除釋出狀態，不改動目前 selected_xxx
+                option.is_released = "false";
+                option.released_at = DateTime.MinValue.ToDateTimeString();
+                option.released_dayoff_type = "";
+                option.release_pool_guid = "";
+                if ((option.dayoff_source_type ?? "").Trim().ToUpper() == "RELEASED_SOURCE")
+                {
+                    option.dayoff_source_type = "";
+                }
+                option.updated_at = now;
+                option.NormalizeSelection();
+
+                pool.status = "CANCELLED";
+                pool.updated_at = now;
+                pool.version_no = (pool.version_no.StringToInt32() + 1).ToString();
+
+                sql_staffDayOffOptionClass.UpdateByDefulteExtra(null, option.ClassToSQL<StaffDayOffOptionClass>());
+                sql_dayOffReleasePoolClass.UpdateByDefulteExtra(null, pool.ClassToSQL<DayOffReleasePoolClass>());
+
+                returnData.Code = 200;
+                returnData.Data = new
+                {
+                    option,
+                    release_pool = pool
+                };
+                returnData.Result = "取消釋出成功";
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 接手指定釋出池名額作為填洞休假（claim_released_dayoff_option）
+        /// </summary>
+        /// <remarks>
+        /// ## 🌐 API URL
+        /// POST /phar_roster_api/DayOffSchedule/claim_released_dayoff_option
+        ///
+        /// ## 📘 功能說明
+        /// 讓指定人員接手某筆 OPEN 狀態的 DayOffReleasePoolClass。
+        ///
+        /// ## 併發保護
+        /// 1. API lock
+        /// 2. DB 條件更新（remaining_slots > 0 且 version_no 比對）
+        ///
+        /// ## 注意
+        /// - 一個池第一版只允許一人接手
+        /// - 必須有對應 item
+        /// - 不可接自己釋出的池
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容的物件。</param>
+        /// <returns>回傳 JSON 字串。</returns>
+        [HttpPost("claim_released_dayoff_option")]
+        public async Task<string> claim_released_dayoff_option([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "claim_released_dayoff_option";
+
+            try
+            {
+                string GetVal(string key) =>
+                  returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                  ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_guid = GetVal("staff_guid");
+                string release_pool_guid = GetVal("release_pool_guid");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_name";
+                    return returnData.JsonSerializationt();
+                }
+                if (staff_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 staff_guid";
+                    return returnData.JsonSerializationt();
+                }
+                if (release_pool_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 release_pool_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffReleasePoolClass = MethodClass.GetSQLControl<DayOffReleasePoolClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass
+                    .GetRowsByDefult(null, "form_name", form_name)
+                    .FirstOrDefault();
+
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                lock (_dayoffReleasePoolLock)
+                {
+                    object[] obj_pool = sql_dayOffReleasePoolClass
+                        .GetRowsByDefult(null, "GUID", release_pool_guid)
+                        .FirstOrDefault();
+
+                    if (obj_pool == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"找不到釋出池(release_pool_guid={release_pool_guid})";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    DayOffReleasePoolClass pool = obj_pool.SQLToClass<DayOffReleasePoolClass>();
+
+                    if (pool.form_guid != form.GUID)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "釋出池不屬於指定表單";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (pool.status != "OPEN")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"釋出池目前不可接手(status={pool.status})";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (pool.remaining_slots.StringToInt32() <= 0)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "釋出池名額不足";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (pool.source_staff_guid == staff_guid)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "不可接手自己釋出的名額";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    List<StaffDayOffOptionClass> allOptions = sql_staffDayOffOptionClass
+                        .GetRowsByDefult(null, "form_guid", form.GUID)
+                        .SQLToClass<StaffDayOffOptionClass>();
+
+                    List<DayOffScheduleItemClass> allItems = sql_dayOffScheduleItemClass
+                        .GetRowsByDefult(null, "form_guid", form.GUID)
+                        .SQLToClass<DayOffScheduleItemClass>();
+
+                    List<DayOffScheduleDayClass> allDays = sql_dayOffScheduleDayClass
+                        .GetRowsByDefult(null, "form_guid", form.GUID)
+                        .SQLToClass<DayOffScheduleDayClass>();
+
+                    bool alreadyClaimed = allOptions.Any(x =>
+                        x != null &&
+                        x.is_from_release == "true" &&
+                        x.release_pool_guid == release_pool_guid);
+
+                    if (alreadyClaimed)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "此釋出池已被其他人接手";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    string targetDate = pool.date.StringToDateTime().ToDateString('-');
+
+                    DayOffScheduleDayClass day = allDays
+                        .Where(x => x.date.StringToDateTime().ToDateString('-') == targetDate)
+                        .FirstOrDefault();
+
+                    if (day == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"找不到日期資料({targetDate})";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    DayOffScheduleItemClass targetItem = allItems
+                        .Where(x =>
+                            x.staff_guid == staff_guid &&
+                            x.date.StringToDateTime().ToDateString('-') == targetDate)
+                        .FirstOrDefault();
+
+                    if (targetItem == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "接手者於該日無排休資料(item)，不可填洞";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    StaffDayOffOptionClass targetOption = allOptions
+                        .Where(x =>
+                            x.staff_guid == staff_guid &&
+                            x.date.StringToDateTime().ToDateString('-') == targetDate)
+                        .FirstOrDefault();
+
+                    if (targetOption != null)
+                    {
+                        targetOption.NormalizeSelection();
+
+                        bool hasExistingSelection =
+                            targetOption.selected_full == "true" ||
+                            targetOption.selected_half_am == "true" ||
+                            targetOption.selected_half_pm == "true";
+
+                        if (hasExistingSelection)
+                        {
+                            returnData.Code = -200;
+                            returnData.Result = "接手者該日已有休假選擇，不可再接手填洞";
+                            return returnData.JsonSerializationt();
+                        }
+
+                        if (targetOption.is_force_ff == "true")
+                        {
+                            returnData.Code = -200;
+                            returnData.Result = "接手者該日為系統強制放假(FF)，不可填洞";
+                            return returnData.JsonSerializationt();
+                        }
+                    }
+
+                    List<StaffDayOffOptionClass> dateOptions = allOptions
+                        .Where(x => x != null && x.date.StringToDateTime().ToDateString('-') == targetDate)
+                        .ToList();
+
+                    int amSelected = 0;
+                    int pmSelected = 0;
+
+                    foreach (var option in dateOptions)
+                    {
+                        option.NormalizeSelection();
+
+                        if (option.selected_full == "true")
+                        {
+                            amSelected++;
+                            pmSelected++;
+                        }
+                        else
+                        {
+                            if (option.selected_half_am == "true") amSelected++;
+                            if (option.selected_half_pm == "true") pmSelected++;
+                        }
+                    }
+
+                    int amCapacity = day.am_max_dayoff_count.StringToInt32();
+                    int pmCapacity = day.pm_max_dayoff_count.StringToInt32();
+
+                    int amRemaining = amCapacity - amSelected;
+                    int pmRemaining = pmCapacity - pmSelected;
+
+                    string releaseType = (pool.release_dayoff_type ?? "").Trim().ToUpper();
+
+                    if (releaseType == "FULL")
+                    {
+                        if (!(amRemaining > 0 && pmRemaining > 0))
+                        {
+                            returnData.Code = -200;
+                            returnData.Result = "整天名額不足";
+                            return returnData.JsonSerializationt();
+                        }
+                    }
+                    else if (releaseType == "HALF_AM")
+                    {
+                        if (!(amRemaining > 0))
+                        {
+                            returnData.Code = -200;
+                            returnData.Result = "上午名額不足";
+                            return returnData.JsonSerializationt();
+                        }
+                    }
+                    else if (releaseType == "HALF_PM")
+                    {
+                        if (!(pmRemaining > 0))
+                        {
+                            returnData.Code = -200;
+                            returnData.Result = "下午名額不足";
+                            return returnData.JsonSerializationt();
+                        }
+                    }
+                    else
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"釋出類型異常({pool.release_dayoff_type})";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    // DB 條件更新搶名額（樂觀鎖）
+                    string oldVersion = pool.version_no;
+                    string now = DateTime.Now.ToDateTimeString();
+                    int newClaimed = pool.claimed_slots.StringToInt32() + 1;
+                    int newRemaining = pool.remaining_slots.StringToInt32() - 1;
+                    int newVersion = pool.version_no.StringToInt32() + 1;
+                    string newStatus = newRemaining <= 0 ? "CLOSED" : "OPEN";
+
+                    string sql = $@"
+UPDATE {sql_dayOffReleasePoolClass.Database}.{sql_dayOffReleasePoolClass.TableName}
+SET claimed_slots = @claimed_slots,
+    remaining_slots = @remaining_slots,
+    version_no = @version_no,
+    status = @status,
+    updated_at = @updated_at
+WHERE GUID = @guid
+  AND status = 'OPEN'
+  AND remaining_slots > 0
+  AND version_no = @old_version_no;
+";
+                    var parameters = new
+                    {
+                        claimed_slots = newClaimed.ToString(),
+                        remaining_slots = newRemaining.ToString(),
+                        version_no = newVersion.ToString(),
+                        status = newStatus,
+                        updated_at = now,
+                        guid = pool.GUID,
+                        old_version_no = oldVersion
+                    };
+
+                    int affectCount = sql_dayOffReleasePoolClass.ExecuteNonQuery(sql, parameters);
+                    if (affectCount <= 0)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "搶洞失敗，可能已被其他人先接手";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (targetOption == null)
+                    {
+                        targetOption = new StaffDayOffOptionClass();
+                        targetOption.GUID = Guid.NewGuid().ToString();
+                        targetOption.form_guid = form.GUID;
+                        targetOption.item_guid = targetItem.GUID;
+                        targetOption.staff_guid = staff_guid;
+                        targetOption.date = pool.date;
+                        targetOption.suggested_dates_list = new List<string>() { targetDate };
+                        targetOption.is_any_date = "false";
+                        targetOption.assigned_shift = "OFF";
+                        targetOption.can_full = "false";
+                        targetOption.can_half_am = "false";
+                        targetOption.can_half_pm = "false";
+                        targetOption.is_forbidden = "false";
+                        targetOption.is_force_ff = "false";
+                        targetOption.force_ff_at = DateTime.MinValue.ToDateTimeString();
+                        targetOption.is_released = "false";
+                        targetOption.released_at = DateTime.MinValue.ToDateTimeString();
+                        targetOption.released_dayoff_type = "";
+                        targetOption.updated_at = now;
+                    }
+
+                    targetOption.ClearSelection();
+
+                    if (releaseType == "FULL")
+                    {
+                        targetOption.can_full = "true";
+                        targetOption.can_half_am = "false";
+                        targetOption.can_half_pm = "false";
+                        targetOption.SelectFullDay(pool.date);
+                    }
+                    else if (releaseType == "HALF_AM")
+                    {
+                        targetOption.can_full = "false";
+                        targetOption.can_half_am = "true";
+                        targetOption.can_half_pm = "false";
+                        targetOption.SelectHalfAM(pool.date);
+                    }
+                    else if (releaseType == "HALF_PM")
+                    {
+                        targetOption.can_full = "false";
+                        targetOption.can_half_am = "false";
+                        targetOption.can_half_pm = "true";
+                        targetOption.SelectHalfPM(pool.date);
+                    }
+
+                    targetOption.is_from_release = "true";
+                    targetOption.source_option_guid = pool.source_option_guid;
+                    targetOption.release_pool_guid = pool.GUID;
+                    targetOption.dayoff_source_type = "HOLE_FILL";
+                    targetOption.updated_at = now;
+                    targetOption.NormalizeSelection();
+
+                    targetItem.option_guid = targetOption.GUID;
+                    targetItem.updated_at = now;
+
+                    if (allOptions.Any(x => x.GUID == targetOption.GUID))
+                    {
+                        sql_staffDayOffOptionClass.UpdateByDefulteExtra(null, targetOption.ClassToSQL<StaffDayOffOptionClass>());
+                    }
+                    else
+                    {
+                        sql_staffDayOffOptionClass.AddRows(null, new List<object[]>() { targetOption.ClassToSQL<StaffDayOffOptionClass>() });
+                    }
+
+                    sql_dayOffScheduleItemClass.UpdateByDefulteExtra(null, targetItem.ClassToSQL<DayOffScheduleItemClass>());
+
+                    // 回讀 pool 最新狀態
+                    DayOffReleasePoolClass poolAfter = sql_dayOffReleasePoolClass
+                        .GetRowsByDefult(null, "GUID", pool.GUID)
+                        .SQLToClass<DayOffReleasePoolClass>()
+                        .FirstOrDefault();
+
+                    returnData.Code = 200;
+                    returnData.Data = new
+                    {
+                        claimed_option = targetOption,
+                        release_pool = poolAfter
+                    };
+                    returnData.Result = "接手釋出名額成功";
+                    return returnData.JsonSerializationt(true);
+                }
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 取消接手釋出名額（cancel_claim_released_dayoff_option）
+        /// </summary>
+        /// <remarks>
+        /// ## 🌐 API URL
+        /// POST /phar_roster_api/DayOffSchedule/cancel_claim_released_dayoff_option
+        ///
+        /// ## 📘 功能說明
+        /// 讓接手者取消一筆 HOLE_FILL 類型的休假，並歸還釋出池名額。
+        ///
+        /// ## 功能內容
+        /// 1. 驗證 claim option 是否存在
+        /// 2. 驗證此 option 為 is_from_release=true
+        /// 3. 回補 release_pool：
+        ///    - claimed_slots -1
+        ///    - remaining_slots +1
+        ///    - status = OPEN
+        /// 4. 清空 claim option 選擇
+        /// 5. 清空 source_option_guid / release_pool_guid / is_from_release
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容的物件。</param>
+        /// <returns>回傳 JSON 字串。</returns>
+        [HttpPost("cancel_claim_released_dayoff_option")]
+        public string cancel_claim_released_dayoff_option([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "cancel_claim_released_dayoff_option";
+
+            try
+            {
+                string GetVal(string key) =>
+                  returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                  ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string option_guid = GetVal("option_guid");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_name";
+                    return returnData.JsonSerializationt();
+                }
+                if (option_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 option_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffReleasePoolClass = MethodClass.GetSQLControl<DayOffReleasePoolClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass
+                    .GetRowsByDefult(null, "form_name", form_name)
+                    .FirstOrDefault();
+
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                object[] obj_option = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "GUID", option_guid)
+                    .FirstOrDefault();
+
+                if (obj_option == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到接手 option(option_guid={option_guid})";
+                    return returnData.JsonSerializationt();
+                }
+
+                StaffDayOffOptionClass option = obj_option.SQLToClass<StaffDayOffOptionClass>();
+
+                if (option.form_guid != form.GUID)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "option 不屬於指定表單";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (option.is_from_release != "true" || option.release_pool_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "此 option 非接手釋出名額，不可取消接手";
+                    return returnData.JsonSerializationt();
+                }
+
+                lock (_dayoffReleasePoolLock)
+                {
+                    object[] obj_pool = sql_dayOffReleasePoolClass
+                        .GetRowsByDefult(null, "GUID", option.release_pool_guid)
+                        .FirstOrDefault();
+
+                    if (obj_pool == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"找不到釋出池(release_pool_guid={option.release_pool_guid})";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    DayOffReleasePoolClass pool = obj_pool.SQLToClass<DayOffReleasePoolClass>();
+
+                    string now = DateTime.Now.ToDateTimeString();
+
+                    int claimed = pool.claimed_slots.StringToInt32();
+                    int remain = pool.remaining_slots.StringToInt32();
+
+                    if (claimed > 0) claimed--;
+                    remain++;
+
+                    pool.claimed_slots = claimed.ToString();
+                    pool.remaining_slots = remain.ToString();
+                    pool.status = "OPEN";
+                    pool.version_no = (pool.version_no.StringToInt32() + 1).ToString();
+                    pool.updated_at = now;
+
+                    option.ClearSelection();
+                    option.is_from_release = "false";
+                    option.source_option_guid = "";
+                    option.release_pool_guid = "";
+                    option.dayoff_source_type = "";
+                    option.updated_at = now;
+                    option.NormalizeSelection();
+
+                    sql_dayOffReleasePoolClass.UpdateByDefulteExtra(null, pool.ClassToSQL<DayOffReleasePoolClass>());
+                    sql_staffDayOffOptionClass.UpdateByDefulteExtra(null, option.ClassToSQL<StaffDayOffOptionClass>());
+
+                    object[] obj_item = sql_dayOffScheduleItemClass
+                        .GetRowsByDefult(null, "GUID", option.item_guid)
+                        .FirstOrDefault();
+
+                    if (obj_item != null)
+                    {
+                        DayOffScheduleItemClass item = obj_item.SQLToClass<DayOffScheduleItemClass>();
+                        item.option_guid = option.GUID;
+                        item.updated_at = now;
+                        sql_dayOffScheduleItemClass.UpdateByDefulteExtra(null, item.ClassToSQL<DayOffScheduleItemClass>());
+                    }
+
+                    returnData.Code = 200;
+                    returnData.Data = new
+                    {
+                        cancelled_option = option,
+                        release_pool = pool
+                    };
+                    returnData.Result = "取消接手成功";
+                    return returnData.JsonSerializationt(true);
+                }
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 查詢指定人員於指定日期可接手的填洞休假名額（升級版 get_hole_fill_available_options）
+        /// </summary>
+        /// <remarks>
+        /// ## 🌐 API URL
+        /// POST /phar_roster_api/dayOffSchedule/get_hole_fill_available_options
+        ///
+        /// ## 📘 功能說明
+        /// 依據指定表單、指定人員、指定日期，查詢當日所有可接手的釋出池名額。
+        ///
+        /// ## 升級版規則
+        /// 候選來源改由 DayOffReleasePoolClass 提供，僅列出：
+        /// - status = OPEN
+        /// - remaining_slots > 0
+        /// - date = 指定日期
+        ///
+        /// 再進一步判斷：
+        /// - 不可接自己釋出的名額
+        /// - 當日時段容量是否足夠
+        /// - 該池是否已被接滿
+        ///
+        /// ## 注意
+        /// - 本 API 只回傳候選清單，不會執行接手
+        /// </remarks>
+        /// <param name="returnData">returnData 物件，主要使用 ValueAry 作為參數輸入。</param>
+        /// <returns>回傳 JSON 字串。</returns>
+        [HttpPost("get_hole_fill_available_options")]
+        public string get_hole_fill_available_options([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "/phar_roster_api/dayOffSchedule/get_hole_fill_available_options";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                    .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_guid = GetVal("staff_guid");
+                string date = GetVal("date");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 form_name";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (staff_guid.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 staff_guid";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (date.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未提供 date";
+                    return returnData.JsonSerializationt();
+                }
+
+                string targetDate = date.StringToDateTime().ToDateString('-');
+                if (targetDate.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"日期格式錯誤({date})";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffReleasePoolClass = MethodClass.GetSQLControl<DayOffReleasePoolClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass
+                    .GetRowsByDefult(null, "form_name", form_name)
+                    .FirstOrDefault();
+
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return returnData.JsonSerializationt();
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                DayOffScheduleDayClass day = sql_dayOffScheduleDayClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .Where(x => x.date.StringToDateTime().ToDateString('-') == targetDate)
+                    .FirstOrDefault();
+
+                if (day == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到日期資料({targetDate})";
+                    return returnData.JsonSerializationt();
+                }
+
+                List<StaffDayOffOptionClass> allOptions = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>();
+
+                List<DayOffReleasePoolClass> allPools = sql_dayOffReleasePoolClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffReleasePoolClass>();
+
+                // 當日全部 option，計算容量
+                List<StaffDayOffOptionClass> dateOptions = allOptions
+                    .Where(x => x != null && x.date.StringToDateTime().ToDateString('-') == targetDate)
+                    .ToList();
+
+                int amSelected = 0;
+                int pmSelected = 0;
+
+                foreach (var option in dateOptions)
+                {
+                    option.NormalizeSelection();
+
+                    if (option.selected_full == "true")
+                    {
+                        amSelected++;
+                        pmSelected++;
+                    }
+                    else
+                    {
+                        if (option.selected_half_am == "true") amSelected++;
+                        if (option.selected_half_pm == "true") pmSelected++;
+                    }
+                }
+
+                int amCapacity = day.am_max_dayoff_count.StringToInt32();
+                int pmCapacity = day.pm_max_dayoff_count.StringToInt32();
+
+                int amRemaining = amCapacity - amSelected;
+                int pmRemaining = pmCapacity - pmSelected;
+
+                // 當日可接手的 pool
+                List<DayOffReleasePoolClass> candidatePools = allPools
+                    .Where(x =>
+                        x != null &&
+                        x.date.StringToDateTime().ToDateString('-') == targetDate &&
+                        x.status == "OPEN" &&
+                        x.remaining_slots.StringToInt32() > 0)
+                    .ToList();
+
+                // 若已有 claim option，也可用來輔助判斷是否已被接滿
+                HashSet<string> claimedPoolGuids = allOptions
+                    .Where(x =>
+                        x != null &&
+                        x.is_from_release == "true" &&
+                        x.release_pool_guid.StringIsEmpty() == false)
+                    .Select(x => x.release_pool_guid)
+                    .ToHashSet();
+
+                List<HoleFillAvailableOptionDto> result = new List<HoleFillAvailableOptionDto>();
+
+                foreach (var pool in candidatePools)
+                {
+                    HoleFillAvailableOptionDto dto = new HoleFillAvailableOptionDto();
+                    dto.release_pool_guid = pool.GUID;
+                    dto.source_option_guid = pool.source_option_guid;
+                    dto.source_item_guid = pool.source_item_guid;
+                    dto.source_staff_guid = pool.source_staff_guid;
+                    dto.source_staff_id = "";
+                    dto.source_staff_name = "";
+                    dto.date = targetDate;
+                    dto.release_dayoff_type = pool.release_dayoff_type;
+                    dto.total_slots = pool.total_slots;
+                    dto.claimed_slots = pool.claimed_slots;
+                    dto.remaining_slots = pool.remaining_slots;
+                    dto.am_remaining_count = amRemaining.ToString();
+                    dto.pm_remaining_count = pmRemaining.ToString();
+                    dto.can_claim = "true";
+                    dto.block_reason = "";
+
+                    // 1. 不可接自己釋出的名額
+                    if (pool.source_staff_guid == staff_guid)
+                    {
+                        dto.can_claim = "false";
+                        dto.block_reason = "不可接手自己釋出的名額";
+                    }
+
+                    // 2. 保守判斷：若已被 claim 過，直接擋
+                    if (dto.can_claim == "true" && claimedPoolGuids.Contains(pool.GUID))
+                    {
+                        dto.can_claim = "false";
+                        dto.block_reason = "此釋出池已被其他人接手";
+                    }
+
+                    // 3. 依釋出類型判斷容量
+                    if (dto.can_claim == "true")
+                    {
+                        string releaseType = (pool.release_dayoff_type ?? "").Trim().ToUpper();
+
+                        if (releaseType == "FULL")
+                        {
+                            if (!(amRemaining > 0 && pmRemaining > 0))
+                            {
+                                dto.can_claim = "false";
+                                dto.block_reason = "整天名額不足";
+                            }
+                        }
+                        else if (releaseType == "HALF_AM")
+                        {
+                            if (!(amRemaining > 0))
+                            {
+                                dto.can_claim = "false";
+                                dto.block_reason = "上午名額不足";
+                            }
+                        }
+                        else if (releaseType == "HALF_PM")
+                        {
+                            if (!(pmRemaining > 0))
+                            {
+                                dto.can_claim = "false";
+                                dto.block_reason = "下午名額不足";
+                            }
+                        }
+                        else
+                        {
+                            dto.can_claim = "false";
+                            dto.block_reason = $"釋出類型異常({pool.release_dayoff_type})";
+                        }
+                    }
+
+                    result.Add(dto);
+                }
+
+                returnData.Code = 200;
+                returnData.Result = "取得可填洞名額成功";
+                returnData.Data = result;
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -500;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 下載班表匯入空白模板 Excel
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途
+        /// 本 API 用於下載「班表匯入空白模板 Excel」。
+        ///
+        /// 使用者可參考既有排班 PDF 或原始 Excel，
+        /// 將對應班別與日期的人員簡名，直接填入模板中，
+        /// 後續再由系統進行預覽檢查與正式匯入。
+        ///
+        /// 此模板設計目標：
+        /// - 不需要一筆一筆新增班表資料
+        /// - 可讓使用者直接複製 Excel 內容貼入
+        /// - 保持未來班表匯入格式可擴充性
+        ///
+        /// ---
+        ///
+        /// ## 🌐 URL
+        /// ```text
+        /// /phar_roster_api/dayOffSchedule/download_schedule_import_template_excel
+        /// ```
+        ///
+        /// ## 🧩 模板設計概念
+        /// 模板採用「班別列、日期欄」方式：
+        ///
+        /// - A 欄：班別類型
+        /// - B 欄：時段
+        /// - C 欄之後：日期欄（01 ~ 31）
+        ///
+        /// 每一格代表：
+        /// 「某一天、某班別、某時段」的人員簡名內容。
+        ///
+        /// 使用者可依照排班 PDF 或原始 Excel，將對應內容貼入儲存格。
+        ///
+        /// ---
+        ///
+        /// ## 📥 Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "download_schedule_import_template_excel",
+        ///   "ValueAry": [],
+        ///   "Data": {}
+        /// }
+        /// ```
+        ///
+        /// > 本 API 不需要 year_month，也不需要其他參數。
+        ///
+        /// ---
+        ///
+        /// ## 📤 Response 說明（成功）
+        /// 成功時回傳 Excel 檔案串流。
+        ///
+        /// ### Response Header 範例
+        /// ```text
+        /// Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        /// Content-Disposition: attachment; filename="schedule_import_template.xlsx"; filename*=UTF-8''%E7%8F%AD%E8%A1%A8%E5%8C%AF%E5%85%A5%E7%A9%BA%E7%99%BD%E6%A8%A1%E6%9D%BF.xlsx
+        /// Access-Control-Expose-Headers: Content-Disposition, Content-Length, Content-Type
+        /// ```
+        ///
+        /// ### 檔名
+        /// ```text
+        /// 班表匯入空白模板.xlsx
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## ❌ Response JSON 範例（錯誤）
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "download_schedule_import_template_excel",
+        ///   "Result": "例外：Excel 模板產生失敗"
+        /// }
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📑 Excel 模板結構
+        ///
+        /// ### Sheet 名稱
+        /// ```text
+        /// 班表匯入
+        /// ```
+        ///
+        /// ### 第一列欄位
+        /// | 欄位 | 說明 |
+        /// |------|------|
+        /// | A1 | 班別類型 |
+        /// | B1 | 時段 |
+        /// | C1 ~ AG1 | 日期欄（01 ~ 31） |
+        ///
+        /// ### 日期欄說明
+        /// 本模板固定提供 31 天欄位，
+        /// 由使用者依實際月份自行填寫或對照使用。
+        ///
+        /// 欄位顯示為：
+        /// ```text
+        /// 01, 02, 03, 04 ... 31
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📋 固定班別列順序
+        /// 模板內班別列固定如下：
+        ///
+        /// | 班別類型 | 時段 |
+        /// |------|------|
+        /// | 國定假日 | 08:00-12:00 |
+        /// | 假日門診 | 07:30-16:00 |
+        /// | 假日門診 | 08:00-16:00 |
+        /// | 假日急診 | 08:00-16:00 |
+        /// | 化療 | 08:00-12:00 |
+        /// | TPN | 08:00-16:00 |
+        /// | 中藥局 | 12:30-21:00 |
+        /// | 小夜門診 | 12:30-21:00 |
+        /// | 小夜門診 | 13:30-22:00 |
+        /// | 小夜門診 | 14:30-23:00 |
+        /// | 小夜門診 | 15:30-23:59 |
+        /// | 小夜急診 | 16:00-23:59 |
+        /// | 小夜其他 | 12:30-21:00 |
+        /// | 大夜門診 | 00:00-08:00 |
+        /// | 大夜急診 | 00:00-08:00 |
+        ///
+        /// ---
+        ///
+        /// ## 📝 儲存格填寫規則
+        /// 日期欄中的每個儲存格，代表：
+        /// 「該日期、該班別、該時段」的人員簡名內容。
+        ///
+        /// ### 規則
+        /// 1. 一個字代表一位人員簡名。
+        /// 2. 不使用任何分隔符號。
+        /// 3. 不加空白。
+        /// 4. 不加中括號。
+        /// 5. 沒有人就留空。
+        /// 6. 國定假日不需另外設定日期，只看「國定假日 08:00-12:00」那列是否有人。
+        ///
+        /// ### 合法範例
+        /// ```text
+        /// 亭庭璇詩
+        /// 均甄
+        /// 品
+        /// 曼能
+        /// ```
+        ///
+        /// ### 不合法範例
+        /// ```text
+        /// 亭、庭、璇、詩
+        /// [品]陳媚松顏靖
+        /// 亭 庭 璇 詩
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📊 範例表格
+        /// 下列為模板範例：
+        ///
+        /// | 班別類型 | 時段 | 01 | 02 | 03 | 04 | 05 |
+        /// |------|------|------|------|------|------|------|
+        /// | 國定假日 | 08:00-12:00 |  |  |  |  |  |
+        /// | 假日門診 | 07:30-16:00 |  |  |  |  |  |
+        /// | 假日門診 | 08:00-16:00 |  |  |  |  |  |
+        /// | 假日急診 | 08:00-16:00 |  |  |  |  |  |
+        /// | 化療 | 08:00-12:00 |  |  |  |  |  |
+        /// | TPN | 08:00-16:00 |  |  |  |  |  |
+        /// | 中藥局 | 12:30-21:00 |  |  |  |  |  |
+        /// | 小夜門診 | 12:30-21:00 |  |  |  |  |  |
+        /// | 小夜門診 | 13:30-22:00 |  |  |  |  |  |
+        /// | 小夜門診 | 14:30-23:00 |  |  |  |  |  |
+        /// | 小夜門診 | 15:30-23:59 |  |  |  |  |  |
+        /// | 小夜急診 | 16:00-23:59 |  |  |  |  |  |
+        /// | 小夜其他 | 12:30-21:00 |  |  |  |  |  |
+        /// | 大夜門診 | 00:00-08:00 |  |  |  |  |  |
+        /// | 大夜急診 | 00:00-08:00 |  |  |  |  |  |
+        ///
+        /// ---
+        ///
+        /// ## 🚀 簡易操作方式
+        ///
+        /// ### 方式一：直接手動填寫
+        /// 1. 下載空白模板。
+        /// 2. 依照班別與日期，在對應儲存格填入人員簡名。
+        /// 3. 若該班別當天沒有人，留空即可。
+        ///
+        /// ### 方式二：參考原始 Excel 或排班資料複製貼上
+        /// 例如：
+        /// - 使用者看到 5/1 的「假日門診 07:30-16:00」是 `亭庭璇詩`
+        /// - 可直接將 `亭庭璇詩` 貼入該列 01 欄位
+        ///
+        /// 再例如：
+        /// - 使用者看到 5/1 的「假日急診 08:00-16:00」是 `均甄`
+        /// - 可直接將 `均甄` 貼入該列 01 欄位
+        ///
+        /// ### 操作重點
+        /// - 一格就是一個班別 + 一天
+        /// - 一格內直接貼整串簡名
+        /// - 不需逐筆輸入人員資料
+        ///
+        /// ---
+        ///
+        /// ## ⚙️ 工程實作要求
+        ///
+        /// ### 1. 本 API 不需要任何參數
+        /// - 不帶 year_month
+        /// - 不依月份變動欄位數
+        /// - 固定產出 31 天欄位
+        ///
+        /// ### 2. 固定輸出內容
+        /// - 1 張 Sheet
+        /// - Sheet 名稱為 `班表匯入`
+        /// - 固定 15 列班別
+        /// - 固定日期欄 01 ~ 31
+        ///
+        /// ### 3. 樣式建議
+        /// - 第一列粗體
+        /// - 第一列底色淡灰
+        /// - 所有儲存格加框線
+        /// - A/B 欄固定寬度
+        /// - 日期欄置中
+        /// - 凍結前 2 欄與第 1 列
+        ///
+        /// ### 4. 欄寬建議
+        /// - A 欄（班別類型）：18
+        /// - B 欄（時段）：16
+        /// - 日期欄：10 ~ 12
+        ///
+        /// ---
+        ///
+        /// ## 📌 注意事項
+        /// - 本 API 僅負責下載空白模板，不做資料驗證。
+        /// - 實際匯入驗證（例如簡名重複、找不到人員、格式異常）
+        ///   應由後續的 preview / confirm 匯入 API 處理。
+        /// - 國定假日是否有人上班，直接填在 `國定假日 08:00-12:00` 那列，不需額外提供國定假日清單。
+        /// - 中藥局、TPN、化療這些列只填人員簡名，不加前綴。
+        /// </remarks>
+        /// <param name="returnData">統一封裝的請求物件，本 API 不需額外參數。</param>
+        /// <returns>成功時回傳 Excel 檔案串流，失敗時回傳 JSON 錯誤訊息。</returns>
+        [HttpPost("download_schedule_import_template_excel")]
+        public IActionResult download_schedule_import_template_excel([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "download_schedule_import_template_excel";
+
+            try
+            {
+                var workbook = new NPOI.XSSF.UserModel.XSSFWorkbook();
+                var sheet = workbook.CreateSheet("班表匯入");
+
+                var rows = new List<(string ShiftType, string Time)>
+        {
+            ("國定假日", "08:00-12:00"),
+            ("假日門診", "07:30-16:00"),
+            ("假日門診", "08:00-16:00"),
+            ("假日急診", "08:00-16:00"),
+            ("化療", "08:00-12:00"),
+            ("TPN", "08:00-16:00"),
+            ("中藥局", "12:30-21:00"),
+            ("小夜門診", "12:30-21:00"),
+            ("小夜門診", "13:30-22:00"),
+            ("小夜門診", "14:30-23:00"),
+            ("小夜門診", "15:30-23:59"),
+            ("小夜急診", "16:00-23:59"),
+            ("小夜其他", "12:30-21:00"),
+            ("大夜門診", "00:00-08:00"),
+            ("大夜急診", "00:00-08:00"),
+        };
+
+                // ===== 字型 =====
+                var fontHeader = workbook.CreateFont();
+                fontHeader.FontName = "微軟正黑體";
+                fontHeader.FontHeightInPoints = 11;
+                fontHeader.IsBold = true;
+
+                var fontNormal = workbook.CreateFont();
+                fontNormal.FontName = "微軟正黑體";
+                fontNormal.FontHeightInPoints = 10;
+
+                // ===== 標題樣式 =====
+                var styleHeader = workbook.CreateCellStyle();
+                styleHeader.Alignment = NPOI.SS.UserModel.HorizontalAlignment.Center;
+                styleHeader.VerticalAlignment = NPOI.SS.UserModel.VerticalAlignment.Center;
+                styleHeader.BorderTop = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleHeader.BorderBottom = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleHeader.BorderLeft = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleHeader.BorderRight = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleHeader.SetFont(fontHeader);
+                styleHeader.FillForegroundColor = NPOI.HSSF.Util.HSSFColor.Grey25Percent.Index;
+                styleHeader.FillPattern = NPOI.SS.UserModel.FillPattern.SolidForeground;
+
+                // ===== 一般儲存格樣式 =====
+                var styleCell = workbook.CreateCellStyle();
+                styleCell.Alignment = NPOI.SS.UserModel.HorizontalAlignment.Center;
+                styleCell.VerticalAlignment = NPOI.SS.UserModel.VerticalAlignment.Center;
+                styleCell.BorderTop = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleCell.BorderBottom = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleCell.BorderLeft = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleCell.BorderRight = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleCell.WrapText = true;
+                styleCell.SetFont(fontNormal);
+
+                // ===== 說明區樣式 =====
+                var styleNote = workbook.CreateCellStyle();
+                styleNote.Alignment = NPOI.SS.UserModel.HorizontalAlignment.Left;
+                styleNote.VerticalAlignment = NPOI.SS.UserModel.VerticalAlignment.Top;
+                styleNote.BorderTop = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleNote.BorderBottom = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleNote.BorderLeft = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleNote.BorderRight = NPOI.SS.UserModel.BorderStyle.Thin;
+                styleNote.WrapText = true;
+                styleNote.SetFont(fontNormal);
+
+                // ===== 第 1 列 =====
+                var headerRow = sheet.CreateRow(0);
+                headerRow.HeightInPoints = 22;
+
+                var cellA1 = headerRow.CreateCell(0);
+                cellA1.SetCellValue("班別類型");
+                cellA1.CellStyle = styleHeader;
+
+                var cellB1 = headerRow.CreateCell(1);
+                cellB1.SetCellValue("時段");
+                cellB1.CellStyle = styleHeader;
+
+                for (int i = 1; i <= 31; i++)
+                {
+                    var cell = headerRow.CreateCell(i + 1);
+                    cell.SetCellValue(i.ToString("00"));
+                    cell.CellStyle = styleHeader;
+                }
+
+                // ===== 固定班別列 =====
+                int rowIndex = 1;
+                foreach (var rowData in rows)
+                {
+                    var row = sheet.CreateRow(rowIndex);
+                    row.HeightInPoints = 20;
+
+                    var cell0 = row.CreateCell(0);
+                    cell0.SetCellValue(rowData.ShiftType);
+                    cell0.CellStyle = styleCell;
+
+                    var cell1 = row.CreateCell(1);
+                    cell1.SetCellValue(rowData.Time);
+                    cell1.CellStyle = styleCell;
+
+                    for (int i = 1; i <= 31; i++)
+                    {
+                        var cell = row.CreateCell(i + 1);
+                        cell.SetCellValue("");
+                        cell.CellStyle = styleCell;
+                    }
+
+                    rowIndex++;
+                }
+
+                // ===== 說明區 =====
+                rowIndex += 1;
+                var noteRow = sheet.CreateRow(rowIndex);
+                noteRow.HeightInPoints = 130;
+
+                var noteCell = noteRow.CreateCell(0);
+                noteCell.SetCellValue(
+                    "【填寫說明】\n" +
+                    "1. 每個字代表一位人員簡名。\n" +
+                    "2. 同一格不可有重複簡名。\n" +
+                    "3. 不可輸入空白、逗號、中括號等特殊符號。\n" +
+                    "4. 沒有人請留空。\n" +
+                    "5. 國定假日是否有人上班，直接填在「國定假日 08:00-12:00」那列。\n" +
+                    "6. 中藥局、TPN、化療只填人員簡名，不加前綴。\n" +
+                    "7. 第一列日期可由使用者自行改成 01~31 或實際日期。"
+                );
+                noteCell.CellStyle = styleNote;
+
+                // 合併說明區
+                sheet.AddMergedRegion(new NPOI.SS.Util.CellRangeAddress(rowIndex, rowIndex, 0, 32));
+                for (int i = 1; i <= 32; i++)
+                {
+                    var c = noteRow.CreateCell(i);
+                    c.CellStyle = styleNote;
+                }
+
+                // ===== 欄寬 =====
+                sheet.SetColumnWidth(0, 18 * 256); // 班別類型
+                sheet.SetColumnWidth(1, 16 * 256); // 時段
+                for (int i = 2; i <= 32; i++)
+                {
+                    sheet.SetColumnWidth(i, 11 * 256); // 日期
+                }
+
+                // ===== 凍結窗格 =====
+                sheet.CreateFreezePane(2, 1);
+
+                // ===== 輸出 =====
+                byte[] bytes;
+                using (var ms = new MemoryStream())
+                {
+                    workbook.Write(ms);
+                    bytes = ms.ToArray();
+                }
+
+                var stream = new MemoryStream(bytes);
+                string contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+                // 英文 fallback，避免某些瀏覽器 filename 亂碼
+                string downloadFileName = "schedule_import_template.xlsx";
+                // 中文檔名放在 filename*
+                string displayFileName = "班表匯入空白模板.xlsx";
+                string utf8FileName = Uri.EscapeDataString(displayFileName);
+
+                Response.Headers["Content-Disposition"] =
+                    $"attachment; filename=\"{downloadFileName}\"; filename*=UTF-8''{utf8FileName}";
+                Response.Headers["Access-Control-Expose-Headers"] =
+                    "Content-Disposition, Content-Length, Content-Type";
+
+                return File(stream, contentType);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = $"例外：{ex.Message}";
+                return new JsonResult(returnData);
+            }
+        }
+
+        /// <summary>
+        /// 預覽匯入班表 Excel，並回傳附有驗證結果標記的 Excel
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途
+        /// 本 API 用於預覽「班表匯入 Excel」內容，僅進行解析與驗證，不會寫入資料庫。
+        ///
+        /// 使用者上傳由「班表匯入空白模板」填寫完成的 Excel 後，
+        /// 系統會逐格解析班別與日期內容，並檢查格式與人員簡名是否正確。
+        ///
+        /// 驗證完成後，系統會回傳一份新的 Excel：
+        /// 1. 原始 Sheet 內，將有內容的儲存格依驗證結果上色
+        /// 2. 驗證成功格子標記為綠色
+        /// 3. 驗證失敗格子標記為紅色
+        /// 4. 固定班別列錯誤時，A/B 欄位標記為紅色
+        /// 5. 每格會加上批註，顯示解析結果或錯誤原因
+        /// 6. 額外新增 `預覽結果` Sheet，列出所有驗證結果明細
+        ///
+        /// ---
+        ///
+        /// ## 🌐 URL
+        /// ```text
+        /// /phar_roster_api/dayOffSchedule/preview_import_schedule_excel
+        /// ```
+        ///
+        /// ## Method
+        /// ```text
+        /// POST
+        /// ```
+        ///
+        /// ## Content-Type
+        /// ```text
+        /// multipart/form-data
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📥 上傳欄位
+        /// | 欄位名稱 | 型別 | 必填 | 說明 |
+        /// |------|------|------|------|
+        /// | file | IFormFile | ✅ | 要預覽的 Excel 檔案（僅支援 .xlsx） |
+        ///
+        /// ---
+        ///
+        /// ## 📑 Excel 模板前提
+        /// 本 API 預設使用者上傳的是由「班表匯入空白模板」填寫完成的 Excel。
+        ///
+        /// 模板規則如下：
+        /// 1. 第 1 列為標題列
+        /// 2. A1 = 班別類型
+        /// 3. B1 = 時段
+        /// 4. C1 ~ AG1 = 日期欄（01 ~ 31）
+        /// 5. 第 2 列開始為固定班別列
+        ///
+        /// 固定班別列定義如下：
+        ///
+        /// | 班別類型 | 時段 |
+        /// |------|------|
+        /// | 國定假日 | 08:00-12:00 |
+        /// | 假日門診 | 07:30-16:00 |
+        /// | 假日門診 | 08:00-16:00 |
+        /// | 假日急診 | 08:00-16:00 |
+        /// | 化療 | 08:00-12:00 |
+        /// | TPN | 08:00-16:00 |
+        /// | 中藥局 | 12:30-21:00 |
+        /// | 小夜門診 | 12:30-21:00 |
+        /// | 小夜門診 | 13:30-22:00 |
+        /// | 小夜門診 | 14:30-23:00 |
+        /// | 小夜門診 | 15:30-23:59 |
+        /// | 小夜急診 | 16:00-23:59 |
+        /// | 小夜其他 | 12:30-21:00 |
+        /// | 大夜門診 | 00:00-08:00 |
+        /// | 大夜急診 | 00:00-08:00 |
+        ///
+        /// ---
+        ///
+        /// ## 📝 儲存格填寫規則
+        /// 日期欄中的每個儲存格，代表：
+        /// 「該日期、該班別、該時段」的人員簡名內容。
+        ///
+        /// ### 規則
+        /// 1. 一個字代表一位人員簡名
+        /// 2. 不使用任何分隔符號
+        /// 3. 不加空白
+        /// 4. 不加中括號
+        /// 5. 沒有人就留空
+        ///
+        /// ### 合法範例
+        /// ```text
+        /// 亭庭璇詩
+        /// 均甄
+        /// 品
+        /// 曼能
+        /// ```
+        ///
+        /// ### 不合法範例
+        /// ```text
+        /// 亭、庭、璇、詩
+        /// [品]陳媚松顏靖
+        /// 亭 庭 璇 詩
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## ✅ 驗證規則
+        /// 本 API 會做以下檢查：
+        ///
+        /// ### 1. 檔案檢查
+        /// - 必須有上傳檔案
+        /// - 副檔名必須為 `.xlsx`
+        ///
+        /// ### 2. Excel 基本結構檢查
+        /// - 必須至少有一張 Sheet
+        /// - 第一張 Sheet 必須可讀取
+        /// - 第 1 列必須存在
+        /// - A1 必須為 `班別類型`
+        /// - B1 必須為 `時段`
+        ///
+        /// ### 3. 固定班別列檢查
+        /// - 第 2 列到第 16 列必須符合固定班別定義
+        /// - 若班別類型或時段不符，該列視為錯誤
+        ///
+        /// ### 4. 日期欄檢查
+        /// - 日期欄必須為 01 ~ 31
+        /// - 若欄位標題不是合法日期欄，對應格子會視為錯誤
+        ///
+        /// ### 5. 儲存格內容格式檢查
+        /// - 不可包含空白
+        /// - 不可包含全形空白
+        /// - 不可包含逗號
+        /// - 不可包含頓號
+        /// - 不可包含中括號
+        /// - 不可包含換行
+        /// - 不可包含 Tab
+        ///
+        /// ### 6. 簡名解析檢查
+        /// - 一個字代表一位人
+        /// - 同一格不可有重複簡名
+        /// - 每個簡名都必須能找到 staff
+        /// - 每個簡名必須唯一對應到一位 staff
+        ///
+        /// ### 7. 同日跨班別重複檢查
+        /// - 同一天同一人不可出現在多個班別
+        /// - 若重複，會回傳錯誤
+        ///
+        /// ---
+        ///
+        /// ## 📤 Response 說明
+        ///
+        /// ### 成功
+        /// 成功時不回傳 JSON，而是直接回傳「驗證後 Excel 檔案」。
+        ///
+        /// 驗證後 Excel 內容：
+        /// 1. 原始匯入 Sheet：
+        ///    - 成功格子：綠色
+        ///    - 錯誤格子：紅色
+        ///    - 每格附加批註
+        /// 2. 預覽結果 Sheet：
+        ///    - 顯示總格數、成功格數、失敗格數
+        ///    - 列出每一格的解析結果
+        ///
+        /// ### 檔名
+        /// ```text
+        /// schedule_import_preview_result.xlsx
+        /// ```
+        ///
+        /// ### 下載時顯示名稱
+        /// ```text
+        /// 班表匯入預覽結果.xlsx
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## ❌ 錯誤回傳 JSON 範例
+        ///
+        /// ### 未收到上傳檔案
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "preview_import_schedule_excel",
+        ///   "Result": "未收到上傳檔案"
+        /// }
+        /// ```
+        ///
+        /// ### 檔案格式錯誤
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "preview_import_schedule_excel",
+        ///   "Result": "僅支援 .xlsx Excel 檔案"
+        /// }
+        /// ```
+        ///
+        /// ### Excel 標題列錯誤
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "preview_import_schedule_excel",
+        ///   "Result": "Excel 標題格式錯誤，前兩欄必須為「班別類型 / 時段」"
+        /// }
+        /// ```
+        ///
+        /// ### 系統例外
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "preview_import_schedule_excel",
+        ///   "Result": "例外：Object reference not set to an instance of an object."
+        /// }
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 🚀 使用流程
+        /// 1. 先下載 `download_schedule_import_template_excel` 空白模板
+        /// 2. 在 Excel 內填入班表資料
+        /// 3. 上傳到本 API 預覽
+        /// 4. 系統回傳附顏色與批註的 Excel
+        /// 5. 使用者直接查看哪格成功、哪格錯誤
+        /// 6. 修正後再重新上傳
+        ///
+        /// ---
+        ///
+        /// ## 📌 注意事項
+        /// - 本 API 僅做預覽與驗證，不會寫入資料庫。
+        /// - 本 API 依賴 Staff 主檔資料，用於比對簡名是否合法。
+        /// - Staff 簡名必須唯一，否則該簡名會判定為錯誤。
+        /// - 本 API 目前僅支援單字簡名規則。
+        /// - 若同一天同一人出現在多個班別，會回傳錯誤。
+        /// </remarks>
+        /// <param name="file">上傳的 Excel 檔案（.xlsx）</param>
+        /// <returns>成功時回傳附驗證結果標記的 Excel 檔案，失敗時回傳 JSON 錯誤訊息。</returns>
+        [HttpPost("preview_import_schedule_excel")]
+        public IActionResult preview_import_schedule_excel(IFormFile file)
+        {
+            var timer = new MyTimerBasic();
+            returnData returnData = new returnData();
+            returnData.Method = "preview_import_schedule_excel";
+
+            try
+            {
+                if (file == null || file.Length == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未收到上傳檔案";
+                    return new JsonResult(returnData);
+                }
+
+                string ext = Path.GetExtension(file.FileName)?.ToLower();
+                if (ext != ".xlsx")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "僅支援 .xlsx Excel 檔案";
+                    return new JsonResult(returnData);
+                }
+
+                List<ImportScheduleTemplateRow> templateRows = ImportScheduleTemplateDefinition.GetRows();
+
+                List<StaffClass> staffClasses = staff.GetStaffs(new List<string>() { "pageSize=10000" }).staffClasses;
+                if (staffClasses == null) staffClasses = new List<StaffClass>();
+
+                Dictionary<string, List<StaffClass>> simpleNameMap =
+                    ImportScheduleStaffHelper.BuildSimpleNameMap(staffClasses);
+
+                PreviewImportScheduleExcelResponse preview = new PreviewImportScheduleExcelResponse();
+                preview.file_name = file.FileName;
+
+                Dictionary<string, string> dayStaffUsedMap = new Dictionary<string, string>();
+
+                using (var stream = file.OpenReadStream())
+                {
+                    XSSFWorkbook workbook = new XSSFWorkbook(stream);
+                    ISheet sourceSheet = workbook.GetSheetAt(0);
+
+                    if (sourceSheet == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "Excel 沒有可讀取的 Sheet";
+                        return new JsonResult(returnData);
+                    }
+
+                    int oldPreviewSheetIndex = workbook.GetSheetIndex("預覽結果");
+                    if (oldPreviewSheetIndex >= 0)
+                    {
+                        workbook.RemoveSheetAt(oldPreviewSheetIndex);
+                    }
+
+                    IRow headerRow = sourceSheet.GetRow(0);
+                    if (headerRow == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "Excel 標題列不存在";
+                        return new JsonResult(returnData);
+                    }
+
+                    string headerA = ImportScheduleExcelHelper.GetCellString(headerRow.GetCell(0));
+                    string headerB = ImportScheduleExcelHelper.GetCellString(headerRow.GetCell(1));
+
+                    if (headerA != "班別類型" || headerB != "時段")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "Excel 標題格式錯誤，前兩欄必須為「班別類型 / 時段」";
+                        return new JsonResult(returnData);
+                    }
+
+                    Dictionary<int, string> dateColumnMap =
+                        ImportScheduleExcelHelper.BuildDateColumnMap(headerRow, 2, 32);
+
+                    ICellStyle successStyle = CreatePreviewCellStyle(workbook, HSSFColor.LightGreen.Index);
+                    ICellStyle errorStyle = CreatePreviewCellStyle(workbook, HSSFColor.Rose.Index);
+                    ICellStyle warningStyle = CreatePreviewCellStyle(workbook, HSSFColor.LightYellow.Index);
+                    ICellStyle resultHeaderStyle = CreatePreviewHeaderStyle(workbook);
+                    ICellStyle resultCellStyle = CreatePreviewNormalStyle(workbook);
+
+                    IDrawing drawing = sourceSheet.CreateDrawingPatriarch();
+
+                    int totalCells = 0;
+                    int successCells = 0;
+                    int errorCells = 0;
+
+                    for (int rowIndex = 1; rowIndex <= templateRows.Count; rowIndex++)
+                    {
+                        IRow row = sourceSheet.GetRow(rowIndex);
+                        ImportScheduleTemplateRow expected = templateRows[rowIndex - 1];
+
+                        if (row == null)
+                        {
+                            IRow createdRow = sourceSheet.CreateRow(rowIndex);
+                            ICell aCell = createdRow.CreateCell(0);
+                            ICell bCell = createdRow.CreateCell(1);
+                            aCell.SetCellValue("");
+                            bCell.SetCellValue("");
+                            aCell.CellStyle = errorStyle;
+                            bCell.CellStyle = errorStyle;
+
+                            AddCellComment(drawing, aCell, $"第 {rowIndex + 1} 列不存在，應為固定班別列：{expected.ShiftType} / {expected.ShiftTime}");
+                            AddCellComment(drawing, bCell, $"第 {rowIndex + 1} 列不存在，應為固定班別列：{expected.ShiftType} / {expected.ShiftTime}");
+
+                            PreviewImportScheduleExcelCellResult rowErr = new PreviewImportScheduleExcelCellResult
+                            {
+                                row_index = (rowIndex + 1).ToString(),
+                                column_index = "1",
+                                date_text = "",
+                                shift_type = "",
+                                shift_time = "",
+                                raw_text = "",
+                                parsed_simple_names = "",
+                                parsed_staff_ids = "",
+                                parsed_staff_names = "",
+                                is_success = "false",
+                                error_message = $"第 {rowIndex + 1} 列不存在，應為固定班別列：{expected.ShiftType} / {expected.ShiftTime}"
+                            };
+
+                            preview.results.Add(rowErr);
+                            errorCells++;
+                            continue;
+                        }
+
+                        string shiftType = ImportScheduleExcelHelper.GetCellString(row.GetCell(0));
+                        string shiftTime = ImportScheduleExcelHelper.GetCellString(row.GetCell(1));
+
+                        if (!ImportScheduleExcelHelper.IsTemplateRowMatched(shiftType, shiftTime, expected))
+                        {
+                            ICell shiftTypeCell = row.GetCell(0) ?? row.CreateCell(0);
+                            ICell shiftTimeCell = row.GetCell(1) ?? row.CreateCell(1);
+
+                            shiftTypeCell.CellStyle = errorStyle;
+                            shiftTimeCell.CellStyle = errorStyle;
+
+                            string rowErrorMessage = $"第 {rowIndex + 1} 列班別定義錯誤，應為「{expected.ShiftType} / {expected.ShiftTime}」";
+
+                            AddCellComment(drawing, shiftTypeCell, rowErrorMessage);
+                            AddCellComment(drawing, shiftTimeCell, rowErrorMessage);
+
+                            PreviewImportScheduleExcelCellResult rowErr = new PreviewImportScheduleExcelCellResult
+                            {
+                                row_index = (rowIndex + 1).ToString(),
+                                column_index = "1",
+                                date_text = "",
+                                shift_type = shiftType,
+                                shift_time = shiftTime,
+                                raw_text = "",
+                                parsed_simple_names = "",
+                                parsed_staff_ids = "",
+                                parsed_staff_names = "",
+                                is_success = "false",
+                                error_message = rowErrorMessage
+                            };
+
+                            preview.results.Add(rowErr);
+                            errorCells++;
+                        }
+
+                        for (int col = 2; col <= 32; col++)
+                        {
+                            ICell cell = row.GetCell(col);
+                            string rawText = ImportScheduleExcelHelper.GetCellString(cell);
+                            if (rawText.StringIsEmpty()) continue;
+
+                            totalCells++;
+
+                            string dateText = dateColumnMap.ContainsKey(col) ? dateColumnMap[col] : "";
+
+                            PreviewImportScheduleExcelCellResult result = new PreviewImportScheduleExcelCellResult
+                            {
+                                row_index = (rowIndex + 1).ToString(),
+                                column_index = (col + 1).ToString(),
+                                date_text = dateText,
+                                shift_type = shiftType,
+                                shift_time = shiftTime,
+                                raw_text = rawText,
+                                parsed_simple_names = "",
+                                parsed_staff_ids = "",
+                                parsed_staff_names = "",
+                                is_success = "false",
+                                error_message = ""
+                            };
+
+                            if (dateText.StringIsEmpty() || !ImportScheduleExcelHelper.IsValidDayHeader(dateText))
+                            {
+                                result.error_message = $"第 1 列第 {col + 1} 欄日期標題錯誤，應為 01~31";
+                                if (cell != null)
+                                {
+                                    cell.CellStyle = errorStyle;
+                                    AddCellComment(drawing, cell, result.error_message);
+                                }
+                                preview.results.Add(result);
+                                errorCells++;
+                                continue;
+                            }
+
+                            if (ImportScheduleExcelHelper.ContainsInvalidCharacters(rawText))
+                            {
+                                result.error_message = "內容格式錯誤，不可包含空白、逗號、頓號、中括號或換行";
+                                if (cell != null)
+                                {
+                                    cell.CellStyle = errorStyle;
+                                    AddCellComment(drawing, cell, result.error_message);
+                                }
+                                preview.results.Add(result);
+                                errorCells++;
+                                continue;
+                            }
+
+                            List<string> simpleNames = ImportScheduleExcelHelper.ParseSimpleNames(rawText);
+
+                            List<string> duplicatedSimpleNames =
+                                ImportScheduleExcelHelper.GetDuplicatedSimpleNames(simpleNames);
+
+                            if (duplicatedSimpleNames.Count > 0)
+                            {
+                                result.error_message = $"同一格不可有重複簡名：{string.Join(",", duplicatedSimpleNames)}";
+                                if (cell != null)
+                                {
+                                    cell.CellStyle = errorStyle;
+                                    AddCellComment(drawing, cell, result.error_message);
+                                }
+                                preview.results.Add(result);
+                                errorCells++;
+                                continue;
+                            }
+
+                            ImportScheduleResolveResult resolveResult =
+                                ImportScheduleStaffHelper.ResolveSimpleNames(simpleNameMap, simpleNames);
+
+                            if (!resolveResult.IsSuccess)
+                            {
+                                result.error_message = resolveResult.ErrorMessage;
+                                if (cell != null)
+                                {
+                                    cell.CellStyle = errorStyle;
+                                    AddCellComment(drawing, cell, result.error_message);
+                                }
+                                preview.results.Add(result);
+                                errorCells++;
+                                continue;
+                            }
+
+                            bool hasDuplicateError = false;
+                            foreach (ImportScheduleResolvedStaff resolvedStaff in resolveResult.Staffs)
+                            {
+                                string currentShiftInfo = $"{shiftType} {shiftTime}";
+                                bool ok = ImportScheduleStaffHelper.TryCheckAndRegisterDailyDuplicate(
+                                    dayStaffUsedMap,
+                                    dateText,
+                                    resolvedStaff,
+                                    currentShiftInfo,
+                                    out string duplicateError);
+
+                                if (!ok)
+                                {
+                                    result.error_message = duplicateError;
+                                    hasDuplicateError = true;
+                                    break;
+                                }
+                            }
+
+                            if (hasDuplicateError)
+                            {
+                                if (cell != null)
+                                {
+                                    cell.CellStyle = errorStyle;
+                                    AddCellComment(drawing, cell, result.error_message);
+                                }
+                                preview.results.Add(result);
+                                errorCells++;
+                                continue;
+                            }
+
+                            result.parsed_simple_names = ImportScheduleStaffHelper.JoinSimpleNames(resolveResult.Staffs);
+                            result.parsed_staff_ids = ImportScheduleStaffHelper.JoinStaffIds(resolveResult.Staffs);
+                            result.parsed_staff_names = ImportScheduleStaffHelper.JoinStaffNames(resolveResult.Staffs);
+                            result.is_success = "true";
+                            result.error_message = "";
+
+                            if (cell != null)
+                            {
+                                cell.CellStyle = successStyle;
+                                AddCellComment(
+                                    drawing,
+                                    cell,
+                                    $"驗證成功\n簡名：{result.parsed_simple_names}\n工號：{result.parsed_staff_ids}\n姓名：{result.parsed_staff_names}"
+                                );
+                            }
+
+                            preview.results.Add(result);
+                            successCells++;
+                        }
+                    }
+
+                    preview.total_cells = totalCells.ToString();
+                    preview.success_cells = successCells.ToString();
+                    preview.error_cells = errorCells.ToString();
+
+                    ISheet resultSheet = workbook.CreateSheet("預覽結果");
+
+                    int resultRowIndex = 0;
+
+                    IRow summaryTitleRow = resultSheet.CreateRow(resultRowIndex++);
+                    ICell summaryTitleCell = summaryTitleRow.CreateCell(0);
+                    summaryTitleCell.SetCellValue("班表匯入預覽結果");
+                    summaryTitleCell.CellStyle = resultHeaderStyle;
+                    resultSheet.AddMergedRegion(new CellRangeAddress(0, 0, 0, 8));
+
+                    IRow summaryRow = resultSheet.CreateRow(resultRowIndex++);
+                    SetResultCell(summaryRow, 0, "檔名", resultHeaderStyle);
+                    SetResultCell(summaryRow, 1, preview.file_name, resultCellStyle);
+                    SetResultCell(summaryRow, 2, "總格數", resultHeaderStyle);
+                    SetResultCell(summaryRow, 3, preview.total_cells, resultCellStyle);
+                    SetResultCell(summaryRow, 4, "成功格數", resultHeaderStyle);
+                    SetResultCell(summaryRow, 5, preview.success_cells, resultCellStyle);
+                    SetResultCell(summaryRow, 6, "失敗格數", resultHeaderStyle);
+                    SetResultCell(summaryRow, 7, preview.error_cells, resultCellStyle);
+
+                    resultRowIndex++;
+
+                    IRow resultHeaderRow = resultSheet.CreateRow(resultRowIndex++);
+                    string[] headers = new string[]
+                    {
+                "列號",
+                "欄號",
+                "日期",
+                "班別類型",
+                "時段",
+                "原始內容",
+                "解析簡名",
+                "解析工號",
+                "解析姓名",
+                "是否成功",
+                "錯誤訊息"
+                    };
+
+                    for (int i = 0; i < headers.Length; i++)
+                    {
+                        SetResultCell(resultHeaderRow, i, headers[i], resultHeaderStyle);
+                    }
+
+                    foreach (PreviewImportScheduleExcelCellResult item in preview.results)
+                    {
+                        IRow rr = resultSheet.CreateRow(resultRowIndex++);
+                        SetResultCell(rr, 0, item.row_index, resultCellStyle);
+                        SetResultCell(rr, 1, item.column_index, resultCellStyle);
+                        SetResultCell(rr, 2, item.date_text, resultCellStyle);
+                        SetResultCell(rr, 3, item.shift_type, resultCellStyle);
+                        SetResultCell(rr, 4, item.shift_time, resultCellStyle);
+                        SetResultCell(rr, 5, item.raw_text, resultCellStyle);
+                        SetResultCell(rr, 6, item.parsed_simple_names, resultCellStyle);
+                        SetResultCell(rr, 7, item.parsed_staff_ids, resultCellStyle);
+                        SetResultCell(rr, 8, item.parsed_staff_names, resultCellStyle);
+                        SetResultCell(rr, 9, item.is_success, item.is_success == "true" ? successStyle : errorStyle);
+                        SetResultCell(rr, 10, item.error_message, resultCellStyle);
+                    }
+
+                    for (int i = 0; i <= 10; i++)
+                    {
+                        resultSheet.SetColumnWidth(i, 18 * 256);
+                    }
+                    resultSheet.SetColumnWidth(5, 24 * 256);
+                    resultSheet.SetColumnWidth(10, 40 * 256);
+
+                    byte[] bytes;
+                    using (var ms = new MemoryStream())
+                    {
+                        workbook.Write(ms);
+                        bytes = ms.ToArray();
+                    }
+
+                    var outputStream = new MemoryStream(bytes);
+                    string contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+                    string downloadFileName = "schedule_import_preview_result.xlsx";
+                    string displayFileName = "班表匯入預覽結果.xlsx";
+                    string utf8FileName = Uri.EscapeDataString(displayFileName);
+
+                    Response.Headers["Content-Disposition"] =
+                        $"attachment; filename=\"{downloadFileName}\"; filename*=UTF-8''{utf8FileName}";
+                    Response.Headers["Access-Control-Expose-Headers"] =
+                        "Content-Disposition, Content-Length, Content-Type";
+
+                    return File(outputStream, contentType);
+                }
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = $"例外：{ex.Message}";
+                return new JsonResult(returnData);
+            }
+        }
+
+        /// <summary>
+        /// 建立預覽用儲存格樣式（底色）
+        /// </summary>
+        private ICellStyle CreatePreviewCellStyle(IWorkbook workbook, short fillColor)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Center;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.WrapText = true;
+            style.FillForegroundColor = fillColor;
+            style.FillPattern = FillPattern.SolidForeground;
+            style.SetFont(font);
+
+            return style;
+        }
+        /// <summary>
+        /// 建立結果 Sheet 標題樣式
+        /// </summary>
+        private ICellStyle CreatePreviewHeaderStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 11;
+            font.IsBold = true;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Center;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.WrapText = true;
+            style.FillForegroundColor = HSSFColor.Grey25Percent.Index;
+            style.FillPattern = FillPattern.SolidForeground;
+            style.SetFont(font);
+
+            return style;
+        }
+        /// <summary>
+        /// 建立結果 Sheet 一般樣式
+        /// </summary>
+        private ICellStyle CreatePreviewNormalStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Left;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.WrapText = true;
+            style.SetFont(font);
+
+            return style;
+        }
+        /// <summary>
+        /// 新增或更新儲存格批註
+        /// </summary>
+        private void AddCellComment(IDrawing drawing, ICell cell, string commentText)
+        {
+            if (cell == null || drawing == null) return;
+            if (commentText == null) commentText = "";
+
+            IWorkbook workbook = cell.Sheet.Workbook;
+            ICreationHelper factory = workbook.GetCreationHelper();
+
+            IClientAnchor anchor = factory.CreateClientAnchor();
+            anchor.Col1 = cell.ColumnIndex;
+            anchor.Col2 = cell.ColumnIndex + 3;
+            anchor.Row1 = cell.RowIndex;
+            anchor.Row2 = cell.RowIndex + 4;
+
+            IComment comment = drawing.CreateCellComment(anchor);
+            comment.String = factory.CreateRichTextString(commentText);
+            comment.Author = "System";
+            cell.CellComment = comment;
+        }
+        /// <summary>
+        /// 設定結果 Sheet 儲存格內容與樣式
+        /// </summary>
+        private void SetResultCell(IRow row, int colIndex, string text, ICellStyle style)
+        {
+            ICell cell = row.GetCell(colIndex) ?? row.CreateCell(colIndex);
+            cell.SetCellValue(text ?? "");
+            if (style != null) cell.CellStyle = style;
+        }
 
         /// <summary>
         /// 將時間字串正規化：空值/MinValue/非法字串 → MinValue 字串；合法字串 → 原樣回傳
@@ -6419,7 +12904,6 @@ namespace PharmaRosterAPI
 
             return dt;
         }
-
 
         // =========================
         // ✅ Helper：依 option 計算 day 的登入者視角統計
@@ -6597,22 +13081,22 @@ namespace PharmaRosterAPI
                 // ✅ 你新增的 FF 欄位（請確保 class 已加上）
                 opt.is_force_ff = "true";
             }
-            if (dt.StringToDateTime().DayOfWeek == DayOfWeek.Saturday)
-            {
-                item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt.StringToDateTime());
-                item.selected_dayoff_type = "FF"; // 若你前端有使用，可留；不需要也可空字串
-                                                  // FF 一律整天假        
-                opt.can_full = "false";
-                opt.can_half_am = "true";
-                opt.can_half_pm = "true";
-                // ✅ 強制選擇整天假
-                opt.selected_full = "false";
-                opt.selected_half_am = "false";
-                opt.selected_half_pm = "false";
-                opt.is_any_date = "true";
+            //if (dt.StringToDateTime().DayOfWeek == DayOfWeek.Saturday)
+            //{
+            //    item.shift_requirement = BuildHolidayOffShiftRequirementJson(dt.StringToDateTime());
+            //    item.selected_dayoff_type = "FF"; // 若你前端有使用，可留；不需要也可空字串
+            //                                      // FF 一律整天假        
+            //    opt.can_full = "false";
+            //    opt.can_half_am = "true";
+            //    opt.can_half_pm = "true";
+            //    // ✅ 強制選擇整天假
+            //    opt.selected_full = "false";
+            //    opt.selected_half_am = "false";
+            //    opt.selected_half_pm = "false";
+            //    opt.is_any_date = "true";
 
-                opt.is_force_ff = "false";
-            }
+            //    opt.is_force_ff = "false";
+            //}
 
             opt.is_forbidden = "false";
             opt.assigned_shift = "OFF";
@@ -6702,7 +13186,7 @@ namespace PharmaRosterAPI
             {
                 DateTime dateTimeSuggestedDate = new DateTime();
                 if (itemDate.DayOfWeek == DayOfWeek.Saturday) dateTimeSuggestedDate = itemDate.AddDays(7);
-                if (itemDate.DayOfWeek == DayOfWeek.Sunday) dateTimeSuggestedDate = itemDate.AddDays(4);
+                if (itemDate.DayOfWeek == DayOfWeek.Sunday) dateTimeSuggestedDate = itemDate.AddDays(1);
             
                 StaffDayOffOptionClass option = new StaffDayOffOptionClass();
                 option.GUID = Guid.NewGuid().ToString();
@@ -6745,7 +13229,7 @@ namespace PharmaRosterAPI
                 option.NormalizeSelection();
                 return option;
             }
-        
+
             // =========================================================
             // ✅ 規則B：前一天小夜班，且後一天沒有上班
             // =========================================================
@@ -6814,7 +13298,7 @@ namespace PharmaRosterAPI
             // ===== 觸發條件：結束時間符合 =====
             string staffGuid = item.staff_guid;
             string endStr = item.workShiftRequirement?.TimeRange.Value.end.ToString() ?? "";
-         
+     
 
             // item日期
             DateTime itemDate = item.date.StringToDateTime();
@@ -6925,15 +13409,17 @@ namespace PharmaRosterAPI
             // =========================================================
             if (itemDate.DayOfWeek == DayOfWeek.Sunday && endStr.Contains("16:00"))
             {
-                if(item.workShiftRequirement.department == "急診")
+          
+                if (item.workShiftRequirement.department == "急診")
                 {
                     StaffDayOffOptionClass option = new StaffDayOffOptionClass();
                     DateTime dateTimeSuggestedDate = DateTime.MinValue;
-
+                
                     option.GUID = Guid.NewGuid().ToString();
                     option.form_guid = item.form_guid;
                     option.item_guid = item.GUID;
                     option.staff_guid = staffGuid;
+                 
                     option.date = item.date;
                     option.can_full = "true";
                     option.can_half_pm = "false";
@@ -6966,13 +13452,14 @@ namespace PharmaRosterAPI
                 }
                 if (item.workShiftRequirement.department == "門診")
                 {
+                
                     StaffDayOffOptionClass option = new StaffDayOffOptionClass();
                     DateTime dateTimeSuggestedDate = DateTime.MinValue;
                     if(item.position.StringIsInt32() == false)
                     {
-                        return null;
+                        option.is_any_date = "true";
                     }
-                
+                   
                     option.GUID = Guid.NewGuid().ToString();
                     option.form_guid = item.form_guid;
                     option.item_guid = item.GUID;
@@ -6993,7 +13480,7 @@ namespace PharmaRosterAPI
                     {
                         if (HasWorkShift(itemIndex, item.staff_guid, dateTimeSuggestedDate))
                         {
-                            return null;
+                            option.is_any_date = "true";
                         }
                         if (dateTimeSuggestedDate.DayOfWeek == DayOfWeek.Saturday)
                         {
@@ -7144,6 +13631,307 @@ namespace PharmaRosterAPI
 
             // 有 workShiftRequirement.time 就視為有班
             return items.Any(x => !(x.workShiftRequirement?.time ?? "").StringIsEmpty());
+        }
+        /// <summary>
+        /// 判斷指定人員在指定表單中的預留休是否已全部處理完成
+        /// </summary>
+        /// <param name="form_guid">表單 GUID</param>
+        /// <param name="staff_guid">人員 GUID</param>
+        /// <returns>true：已完成 / false：尚有預留休未處理</returns>
+        private bool IsStaffReservedDayoffCompleted(string form_guid, string staff_guid)
+        {
+            var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+            List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
+                .GetRowsByDefult(null, "form_guid", form_guid)
+                .SQLToClass<StaffDayOffOptionClass>()
+                .Where(x => x != null && x.staff_guid == staff_guid)
+                .ToList();
+
+            foreach (var option in options)
+            {
+                if (option == null) continue;
+
+                option.NormalizeSelection();
+
+                // 排除填洞休假
+                if ((option.dayoff_source_type ?? "").Trim().ToUpper() == "HOLE_FILL") continue;
+
+                // 排除應休額度排休
+                if (option.is_quota_dayoff == "true") continue;
+
+                // 系統 FF 視為已完成
+                if (option.is_force_ff == "true") continue;
+
+                // 已釋出視為已完成
+                if (option.is_released == "true") continue;
+
+                // 已選擇視為已完成
+                bool hasSelected =
+                    option.selected_full == "true" ||
+                    option.selected_half_am == "true" ||
+                    option.selected_half_pm == "true";
+
+                if (hasSelected) continue;
+
+                // 仍有預留休未處理
+                return false;
+            }
+
+            return true;
+        }
+        /// <summary>
+        /// 取得指定人員於指定表單中的應休額度統計
+        /// </summary>
+        /// <param name="form_guid">表單 GUID</param>
+        /// <param name="staff_guid">人員 GUID</param>
+        /// <returns>應休總額、已使用額度、剩餘額度</returns>
+        private GetStaffRemainingQuotaDayoffResponse GetStaffRemainingQuotaDayoff(string form_guid, string staff_guid)
+        {
+            var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+            var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+            var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+            List<DayOffScheduleDayClass> days = sql_dayOffScheduleDayClass
+                .GetRowsByDefult(null, "form_guid", form_guid)
+                .SQLToClass<DayOffScheduleDayClass>()
+                .OrderBy(x => x.date.StringToDateTime())
+                .ToList();
+
+            List<DayOffScheduleItemClass> items = sql_dayOffScheduleItemClass
+                .GetRowsByDefult(null, "form_guid", form_guid)
+                .SQLToClass<DayOffScheduleItemClass>()
+                .Where(x => x != null && x.staff_guid == staff_guid)
+                .ToList();
+
+            List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
+                .GetRowsByDefult(null, "form_guid", form_guid)
+                .SQLToClass<StaffDayOffOptionClass>()
+                .Where(x => x != null && x.staff_guid == staff_guid)
+                .ToList();
+
+            Dictionary<string, DayOffScheduleItemClass> itemByDate = items
+                .Where(x => x != null && x.date.StringIsEmpty() == false)
+                .GroupBy(x => x.date.StringToDateTime().ToDateString('-'))
+                .ToDictionary(g => g.Key, g => g.First());
+
+            bool HasSchedule(DayOffScheduleItemClass item)
+            {
+                if (item == null) return false;
+
+                WorkShiftRequirementClass req = item.workShiftRequirement;
+                if (req == null) return false;
+                if (req.disabled) return false;
+                if (req.RequiredCountBase <= 0) return false;
+                if (req.shift_type.StringIsEmpty()) return false;
+
+                return true;
+            }
+
+            double quotaTotal = 0;
+            double quotaUsedTotal = 0;
+
+            // 1. 每個週六未上班 +0.5
+            foreach (var day in days)
+            {
+                DateTime dt = day.date.StringToDateTime();
+                if (dt == DateTime.MinValue) continue;
+
+                if (dt.DayOfWeek == DayOfWeek.Saturday)
+                {
+                    string key = dt.ToDateString('-');
+                    itemByDate.TryGetValue(key, out var item);
+
+                    if (!HasSchedule(item))
+                    {
+                        quotaTotal += 0.5;
+                    }
+                }
+            }
+
+            // 2. option 貢獻的 quota
+            foreach (var option in options)
+            {
+                if (option == null) continue;
+
+                option.NormalizeSelection();
+
+                if (option.is_any_date == "true")
+                {
+                    quotaTotal += 1;
+                }
+
+                if (option.is_released == "true")
+                {
+                    string releasedType = (option.released_dayoff_type ?? "").Trim().ToUpper();
+
+                    if (releasedType == "FULL")
+                    {
+                        quotaTotal += 1;
+                    }
+                    else if (releasedType == "HALF_AM" || releasedType == "HALF_PM")
+                    {
+                        quotaTotal += 0.5;
+                    }
+                }
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    quotaUsedTotal += option.quota_used.StringToDouble();
+                }
+            }
+
+            return new GetStaffRemainingQuotaDayoffResponse
+            {
+                staff_guid = staff_guid,
+                quota_total = quotaTotal.ToString("0.##"),
+                quota_used_total = quotaUsedTotal.ToString("0.##"),
+                quota_remaining = (quotaTotal - quotaUsedTotal).ToString("0.##")
+            };
+        }
+        /// <summary>
+        /// 取得單一人員在指定表單中的應休排休公平機制統計
+        /// </summary>
+        /// <param name="form_guid">表單 GUID</param>
+        /// <param name="staff_guid">人員 GUID</param>
+        /// <returns>公平機制統計結果</returns>
+        private StaffQuotaDayoffRuleSummary GetStaffQuotaDayoffRuleSummary(string form_guid, string staff_guid)
+        {
+            var quotaSummary = GetStaffRemainingQuotaDayoff(form_guid, staff_guid);
+
+            var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+            List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
+                .GetRowsByDefult(null, "form_guid", form_guid)
+                .SQLToClass<StaffDayOffOptionClass>()
+                .Where(x => x != null && x.staff_guid == staff_guid)
+                .ToList();
+
+            int pmHalfUsedCount = 0;
+            int saturdayUsedCount = 0;
+            int pmHalfLimitCount = 2;
+            int saturdayLimitCount = 1;
+            bool hasExtraSaturdayLimit = false;
+
+            foreach (var option in options)
+            {
+                if (option == null) continue;
+
+                string quotaType = (option.quota_dayoff_type ?? "").Trim().ToUpper();
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    if (quotaType == "WEEKDAY_HALF_PM")
+                    {
+                        pmHalfUsedCount++;
+                    }
+
+                    if (quotaType == "SATURDAY_HALF_AM")
+                    {
+                        saturdayUsedCount++;
+                    }
+                }
+
+                // 簡化版規則：
+                // 若此人存在「週六或週日的釋出來源」，給額外 1 次週六排休機會
+                DateTime dt = option.date.StringToDateTime();
+                if ((option.is_released == "true" || option.is_any_date == "true") &&
+                    dt != DateTime.MinValue &&
+                    (dt.DayOfWeek == DayOfWeek.Saturday || dt.DayOfWeek == DayOfWeek.Sunday))
+                {
+                    hasExtraSaturdayLimit = true;
+                }
+            }
+
+            if (hasExtraSaturdayLimit)
+            {
+                saturdayLimitCount += 1;
+            }
+
+            return new StaffQuotaDayoffRuleSummary
+            {
+                quota_total = quotaSummary.quota_total,
+                quota_used_total = quotaSummary.quota_used_total,
+                quota_remaining = quotaSummary.quota_remaining,
+                pm_half_used_count = pmHalfUsedCount.ToString(),
+                saturday_used_count = saturdayUsedCount.ToString(),
+                pm_half_limit_count = pmHalfLimitCount.ToString(),
+                saturday_limit_count = saturdayLimitCount.ToString(),
+                has_extra_saturday_limit = hasExtraSaturdayLimit ? "true" : "false"
+            };
+        }
+        /// <summary>
+        /// 取得指定表單、指定日期的休假名額使用統計
+        /// </summary>
+        /// <param name="form_guid">表單 GUID</param>
+        /// <param name="date">指定日期 yyyy-MM-dd</param>
+        /// <returns>當日 AM / PM 名額使用狀況</returns>
+        private DayOffDateQuotaUsageSummary GetDayOffDateQuotaUsageSummary(string form_guid, string date)
+        {
+            var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+            var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+            string targetDate = date.StringToDateTime().ToDateString('-');
+
+            DayOffScheduleDayClass day = sql_dayOffScheduleDayClass
+                .GetRowsByDefult(null, "form_guid", form_guid)
+                .SQLToClass<DayOffScheduleDayClass>()
+                .Where(x => x.date.StringToDateTime().ToDateString('-') == targetDate)
+                .FirstOrDefault();
+
+            if (day == null)
+            {
+                return null;
+            }
+
+            List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
+                .GetRowsByDefult(null, "form_guid", form_guid)
+                .SQLToClass<StaffDayOffOptionClass>()
+                .Where(x => x != null && x.date.StringToDateTime().ToDateString('-') == targetDate)
+                .ToList();
+
+            int amUsed = 0;
+            int pmUsed = 0;
+
+            foreach (var option in options)
+            {
+                if (option == null) continue;
+
+                option.NormalizeSelection();
+
+                // 系統 FF / 預留休 / 應休排休 / 填洞
+                // 只要已經選了，就占用當日名額
+                if (option.selected_full == "true")
+                {
+                    amUsed += 1;
+                    pmUsed += 1;
+                    continue;
+                }
+
+                if (option.selected_half_am == "true")
+                {
+                    amUsed += 1;
+                }
+
+                if (option.selected_half_pm == "true")
+                {
+                    pmUsed += 1;
+                }
+            }
+
+            int amMax = day.am_max_dayoff_count.StringToInt32();
+            int pmMax = day.pm_max_dayoff_count.StringToInt32();
+
+            return new DayOffDateQuotaUsageSummary
+            {
+                date = targetDate,
+                am_max_dayoff_count = amMax.ToString(),
+                pm_max_dayoff_count = pmMax.ToString(),
+                am_used_count = amUsed.ToString(),
+                pm_used_count = pmUsed.ToString(),
+                am_remaining_count = (amMax - amUsed).ToString(),
+                pm_remaining_count = (pmMax - pmUsed).ToString()
+            };
         }
 
         public static DateTime GetFirstSaturdayOfMonth(DateTime date)

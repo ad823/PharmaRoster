@@ -56,6 +56,18 @@
       <SpecificVersion>False</SpecificVersion>
       <HintPath>..\0.DLL\MySql.Data.dll</HintPath>
     </Reference>
+    <Reference Include="NPOI">
+      <HintPath>..\0.DLL\NPOI.dll</HintPath>
+    </Reference>
+    <Reference Include="NPOI.OOXML">
+      <HintPath>..\0.DLL\NPOI.OOXML.dll</HintPath>
+    </Reference>
+    <Reference Include="NPOI.OpenXml4Net">
+      <HintPath>..\0.DLL\NPOI.OpenXml4Net.dll</HintPath>
+    </Reference>
+    <Reference Include="NPOI.OpenXmlFormats">
+      <HintPath>..\0.DLL\NPOI.OpenXmlFormats.dll</HintPath>
+    </Reference>
     <Reference Include="SQLUI">
       <HintPath>..\0.DLL\SQLUI.dll</HintPath>
     </Reference>
@@ -100,6 +112,10 @@
     <Compile Include="BasicClass.cs" />
     <Compile Include="DayOffGroupClass.cs" />
     <Compile Include="DayOffScheduleClass.cs" />
+    <Compile Include="DTOs\ImportSchedule\ImportSchedulePreviewDtos.cs" />
+    <Compile Include="Helpers\ImportSchedule\ImportScheduleExcelHelper.cs" />
+    <Compile Include="Helpers\ImportSchedule\ImportScheduleStaffHelper.cs" />
+    <Compile Include="Helpers\ImportSchedule\ImportScheduleTemplateDefinition.cs" />
     <Compile Include="LeaveRequestClass.cs" />
     <Compile Include="LinePushLogClass.cs" />
     <Compile Include="LineSettingClass.cs" />
@@ -120,6 +136,9 @@
   <ItemGroup>
     <None Include="app.config" />
     <None Include="packages.config" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="Models\" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <PropertyGroup>

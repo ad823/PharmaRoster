@@ -987,7 +987,10 @@ LIMIT 1
         }
 
         /// <summary>
-        /// 建立「排班/排休整合」回覆文字（排班只看 item、排休只看 option）
+        /// 建立「排班/排休整合」回覆文字
+        /// 排班只看 item
+        /// 預留休 / FF / NH / 釋出可從 item.option 讀
+        /// 應休排休需另外從 StaffDayOffOptionClass 查詢，因為應休 option 可能沒有 item
         /// </summary>
         private async Task<string> BuildScheduleAndDayOffReplyText(string formName, string staffId)
         {
@@ -996,6 +999,10 @@ LIMIT 1
 
             var lines = new List<(DateTime dt, int order, string text)>();
 
+            // ===============================
+            // A. 排班 / 預留休 / FF / NH / 釋出
+            // 來源：form.days[].items[]
+            // ===============================
             foreach (var day in form.days ?? new List<DayOffScheduleDayClass>())
             {
                 DateTime dayDt = day?.date.StringToDateTime() ?? DateTime.MinValue;
@@ -1003,42 +1010,82 @@ LIMIT 1
 
                 string dateText = dayDt.ToString("yyyy/MM/dd");
 
-                // 可能一天多 item：全部列出（保守）
                 var items = day.items ?? new List<DayOffScheduleItemClass>();
                 if (items.Count == 0) continue;
 
                 foreach (var item in items)
                 {
-                    // ========= A) 排班（只看 item）=========
+                    if (item == null) continue;
+
+                    // ========= 排班：只看 item =========
                     string shiftType = GetShiftTypeFromItem(item).Trim();
                     string shiftTime = GetShiftTimeFromItem(item).Trim();
+
                     if (shiftType == "swing") shiftType = "小夜";
                     if (shiftType == "midnight") shiftType = "大夜";
                     if (shiftType == "holiday") shiftType = "假日";
+
                     bool hasSchedule =
                         shiftType.StringIsEmpty() == false
                         && !shiftType.Equals("OFF", StringComparison.OrdinalIgnoreCase)
                         && !shiftType.Equals("WW", StringComparison.OrdinalIgnoreCase)
-                        && !shiftType.Equals("FF", StringComparison.OrdinalIgnoreCase);
+                        && !shiftType.Equals("FF", StringComparison.OrdinalIgnoreCase)
+                        && !shiftType.Equals("NH", StringComparison.OrdinalIgnoreCase);
 
                     if (hasSchedule)
                     {
                         string s = shiftTime.StringIsEmpty()
-                            ? $"{dateText}({GetChineseWeekDay(dateText.StringToDateTime())}) {shiftType}"
-                            : $"{dateText}({GetChineseWeekDay(dateText.StringToDateTime())}) {shiftType} {shiftTime}";
+                            ? $"{dateText}({GetChineseWeekDay(dayDt)}) {shiftType}"
+                            : $"{dateText}({GetChineseWeekDay(dayDt)}) {shiftType} {shiftTime}";
+
                         lines.Add((dayDt.Date, 1, s));
                     }
 
-                    // ========= B) 排休（只看 option）=========
-                    string dayoffText = GetDayOffTextFromOption(item.option);
-                    if (dayoffText.StringIsEmpty() == false && item.option.date.StringToDateTime() != DateTime.MinValue && item.option.date.StringIsEmpty() == false)
-                    {
-                        lines.Add((item.option.date.StringToDateTime(), 2, $"{item.option.date.StringToDateTime().ToDateString()}({GetChineseWeekDay(item.option.date.StringToDateTime())}) {dayoffText}"));
-                    }
+                    // ========= 排休：只看 item.option，但不含應休 =========
+                    StaffDayOffOptionClass option = item.option;
+                    if (option == null) continue;
+
+                    string dayoffText = GetDayOffTextFromOption(option, includeQuotaDayoff: false);
+                    if (dayoffText.StringIsEmpty()) continue;
+
+                    DateTime optionDate = option.date.StringToDateTime();
+                    if (optionDate == DateTime.MinValue) continue;
+
+                    lines.Add((
+                        optionDate.Date,
+                        2,
+                        $"{optionDate.ToDateString()}({GetChineseWeekDay(optionDate)}) {dayoffText}"
+                    ));
                 }
             }
 
+            // ===============================
+            // B. 應休排休
+            // 來源：StaffDayOffOptionClass 另外查
+            // 因為應休 option 可能沒有 item
+            // ===============================
+            List<StaffDayOffOptionClass> quotaOptions = GetQuotaDayoffOptionsForStaff(form.GUID, staffId);
+
+            foreach (var option in quotaOptions)
+            {
+                if (option == null) continue;
+
+                string dayoffText = GetDayOffTextFromOption(option, includeQuotaDayoff: true);
+                if (dayoffText.StringIsEmpty()) continue;
+
+                DateTime optionDate = option.date.StringToDateTime();
+                if (optionDate == DateTime.MinValue) continue;
+
+                lines.Add((
+                    optionDate.Date,
+                    3,
+                    $"{optionDate.ToDateString()}({GetChineseWeekDay(optionDate)}) {dayoffText}"
+                ));
+            }
+
             lines = lines
+                .GroupBy(x => $"{x.dt:yyyy-MM-dd}|{x.text}")
+                .Select(g => g.First())
                 .OrderBy(x => x.dt)
                 .ThenBy(x => x.order)
                 .ThenBy(x => x.text)
@@ -1047,15 +1094,134 @@ LIMIT 1
             var sb = new StringBuilder();
             sb.AppendLine($"【排班/排休】{form.form_name}");
             sb.AppendLine($"工號：{staffId}");
+
             if (lines.Count == 0)
             {
                 sb.AppendLine("目前沒有可顯示的排班或已選休假資料。");
                 return sb.ToString().Trim();
             }
 
-            foreach (var x in lines) sb.AppendLine(x.text);
+            foreach (var x in lines)
+            {
+                sb.AppendLine(x.text);
+            }
+
             return sb.ToString().Trim();
         }
+        /// <summary>
+        /// 查詢指定人員在指定表單中的應休排休 option
+        /// 應休 option 可能沒有 item_guid，所以不能只靠 get_form 的 item.option
+        /// </summary>
+        private List<StaffDayOffOptionClass> GetQuotaDayoffOptionsForStaff(string formGuid, string staffId)
+        {
+            var sql_staff = MethodClass.GetSQLControl<StaffClass>();
+            var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+            object[] obj_staff = sql_staff.GetRowsByDefult(null, "staff_id", staffId).FirstOrDefault();
+            if (obj_staff == null) return new List<StaffDayOffOptionClass>();
+
+            StaffClass staff = obj_staff.SQLToClass<StaffClass>();
+            if (staff == null || staff.GUID.StringIsEmpty()) return new List<StaffDayOffOptionClass>();
+
+            List<StaffDayOffOptionClass> options = sql_option
+                .GetRowsByDefult(null, "form_guid", formGuid)
+                .SQLToClass<StaffDayOffOptionClass>()
+                .Where(x =>
+                    x != null &&
+                    x.staff_guid == staff.GUID &&
+                    x.is_quota_dayoff == "true" &&
+                    (
+                        x.selected_full == "true" ||
+                        x.selected_half_am == "true" ||
+                        x.selected_half_pm == "true"
+                    ))
+                .OrderBy(x => x.date.StringToDateTime())
+                .ToList();
+
+            return options;
+        }
+        /// <summary>
+        /// 從 option 取得排休顯示文字
+        /// includeQuotaDayoff:
+        /// true  = 包含應休排休
+        /// false = 排除應休排休，避免 item.option 與額外查詢重複顯示
+        /// </summary>
+        private string GetDayOffTextFromOption(StaffDayOffOptionClass option, bool includeQuotaDayoff)
+        {
+            if (option == null) return "";
+
+            option.NormalizeSelection();
+
+            string sourceType = (option.dayoff_source_type ?? "").Trim().ToUpper();
+            string releaseType = (option.released_dayoff_type ?? "").Trim().ToUpper();
+
+            // ===============================
+            // 1. 應休排休
+            // ===============================
+            if (option.is_quota_dayoff == "true")
+            {
+                if (!includeQuotaDayoff) return "";
+
+                if (option.selected_full == "true")
+                    return "應休-整日";
+
+                if (option.selected_half_am == "true")
+                    return "應休-上午";
+
+                if (option.selected_half_pm == "true")
+                    return "應休-下午";
+
+                return "";
+            }
+
+            // ===============================
+            // 2. NH 國定假日
+            // ===============================
+            if (sourceType == "NATIONAL_HOLIDAY")
+            {
+                return "NH 國定假日";
+            }
+
+            // ===============================
+            // 3. FF 強制休假
+            // ===============================
+            if (option.is_force_ff == "true")
+            {
+                return "FF 假日休假";
+            }
+
+            // ===============================
+            // 4. 已釋出
+            // ===============================
+            if (option.is_released == "true")
+            {
+                if (releaseType == "FULL")
+                    return "已釋出-整日";
+
+                if (releaseType == "HALF_AM")
+                    return "已釋出-上午";
+
+                if (releaseType == "HALF_PM")
+                    return "已釋出-下午";
+
+                return "已釋出";
+            }
+
+            // ===============================
+            // 5. 一般預留休 / 已選休假
+            // ===============================
+            if (option.selected_full == "true")
+                return "休假-整日";
+
+            if (option.selected_half_am == "true")
+                return "休假-上午";
+
+            if (option.selected_half_pm == "true")
+                return "休假-下午";
+
+            return "";
+        }
+   
         public static string GetChineseWeekDay(DateTime date)
         {
             switch (date.DayOfWeek)
@@ -1114,20 +1280,7 @@ LIMIT 1
             }
         }
 
-        /// <summary>
-        /// 排休：從 option 判斷（FF/已選），回傳「休假 全日/上午/下午」
-        /// </summary>
-        private string GetDayOffTextFromOption(StaffDayOffOptionClass opt)
-        {
-            if (opt == null) return "";
-
-            if (opt.is_force_ff == "true") return "休假 全日";
-            if (opt.selected_full == "true") return "休假 全日";
-            if (opt.selected_half_am == "true") return "休假 上午";
-            if (opt.selected_half_pm == "true") return "休假 下午";
-
-            return "";
-        }
+  
 
         /// <summary>
         /// 取得指定表單(form_name)中，指定登入者(staff_id)的個人資料（保留所有 day，即使那天沒有 item 也要回）
