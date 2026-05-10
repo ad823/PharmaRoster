@@ -178,7 +178,6 @@ namespace PharmaRosterAPI
         // ============================================================
         // 解析 staff 清單
         // ============================================================
-
         private List<string> ExtractStaffIds(List<string> valueAry)
         {
             var list = new List<string>();
@@ -217,7 +216,6 @@ namespace PharmaRosterAPI
         // ============================================================
         // 單人推播 + 寫 line_push_log（成功/失敗都寫）
         // ============================================================
-
         private async Task<(bool is_success, string error_message)> PushToOneStaffAndLog(
             string channelAccessToken,
             string staff_id,

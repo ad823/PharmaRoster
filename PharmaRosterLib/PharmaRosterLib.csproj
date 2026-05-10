@@ -112,6 +112,8 @@
     <Compile Include="BasicClass.cs" />
     <Compile Include="DayOffGroupClass.cs" />
     <Compile Include="DayOffScheduleClass.cs" />
+    <Compile Include="DTOs\Auth\RegisteredStaffView.cs" />
+    <Compile Include="DTOs\Auth\ResetPasswordResponse.cs" />
     <Compile Include="DTOs\ImportSchedule\ImportSchedulePreviewDtos.cs" />
     <Compile Include="Helpers\ImportSchedule\ImportScheduleExcelHelper.cs" />
     <Compile Include="Helpers\ImportSchedule\ImportScheduleStaffHelper.cs" />

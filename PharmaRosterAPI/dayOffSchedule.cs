@@ -11,6 +11,9 @@ using NPOI.SS.Formula.Functions;
 using NPOI.SS.UserModel;
 using NPOI.SS.Util;
 using NPOI.XSSF.UserModel;
+using PdfSharp.Drawing;
+using PdfSharp.Fonts;
+using PdfSharp.Pdf;
 using PharmaRosterLib;
 using PharmaRosterLib.Helpers.ImportSchedule;
 using SQLUI;
@@ -1361,7 +1364,667 @@ namespace PharmaRosterAPI
             }
         }
 
-    
+        /// <summary>
+        /// 確認匯入班表 Excel，並建立新的排班表單
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途
+        /// 本 API 用於將已完成預覽檢查的班表 Excel 正式匯入系統，並建立一份新的排班表單。
+        ///
+        /// 匯入來源為「班表匯入空白模板」填寫完成的 Excel。
+        /// 本 API 會：
+        /// 1. 驗證 Excel 內容是否合法
+        /// 2. 驗證 form_name 是否重複
+        /// 3. 依 year_month 建立整個月份所有日期的 DayOffScheduleDayClass
+        /// 4. 依 Excel 內容建立 DayOffScheduleItemClass
+        /// 5. 寫入：
+        ///    - dayoff_schedule_form
+        ///    - dayoff_schedule_day
+        ///    - dayoff_schedule_item
+        ///
+        /// 本 API 不會沿用既有表單，
+        /// 而是依 Excel 建立一份全新的排班表單。
+        ///
+        /// ---
+        ///
+        /// ## 🌐 URL
+        /// ```text
+        /// /phar_roster_api/dayOffSchedule/confirm_import_schedule_excel
+        /// ```
+        ///
+        /// ## Method
+        /// ```text
+        /// POST
+        /// ```
+        ///
+        /// ## Content-Type
+        /// ```text
+        /// multipart/form-data
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📥 上傳欄位
+        /// | 欄位名稱 | 型別 | 必填 | 說明 |
+        /// |------|------|------|------|
+        /// | file | IFormFile | ✅ | 要匯入的 Excel 檔案（僅支援 .xlsx） |
+        /// | form_name | string | ✅ | 新建立的排班表單名稱，不可重複 |
+        /// | year_month | string | ✅ | 年月，格式 yyyy-MM，例如 2026-05 |
+        ///
+        /// ---
+        ///
+        /// ## 📑 Excel 模板前提
+        /// 本 API 預設使用者上傳的是由「班表匯入空白模板」填寫完成的 Excel。
+        ///
+        /// 模板規則如下：
+        /// 1. 第 1 列為標題列
+        /// 2. A1 = 班別類型
+        /// 3. B1 = 時段
+        /// 4. C1 ~ AG1 = 日期欄（01 ~ 31）
+        /// 5. 第 2 列開始為固定班別列
+        ///
+        /// 固定班別列定義如下：
+        ///
+        /// | 班別類型 | 時段 |
+        /// |------|------|
+        /// | 國定假日 | 08:00-12:00 |
+        /// | 假日門診 | 07:30-16:00 |
+        /// | 假日門診 | 08:00-16:00 |
+        /// | 假日急診 | 08:00-16:00 |
+        /// | 化療 | 08:00-12:00 |
+        /// | TPN | 08:00-16:00 |
+        /// | 中藥局 | 12:30-21:00 |
+        /// | 小夜門診 | 12:30-21:00 |
+        /// | 小夜門診 | 13:30-22:00 |
+        /// | 小夜門診 | 14:30-23:00 |
+        /// | 小夜門診 | 15:30-23:59 |
+        /// | 小夜急診 | 16:00-23:59 |
+        /// | 小夜其他 | 12:30-21:00 |
+        /// | 大夜門診 | 00:00-08:00 |
+        /// | 大夜急診 | 00:00-08:00 |
+        ///
+        /// ---
+        ///
+        /// ## 📝 儲存格填寫規則
+        /// 日期欄中的每個儲存格，代表：
+        /// 「該日期、該班別、該時段」的人員簡名內容。
+        ///
+        /// ### 規則
+        /// 1. 一個字代表一位人員簡名
+        /// 2. 不使用任何分隔符號
+        /// 3. 不加空白
+        /// 4. 不加中括號
+        /// 5. 沒有人就留空
+        ///
+        /// ### 合法範例
+        /// ```text
+        /// 亭庭璇詩
+        /// 均甄
+        /// 品
+        /// 曼能
+        /// ```
+        ///
+        /// ### 不合法範例
+        /// ```text
+        /// 亭、庭、璇、詩
+        /// [品]陳媚松顏靖
+        /// 亭 庭 璇 詩
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## ✅ 驗證規則
+        /// 本 API 匯入前會重新做完整驗證：
+        ///
+        /// ### 1. 檔案檢查
+        /// - 必須有上傳檔案
+        /// - 副檔名必須為 `.xlsx`
+        ///
+        /// ### 2. 參數檢查
+        /// - form_name 必填
+        /// - year_month 必填
+        /// - year_month 格式必須為 yyyy-MM
+        /// - form_name 不可與既有表單重複
+        ///
+        /// ### 3. Excel 基本結構檢查
+        /// - 必須至少有一張 Sheet
+        /// - 第一張 Sheet 必須可讀取
+        /// - 第 1 列必須存在
+        /// - A1 必須為 `班別類型`
+        /// - B1 必須為 `時段`
+        ///
+        /// ### 4. 固定班別列檢查
+        /// - 第 2 列到第 16 列必須符合固定班別定義
+        ///
+        /// ### 5. 日期欄檢查
+        /// - 日期欄必須為 01 ~ 31
+        ///
+        /// ### 6. 儲存格內容格式檢查
+        /// - 不可包含空白
+        /// - 不可包含全形空白
+        /// - 不可包含逗號
+        /// - 不可包含頓號
+        /// - 不可包含中括號
+        /// - 不可包含換行
+        /// - 不可包含 Tab
+        ///
+        /// ### 7. 簡名解析檢查
+        /// - 一個字代表一位人
+        /// - 同一格不可有重複簡名
+        /// - 每個簡名都必須能找到 staff
+        /// - 每個簡名必須唯一對應到一位 staff
+        ///
+        /// ### 8. 同日跨班別重複檢查
+        /// - 同一天同一人不可出現在多個班別
+        /// - 若重複，整份不匯入
+        ///
+        /// ---
+        ///
+        /// ## 🏗️ 建立規則
+        ///
+        /// ### 1. 建立表單
+        /// 建立新的 DayOffScheduleFormClass，欄位初始值：
+        /// - enable_weekoff_selection = false
+        /// - enable_annualleave_selection = false
+        /// - is_completed_locked = false
+        ///
+        /// ### 2. 建立日期
+        /// 依 year_month 建立整個月份所有日期的 DayOffScheduleDayClass。
+        /// 即使某天沒有排班，也會建立 day。
+        ///
+        /// ### 3. 建立 item
+        /// 依 Excel 有填值的儲存格建立 DayOffScheduleItemClass。
+        ///
+        /// ### 4. is_special_day 規則
+        /// 只要當天「國定假日 08:00-12:00」那格有人，
+        /// 該日期所有 item 的 is_special_day = true。
+        ///
+        /// ### 5. position 規則
+        /// 完全沿用既有 creat_form 邏輯：
+        /// - 星期日
+        /// - department = 門診 且 time 結束為 16:00 → position 依 index_opd 累加
+        /// - department = 急診 且 time 結束為 16:00 → position 依 index_pher 累加
+        ///
+        /// ### 6. WorkShiftRequirementClass 建立規則
+        /// day = 星期幾英文，例如 Monday / Sunday
+        /// required_count = 1
+        /// assigned_count = 1
+        /// hdr = ""
+        /// disabled = false
+        ///
+        /// shift_type / department mapping：
+        ///
+        /// | Excel 班別 | department | shift_type |
+        /// |------|------|------|
+        /// | 國定假日 | 國定假日 | holiday |
+        /// | 假日門診 | 門診 | holiday |
+        /// | 假日急診 | 急診 | holiday |
+        /// | 化療 | 化療 | holiday |
+        /// | TPN | TPN | holiday |
+        /// | 中藥局 | 中藥局 | swing |
+        /// | 小夜門診 | 門診 | swing |
+        /// | 小夜急診 | 急診 | swing |
+        /// | 小夜其他 | 其他 | swing |
+        /// | 大夜門診 | 門診 | midnight |
+        /// | 大夜急診 | 急診 | midnight |
+        ///
+        /// ---
+        ///
+        /// ## 📤 成功回傳 JSON 範例
+        /// ```json
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "confirm_import_schedule_excel",
+        ///   "Result": "匯入成功，建立表單(五月排班表)，建立日期(31)筆，建立排班項目(128)筆",
+        ///   "Data": {
+        ///     "GUID": "FORM_GUID",
+        ///     "form_name": "五月排班表",
+        ///     "days": [
+        ///       {
+        ///         "GUID": "DAY_GUID",
+        ///         "date": "2026-05-01",
+        ///         "items": [
+        ///           {
+        ///             "staff_id": "A001",
+        ///             "staff_name": "王小明",
+        ///             "staff_simple_name": "亭"
+        ///           }
+        ///         ]
+        ///       }
+        ///     ]
+        ///   }
+        /// }
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## ❌ 錯誤回傳 JSON 範例
+        ///
+        /// ### 表單名稱重複
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "confirm_import_schedule_excel",
+        ///   "Result": "表單名稱(五月排班表)已建立過"
+        /// }
+        /// ```
+        ///
+        /// ### year_month 格式錯誤
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "confirm_import_schedule_excel",
+        ///   "Result": "year_month 格式錯誤，需為 yyyy-MM"
+        /// }
+        /// ```
+        ///
+        /// ### 匯入驗證失敗
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "confirm_import_schedule_excel",
+        ///   "Result": "匯入驗證失敗：同一天同一人不可出現在多個班別：亭，已出現在 假日門診 07:30-16:00"
+        /// }
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📌 注意事項
+        /// - 本 API 會寫入資料庫。
+        /// - 若任一格驗證失敗，整份不匯入。
+        /// - 本 API 不會覆蓋既有表單，而是建立新表單。
+        /// - form_name 不可重複。
+        /// </remarks>
+        /// <param name="file">上傳的 Excel 檔案（.xlsx）</param>
+        /// <param name="form_name">新建立的表單名稱</param>
+        /// <param name="year_month">年月，格式 yyyy-MM，例如 2026-05</param>
+        /// <returns>成功時回傳建立完成的表單資料，失敗時回傳 JSON 錯誤訊息。</returns>
+        [HttpPost("confirm_import_schedule_excel")]
+        public string confirm_import_schedule_excel(IFormFile file, string form_name, string year_month)
+        {
+            var timer = new MyTimerBasic();
+            returnData returnData = new returnData();
+            returnData.Method = "confirm_import_schedule_excel";
+
+            try
+            {
+                init(returnData);
+
+                if (file == null || file.Length == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未收到上傳檔案";
+                    return returnData.JsonSerializationt();
+                }
+
+                string ext = Path.GetExtension(file.FileName)?.ToLower();
+                if (ext != ".xlsx")
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "僅支援 .xlsx Excel 檔案";
+                    return returnData.JsonSerializationt();
+                }
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return returnData.JsonSerializationt();
+                }
+
+                DateTime ym;
+                if (!DateTime.TryParse($"{year_month}-01", out ym))
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "year_month 格式錯誤，需為 yyyy-MM";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+
+                if (sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).Count > 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"表單名稱({form_name})已建立過";
+                    return returnData.JsonSerializationt();
+                }
+
+                List<ImportScheduleTemplateRow> templateRows = ImportScheduleTemplateDefinition.GetRows();
+
+                List<StaffClass> staffClasses = staff.GetStaffs(new List<string>() { "pageSize=10000" }).staffClasses;
+                if (staffClasses == null) staffClasses = new List<StaffClass>();
+
+                Dictionary<string, List<StaffClass>> simpleNameMap =
+                    ImportScheduleStaffHelper.BuildSimpleNameMap(staffClasses);
+
+                Dictionary<string, string> dayStaffUsedMap = new Dictionary<string, string>();
+
+                // key = yyyy-MM-dd，value = true/false 是否國定假日
+                HashSet<string> specialDateSet = new HashSet<string>();
+
+                // 暫存匯入解析結果
+                Dictionary<string, List<ImportScheduleResolvedStaff>> importedData =
+                    new Dictionary<string, List<ImportScheduleResolvedStaff>>();
+                // key = yyyy-MM-dd|ShiftType|ShiftTime
+
+                using (var stream = file.OpenReadStream())
+                {
+                    IWorkbook workbook = new XSSFWorkbook(stream);
+                    ISheet sheet = workbook.GetSheetAt(0);
+
+                    if (sheet == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "Excel 沒有可讀取的 Sheet";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    IRow headerRow = sheet.GetRow(0);
+                    if (headerRow == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "Excel 標題列不存在";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    string headerA = ImportScheduleExcelHelper.GetCellString(headerRow.GetCell(0));
+                    string headerB = ImportScheduleExcelHelper.GetCellString(headerRow.GetCell(1));
+
+                    if (headerA != "班別類型" || headerB != "時段")
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "Excel 標題格式錯誤，前兩欄必須為「班別類型 / 時段」";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    Dictionary<int, string> dateColumnMap =
+                        ImportScheduleExcelHelper.BuildDateColumnMap(headerRow, 2, 32);
+
+                    for (int rowIndex = 1; rowIndex <= templateRows.Count; rowIndex++)
+                    {
+                        IRow row = sheet.GetRow(rowIndex);
+                        ImportScheduleTemplateRow expected = templateRows[rowIndex - 1];
+
+                        if (row == null)
+                        {
+                            returnData.Code = -200;
+                            returnData.Result = $"匯入驗證失敗：第 {rowIndex + 1} 列不存在，應為固定班別列：{expected.ShiftType} / {expected.ShiftTime}";
+                            return returnData.JsonSerializationt();
+                        }
+
+                        string shiftType = ImportScheduleExcelHelper.GetCellString(row.GetCell(0));
+                        string shiftTime = ImportScheduleExcelHelper.GetCellString(row.GetCell(1));
+
+                        if (!ImportScheduleExcelHelper.IsTemplateRowMatched(shiftType, shiftTime, expected))
+                        {
+                            returnData.Code = -200;
+                            returnData.Result = $"匯入驗證失敗：第 {rowIndex + 1} 列班別定義錯誤，應為「{expected.ShiftType} / {expected.ShiftTime}」";
+                            return returnData.JsonSerializationt();
+                        }
+
+                        for (int col = 2; col <= 32; col++)
+                        {
+                            string rawText = ImportScheduleExcelHelper.GetCellString(row.GetCell(col));
+                            if (rawText.StringIsEmpty()) continue;
+
+                            string dayText = dateColumnMap.ContainsKey(col) ? dateColumnMap[col] : "";
+                            if (dayText.StringIsEmpty() || !ImportScheduleExcelHelper.IsValidDayHeader(dayText))
+                            {
+                                returnData.Code = -200;
+                                returnData.Result = $"匯入驗證失敗：第 1 列第 {col + 1} 欄日期標題錯誤，應為 01~31";
+                                return returnData.JsonSerializationt();
+                            }
+
+                            DateTime targetDate = new DateTime(ym.Year, ym.Month, int.Parse(dayText));
+                            string dateKey = targetDate.ToString("yyyy-MM-dd");
+
+                            if (ImportScheduleExcelHelper.ContainsInvalidCharacters(rawText))
+                            {
+                                returnData.Code = -200;
+                                returnData.Result = $"匯入驗證失敗：{dateKey} {shiftType} {shiftTime} 內容格式錯誤，不可包含空白、逗號、頓號、中括號或換行";
+                                return returnData.JsonSerializationt();
+                            }
+
+                            List<string> simpleNames = ImportScheduleExcelHelper.ParseSimpleNames(rawText);
+                            List<string> duplicatedSimpleNames = ImportScheduleExcelHelper.GetDuplicatedSimpleNames(simpleNames);
+
+                            if (duplicatedSimpleNames.Count > 0)
+                            {
+                                returnData.Code = -200;
+                                returnData.Result = $"匯入驗證失敗：{dateKey} {shiftType} {shiftTime} 同一格不可有重複簡名：{string.Join(",", duplicatedSimpleNames)}";
+                                return returnData.JsonSerializationt();
+                            }
+
+                            ImportScheduleResolveResult resolveResult =
+                                ImportScheduleStaffHelper.ResolveSimpleNames(simpleNameMap, simpleNames);
+
+                            if (!resolveResult.IsSuccess)
+                            {
+                                returnData.Code = -200;
+                                returnData.Result = $"匯入驗證失敗：{dateKey} {shiftType} {shiftTime} {resolveResult.ErrorMessage}";
+                                return returnData.JsonSerializationt();
+                            }
+
+                            foreach (ImportScheduleResolvedStaff resolvedStaff in resolveResult.Staffs)
+                            {
+                                string currentShiftInfo = $"{shiftType} {shiftTime}";
+                                bool ok = ImportScheduleStaffHelper.TryCheckAndRegisterDailyDuplicate(
+                                    dayStaffUsedMap,
+                                    dateKey,
+                                    resolvedStaff,
+                                    currentShiftInfo,
+                                    out string duplicateError);
+
+                                if (!ok)
+                                {
+                                    returnData.Code = -200;
+                                    returnData.Result = $"匯入驗證失敗：{duplicateError}";
+                                    return returnData.JsonSerializationt();
+                                }
+                            }
+
+                            string importKey = $"{dateKey}|{shiftType}|{shiftTime}";
+                            importedData[importKey] = resolveResult.Staffs;
+
+                            // 國定假日該格有人 => 當天所有 item is_special_day=true
+                            if (shiftType == "國定假日" && shiftTime == "08:00-12:00" && resolveResult.Staffs.Count > 0)
+                            {
+                                specialDateSet.Add(dateKey);
+                            }
+                        }
+                    }
+                }
+
+                // ===== 建立 form =====
+                DayOffScheduleFormClass dayOffScheduleForm = new DayOffScheduleFormClass()
+                {
+                    GUID = Guid.NewGuid().ToString(),
+                    form_name = form_name,
+                    enable_weekoff_selection = "false",
+                    enable_annualleave_selection = "false",
+                    is_completed_locked = "false",
+                    created_at = DateTime.Now.ToDateTimeString(),
+                    updated_at = DateTime.Now.ToDateTimeString()
+                };
+
+                List<DayOffScheduleDayClass> daysToAdd = new List<DayOffScheduleDayClass>();
+                List<DayOffScheduleItemClass> itemsToAdd = new List<DayOffScheduleItemClass>();
+
+                int daysInMonth = DateTime.DaysInMonth(ym.Year, ym.Month);
+
+                for (int day = 1; day <= daysInMonth; day++)
+                {
+                    DateTime currentDate = new DateTime(ym.Year, ym.Month, day);
+                    string dateKey = currentDate.ToString("yyyy-MM-dd");
+
+                    DayOffScheduleDayClass dayOffScheduleDay = new DayOffScheduleDayClass()
+                    {
+                        GUID = Guid.NewGuid().ToString(),
+                        form_guid = dayOffScheduleForm.GUID,
+                        date = dateKey,
+                        am_max_dayoff_count = "0",
+                        pm_max_dayoff_count = "0",
+                        created_at = DateTime.Now.ToDateTimeString(),
+                        updated_at = DateTime.Now.ToDateTimeString(),
+                        items = new List<DayOffScheduleItemClass>()
+                    };
+
+                    dayOffScheduleForm.days.Add(dayOffScheduleDay);
+                    daysToAdd.Add(dayOffScheduleDay);
+
+                    int index_opd = 0;
+                    int index_pher = 0;
+
+                    foreach (ImportScheduleTemplateRow templateRow in templateRows)
+                    {
+                        string importKey = $"{dateKey}|{templateRow.ShiftType}|{templateRow.ShiftTime}";
+                        if (!importedData.ContainsKey(importKey)) continue;
+
+                        List<ImportScheduleResolvedStaff> resolvedStaffs = importedData[importKey];
+                        if (resolvedStaffs == null || resolvedStaffs.Count == 0) continue;
+
+                        foreach (ImportScheduleResolvedStaff resolvedStaff in resolvedStaffs)
+                        {
+                            DayOffScheduleItemClass dayOffScheduleItem = new DayOffScheduleItemClass()
+                            {
+                                GUID = Guid.NewGuid().ToString(),
+                                form_guid = dayOffScheduleForm.GUID,
+                                day_guid = dayOffScheduleDay.GUID,
+                                option_guid = "",
+                                date = dateKey,
+                                is_special_day = specialDateSet.Contains(dateKey).ToString().ToLower(),
+                                staff_guid = resolvedStaff.GUID,
+                                staff_id = resolvedStaff.staff_id,
+                                staff_name = resolvedStaff.staff_name,
+                                staff_simple_name = resolvedStaff.staff_simple_name,
+                                selected_dayoff_type = "",
+                                position = "",
+                                created_at = DateTime.Now.ToDateTimeString(),
+                                updated_at = DateTime.Now.ToDateTimeString()
+                            };
+
+                            WorkShiftRequirementClass requirement = BuildWorkShiftRequirementForImport(
+                                currentDate,
+                                templateRow.ShiftType,
+                                templateRow.ShiftTime);
+
+                            dayOffScheduleItem.workShiftRequirement = requirement;
+
+                            // 沿用 creat_form 的週日 position 規則
+                            if (currentDate.DayOfWeek == DayOfWeek.Sunday)
+                            {
+                                string endStr = requirement?.TimeRange?.end.ToString() ?? "";
+
+                                if (requirement != null && requirement.department == "門診" && endStr.Contains("16:00"))
+                                {
+                                    dayOffScheduleItem.position = index_opd.ToString();
+                                    index_opd++;
+                                }
+                                else if (requirement != null && requirement.department == "急診" && endStr.Contains("16:00"))
+                                {
+                                    dayOffScheduleItem.position = index_pher.ToString();
+                                    index_pher++;
+                                }
+                            }
+
+                            dayOffScheduleDay.items.Add(dayOffScheduleItem);
+                            itemsToAdd.Add(dayOffScheduleItem);
+                        }
+                    }
+                }
+
+                // ===== 寫入資料庫 =====
+                sql_dayOffScheduleFormClass.AddRow(null, dayOffScheduleForm.ClassToSQL<DayOffScheduleFormClass>());
+                sql_dayOffScheduleDayClass.AddRows(null, daysToAdd.ClassToSQL<DayOffScheduleDayClass>());
+                sql_dayOffScheduleItemClass.AddRows(null, itemsToAdd.ClassToSQL<DayOffScheduleItemClass>());
+
+                returnData.Code = 200;
+                returnData.Result = $"匯入成功，建立表單({dayOffScheduleForm.form_name})，建立日期({daysToAdd.Count})筆，建立排班項目({itemsToAdd.Count})筆";
+                returnData.TimeTaken = $"{timer}";
+                returnData.Data = dayOffScheduleForm;
+                return returnData.JsonSerializationt();
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+        /// <summary>
+        /// 建立匯入用 WorkShiftRequirementClass
+        /// </summary>
+        private WorkShiftRequirementClass BuildWorkShiftRequirementForImport(DateTime date, string shiftType, string shiftTime)
+        {
+            string department = "";
+            string shiftTypeValue = "";
+
+            switch (shiftType)
+            {
+                case "國定假日":
+                    department = "國定假日";
+                    shiftTypeValue = "holiday";
+                    break;
+                case "假日門診":
+                    department = "門診";
+                    shiftTypeValue = "holiday";
+                    break;
+                case "假日急診":
+                    department = "急診";
+                    shiftTypeValue = "holiday";
+                    break;
+                case "化療":
+                    department = "化療";
+                    shiftTypeValue = "holiday";
+                    break;
+                case "TPN":
+                    department = "TPN";
+                    shiftTypeValue = "holiday";
+                    break;
+                case "中藥局":
+                    department = "中藥局";
+                    shiftTypeValue = "swing";
+                    break;
+                case "小夜門診":
+                    department = "門診";
+                    shiftTypeValue = "swing";
+                    break;
+                case "小夜急診":
+                    department = "急診";
+                    shiftTypeValue = "swing";
+                    break;
+                case "小夜其他":
+                    department = "其他";
+                    shiftTypeValue = "swing";
+                    break;
+                case "大夜門診":
+                    department = "門診";
+                    shiftTypeValue = "midnight";
+                    break;
+                case "大夜急診":
+                    department = "急診";
+                    shiftTypeValue = "midnight";
+                    break;
+                default:
+                    department = shiftType;
+                    shiftTypeValue = "";
+                    break;
+            }
+
+            return new WorkShiftRequirementClass
+            {
+                day = date.DayOfWeek.ToString(),
+                time = shiftTime,
+                shift_type = shiftTypeValue,
+                required_count = "1",
+                assigned_count = "1",
+                department = department,
+                hdr = "",
+                disabled = false
+            };
+        }
 
         /// <summary>
         /// 查詢排休表單「任選一天放假」總天數統計（get_any_date_quota_summary）
@@ -9343,6 +10006,2807 @@ namespace PharmaRosterAPI
                 sheet.Rows[r].Cell[col].Text = "";
             }
         }
+
+        #region export_dayoff_status_excel
+        /// <summary>
+        /// 匯出整個排休表的排休狀態 Excel
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途
+        /// 本 API 用於匯出指定排休表單的「整體排休狀態總表 Excel」。
+        ///
+        /// 匯出格式為「人員 × 日期」總表：
+        /// - 每列代表一位人員
+        /// - 每欄代表一個日期
+        /// - 日期前會附加摘要欄位
+        ///
+        /// 可用於：
+        /// - 主管檢視整體排休狀態
+        /// - 排休核對
+        /// - 匯出留存
+        ///
+        /// ---
+        ///
+        /// ## 🌐 URL
+        /// ```text
+        /// /phar_roster_api/dayOffSchedule/export_dayoff_status_excel
+        /// ```
+        ///
+        /// ## Method
+        /// ```text
+        /// POST
+        /// ```
+        ///
+        /// ## Content-Type
+        /// ```text
+        /// application/json
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📥 Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "export_dayoff_status_excel",
+        ///   "ValueAry": [
+        ///     "form_name=2026-05 排休表"
+        ///   ],
+        ///   "Data": {}
+        /// }
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 🔍 參數說明
+        /// | 參數名稱 | 類型 | 必填 | 說明 |
+        /// |------|------|------|------|
+        /// | form_name | string | ✅ | 排休表單名稱 |
+        ///
+        /// ---
+        ///
+        /// ## 📑 匯出內容
+        /// 匯出格式為「人員 × 日期」總表，欄位如下：
+        ///
+        /// | 工號 | 姓名 | 簡名 | 應休總額度 | 已用應休額度 | 剩餘應休額度 | 週六已用次數 | 下午已用次數 | 01 | 02 | 03 | ... |
+        /// |------|------|------|------|------|------|------|------|------|------|------|------|
+        ///
+        /// ---
+        ///
+        /// ## 📝 每格顯示規則
+        /// 若同一人同一天有多種狀態，顯示優先順序如下：
+        ///
+        /// 1. 強制休假
+        ///    - FF
+        ///    - NH
+        /// 2. 已釋出
+        ///    - 釋出-整日
+        ///    - 釋出-AM
+        ///    - 釋出-PM
+        /// 3. 應休排休
+        ///    - QUOTA-FULL
+        ///    - QUOTA-AM
+        ///    - QUOTA-PM
+        /// 4. 一般已選休假
+        ///    - 整日
+        ///    - 上午
+        ///    - 下午
+        ///
+        /// 若該日無任何休假狀態，顯示空白。
+        ///
+        /// ---
+        ///
+        /// ## 📌 匯出範圍規則
+        /// 1. 僅匯出該表單內 `dayoff_schedule_item` 出現過的人員。
+        /// 2. 狀態計算同時納入：
+        ///    - item 對應 option
+        ///    - 額外 quota option（即使沒有 item）
+        /// 3. 已釋出狀態顯示在原持有人當天格子。
+        /// 4. 週六已用次數、下午已用次數僅統計 QUOTA 類型。
+        /// 5. 日期表頭會標示：
+        ///    - 星期六：`dd(六)`
+        ///    - 星期日：`dd(日)`
+        ///    - 國定假日：`dd(國)`
+        ///    - 若同時為週末與國定假日，以國定假日優先顯示。
+        ///
+        /// ---
+        ///
+        /// ## 📤 Response 說明（成功）
+        /// 成功時回傳 Excel 檔案串流。
+        ///
+        /// ### 檔名格式
+        /// ```text
+        /// 排休狀態總表_{form_name}.xlsx
+        /// ```
+        ///
+        /// ### Header 範例
+        /// ```text
+        /// Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+        /// Content-Disposition: attachment; filename="dayoff_status.xlsx"; filename*=UTF-8''%E6%8E%92%E4%BC%91%E7%8B%80%E6%85%8B%E7%B8%BD%E8%A1%A8_2026-05%20%E6%8E%92%E4%BC%91%E8%A1%A8.xlsx
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## ❌ Response JSON 範例（錯誤）
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "export_dayoff_status_excel",
+        ///   "Result": "找不到表單名稱(2026-05 排休表)"
+        /// }
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📌 注意事項
+        /// - 本 API 只做匯出，不修改資料。
+        /// - 若 form_name 不存在，直接回傳錯誤。
+        /// - 匯出資料以表單內資料為準。
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容，需於 ValueAry 傳入 form_name。</param>
+        /// <returns>成功時回傳 Excel 檔案串流，失敗時回傳 JSON 錯誤訊息。</returns>
+        [HttpPost("export_dayoff_status_excel")]
+        public IActionResult export_dayoff_status_excel([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "export_dayoff_status_excel";
+
+            try
+            {
+                init(returnData);
+
+                string GetVal(string key) =>
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return new JsonResult(returnData);
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return new JsonResult(returnData);
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                List<DayOffScheduleDayClass> days = sql_dayOffScheduleDayClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .Where(x => x != null)
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                List<DayOffScheduleItemClass> items = sql_dayOffScheduleItemClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                // 只列出這張表 item 內出現過的人
+                var staffRows = items
+                    .Where(x => !x.staff_guid.StringIsEmpty())
+                    .GroupBy(x => x.staff_guid)
+                    .Select(g =>
+                    {
+                        DayOffScheduleItemClass first = g.First();
+                        return new
+                        {
+                            staff_guid = g.Key,
+                            staff_id = first.staff_id ?? "",
+                            staff_name = first.staff_name ?? "",
+                            staff_simple_name = first.staff_simple_name ?? ""
+                        };
+                    })
+                    .OrderBy(x => x.staff_id)
+                    .ThenBy(x => x.staff_name)
+                    .ToList();
+
+                Dictionary<string, List<DayOffScheduleItemClass>> itemsByStaffDate = items
+                    .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime().ToString("yyyy-MM-dd")}")
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                Dictionary<string, List<StaffDayOffOptionClass>> optionsByStaffDate = options
+                    .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime().ToString("yyyy-MM-dd")}")
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                XSSFWorkbook workbook = new XSSFWorkbook();
+                ISheet sheet = workbook.CreateSheet("排休狀態總表");
+
+                ICellStyle titleStyle = CreateExportTitleStyle(workbook);
+                ICellStyle headerStyle = CreateExportHeaderStyle(workbook);
+                ICellStyle saturdayHeaderStyle = CreateExportColoredHeaderStyle(workbook, HSSFColor.LightCornflowerBlue.Index);
+                ICellStyle sundayHeaderStyle = CreateExportColoredHeaderStyle(workbook, HSSFColor.Rose.Index);
+                ICellStyle holidayHeaderStyle = CreateExportColoredHeaderStyle(workbook, HSSFColor.LightYellow.Index);
+                ICellStyle normalStyle = CreateExportNormalStyle(workbook);
+                ICellStyle centerStyle = CreateExportCenterStyle(workbook);
+
+                int rowIndex = 0;
+
+                // 標題列
+                IRow titleRow = sheet.CreateRow(rowIndex++);
+                titleRow.HeightInPoints = 24;
+                ICell titleCell = titleRow.CreateCell(0);
+                titleCell.SetCellValue($"排休狀態總表 - {form.form_name}");
+                titleCell.CellStyle = titleStyle;
+
+                int totalColumns = 8 + days.Count;
+                sheet.AddMergedRegion(new CellRangeAddress(0, 0, 0, totalColumns - 1));
+
+                // 表頭列
+                IRow headerRow = sheet.CreateRow(rowIndex++);
+                string[] fixedHeaders = new string[]
+                {
+            "工號",
+            "姓名",
+            "簡名",
+            "應休總額度",
+            "已用應休額度",
+            "剩餘應休額度",
+            "週六已用次數",
+            "下午已用次數"
+                };
+
+                for (int i = 0; i < fixedHeaders.Length; i++)
+                {
+                    ICell cell = headerRow.CreateCell(i);
+                    cell.SetCellValue(fixedHeaders[i]);
+                    cell.CellStyle = headerStyle;
+                }
+
+                for (int i = 0; i < days.Count; i++)
+                {
+                    DateTime dt = days[i].date.StringToDateTime();
+                    ICell cell = headerRow.CreateCell(i + fixedHeaders.Length);
+
+                    bool isHoliday = IsNationalHolidayColumn(days[i], items, options);
+                    bool isSaturday = dt.DayOfWeek == DayOfWeek.Saturday;
+                    bool isSunday = dt.DayOfWeek == DayOfWeek.Sunday;
+
+                    string headerText = dt.ToString("dd");
+
+                    if (isHoliday)
+                    {
+                        headerText += "(國)";
+                        cell.CellStyle = holidayHeaderStyle;
+                    }
+                    else if (isSunday)
+                    {
+                        headerText += "(日)";
+                        cell.CellStyle = sundayHeaderStyle;
+                    }
+                    else if (isSaturday)
+                    {
+                        headerText += "(六)";
+                        cell.CellStyle = saturdayHeaderStyle;
+                    }
+                    else
+                    {
+                        cell.CellStyle = headerStyle;
+                    }
+
+                    cell.SetCellValue(headerText);
+                }
+
+                // 資料列
+                foreach (var staffRow in staffRows)
+                {
+                    IRow row = sheet.CreateRow(rowIndex++);
+
+                    StaffQuotaExportSummary summary = BuildStaffQuotaExportSummary(staffRow.staff_guid, options);
+
+                    SetCell(row, 0, staffRow.staff_id, centerStyle);
+                    SetCell(row, 1, staffRow.staff_name, normalStyle);
+                    SetCell(row, 2, staffRow.staff_simple_name, centerStyle);
+                    SetCell(row, 3, summary.quota_total, centerStyle);
+                    SetCell(row, 4, summary.quota_used_total, centerStyle);
+                    SetCell(row, 5, summary.quota_remaining, centerStyle);
+                    SetCell(row, 6, summary.saturday_used_count, centerStyle);
+                    SetCell(row, 7, summary.pm_used_count, centerStyle);
+
+                    for (int i = 0; i < days.Count; i++)
+                    {
+                        string dateKey = days[i].date.StringToDateTime().ToString("yyyy-MM-dd");
+                        string key = $"{staffRow.staff_guid}|{dateKey}";
+
+                        List<DayOffScheduleItemClass> dayItems =
+                            itemsByStaffDate.ContainsKey(key) ? itemsByStaffDate[key] : new List<DayOffScheduleItemClass>();
+
+                        List<StaffDayOffOptionClass> dayOptions =
+                            optionsByStaffDate.ContainsKey(key) ? optionsByStaffDate[key] : new List<StaffDayOffOptionClass>();
+
+                        string displayText = ResolveDayoffExportDisplayText(dayItems, dayOptions);
+                        SetCell(row, i + fixedHeaders.Length, displayText, centerStyle);
+                    }
+                }
+
+                // 欄寬
+                sheet.SetColumnWidth(0, 12 * 256); // 工號
+                sheet.SetColumnWidth(1, 16 * 256); // 姓名
+                sheet.SetColumnWidth(2, 10 * 256); // 簡名
+                sheet.SetColumnWidth(3, 12 * 256); // 應休總額度
+                sheet.SetColumnWidth(4, 12 * 256); // 已用應休額度
+                sheet.SetColumnWidth(5, 12 * 256); // 剩餘應休額度
+                sheet.SetColumnWidth(6, 12 * 256); // 週六已用次數
+                sheet.SetColumnWidth(7, 12 * 256); // 下午已用次數
+
+                for (int i = 0; i < days.Count; i++)
+                {
+                    sheet.SetColumnWidth(i + 8, 12 * 256);
+                }
+
+                sheet.CreateFreezePane(8, 2);
+
+                byte[] bytes;
+                using (var ms = new MemoryStream())
+                {
+                    workbook.Write(ms);
+                    bytes = ms.ToArray();
+                }
+
+                var stream = new MemoryStream(bytes);
+                string contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+                string downloadFileName = "dayoff_status.xlsx";
+                string displayFileName = $"排休狀態總表_{form.form_name}.xlsx";
+                string utf8FileName = Uri.EscapeDataString(displayFileName);
+
+                Response.Headers["Content-Disposition"] =
+                    $"attachment; filename=\"{downloadFileName}\"; filename*=UTF-8''{utf8FileName}";
+                Response.Headers["Access-Control-Expose-Headers"] =
+                    "Content-Disposition, Content-Length, Content-Type";
+
+                return File(stream, contentType);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return new JsonResult(returnData);
+            }
+        }
+        /// <summary>
+        /// 匯出用：單一人員摘要
+        /// </summary>
+        private class StaffQuotaExportSummary
+        {
+            public string quota_total { get; set; } = "0";
+            public string quota_used_total { get; set; } = "0";
+            public string quota_remaining { get; set; } = "0";
+            public string saturday_used_count { get; set; } = "0";
+            public string pm_used_count { get; set; } = "0";
+        }
+        /// <summary>
+        /// 建立單一人員的 quota 摘要
+        /// </summary>
+        private StaffQuotaExportSummary BuildStaffQuotaExportSummary(string staff_guid, List<StaffDayOffOptionClass> options)
+        {
+            StaffQuotaExportSummary result = new StaffQuotaExportSummary();
+
+            if (staff_guid.StringIsEmpty()) return result;
+            if (options == null) return result;
+
+            double quotaTotal = 0;
+            double quotaUsedTotal = 0;
+            int saturdayUsedCount = 0;
+            int pmUsedCount = 0;
+
+            List<StaffDayOffOptionClass> staffOptions = options
+                .Where(x => x != null && x.staff_guid == staff_guid)
+                .ToList();
+
+            foreach (StaffDayOffOptionClass option in staffOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_released == "true")
+                {
+                    string releasedType = (option.released_dayoff_type ?? "").Trim().ToUpper();
+                    if (releasedType == "FULL") quotaTotal += 1;
+                    else if (releasedType == "HALF_AM" || releasedType == "HALF_PM") quotaTotal += 0.5;
+                }
+
+                if (option.is_any_date == "true")
+                {
+                    quotaTotal += 1;
+                }
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    double used = 0;
+                    double.TryParse(option.quota_used, out used);
+                    quotaUsedTotal += used;
+
+                    string quotaType = (option.quota_dayoff_type ?? "").Trim().ToUpper();
+                    if (quotaType == "SATURDAY_HALF_AM")
+                    {
+                        saturdayUsedCount++;
+                    }
+                    if (quotaType == "WEEKDAY_HALF_PM")
+                    {
+                        pmUsedCount++;
+                    }
+                }
+            }
+
+            double remaining = quotaTotal - quotaUsedTotal;
+            if (remaining < 0) remaining = 0;
+
+            result.quota_total = quotaTotal.ToString("0.##");
+            result.quota_used_total = quotaUsedTotal.ToString("0.##");
+            result.quota_remaining = remaining.ToString("0.##");
+            result.saturday_used_count = saturdayUsedCount.ToString();
+            result.pm_used_count = pmUsedCount.ToString();
+
+            return result;
+        }
+        /// <summary>
+        /// 解析單一人員單一天的匯出顯示文字
+        /// 優先順序：強制休假 > 釋出 > QUOTA > 一般已選
+        /// </summary>
+        private string ResolveDayoffExportDisplayText(
+            List<DayOffScheduleItemClass> dayItems,
+            List<StaffDayOffOptionClass> dayOptions)
+        {
+            if (dayItems == null) dayItems = new List<DayOffScheduleItemClass>();
+            if (dayOptions == null) dayOptions = new List<StaffDayOffOptionClass>();
+
+            foreach (DayOffScheduleItemClass item in dayItems)
+            {
+                string selectedType = (item.selected_dayoff_type ?? "").Trim().ToUpper();
+                if (selectedType == "FF") return "FF";
+                if (selectedType == "NH") return "NH";
+            }
+
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                string sourceType = (option.dayoff_source_type ?? "").Trim().ToUpper();
+                if (option.is_force_ff == "true")
+                {
+                    if (sourceType == "NATIONAL_HOLIDAY") return "NH";
+                    return "FF";
+                }
+                if (sourceType == "NATIONAL_HOLIDAY") return "NH";
+            }
+
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_released == "true")
+                {
+                    string releasedType = (option.released_dayoff_type ?? "").Trim().ToUpper();
+                    if (releasedType == "FULL") return "釋出-整日";
+                    if (releasedType == "HALF_AM") return "釋出-AM";
+                    if (releasedType == "HALF_PM") return "釋出-PM";
+                    return "釋出";
+                }
+            }
+
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    if (option.selected_full == "true") return "應休-整日";
+                    if (option.selected_half_am == "true") return "應休-AM";
+                    if (option.selected_half_pm == "true") return "應休-PM";
+                }
+            }
+
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.selected_full == "true") return "整日";
+                if (option.selected_half_am == "true") return "上午";
+                if (option.selected_half_pm == "true") return "下午";
+            }
+
+            return "";
+        }
+        /// <summary>
+        /// 判斷該日期欄是否為國定假日
+        /// 規則：只要當天任一人有 NH，或 option 的 dayoff_source_type = NATIONAL_HOLIDAY，即視為國定假日
+        /// </summary>
+        private bool IsNationalHolidayColumn(
+            DayOffScheduleDayClass day,
+            List<DayOffScheduleItemClass> items,
+            List<StaffDayOffOptionClass> options)
+        {
+            if (day == null) return false;
+
+            string dateKey = day.date.StringToDateTime().ToString("yyyy-MM-dd");
+
+            bool hasNHItem = items.Any(x =>
+                x != null &&
+                x.date.StringToDateTime().ToString("yyyy-MM-dd") == dateKey &&
+                (x.selected_dayoff_type ?? "").Trim().ToUpper() == "NH");
+
+            if (hasNHItem) return true;
+
+            bool hasNHOption = options.Any(x =>
+                x != null &&
+                x.date.StringToDateTime().ToString("yyyy-MM-dd") == dateKey &&
+                ((x.dayoff_source_type ?? "").Trim().ToUpper() == "NATIONAL_HOLIDAY"));
+
+            return hasNHOption;
+        }
+        /// <summary>
+        /// 設定儲存格內容
+        /// </summary>
+        private void SetCell(IRow row, int colIndex, string text, ICellStyle style)
+        {
+            ICell cell = row.GetCell(colIndex) ?? row.CreateCell(colIndex);
+            cell.SetCellValue(text ?? "");
+            if (style != null) cell.CellStyle = style;
+        }
+        /// <summary>
+        /// 建立標題樣式
+        /// </summary>
+        private ICellStyle CreateExportTitleStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 12;
+            font.IsBold = true;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Center;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.SetFont(font);
+
+            return style;
+        }
+        /// <summary>
+        /// 建立表頭樣式
+        /// </summary>
+        private ICellStyle CreateExportHeaderStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+            font.IsBold = true;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Center;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.WrapText = true;
+            style.FillForegroundColor = HSSFColor.Grey25Percent.Index;
+            style.FillPattern = FillPattern.SolidForeground;
+            style.SetFont(font);
+
+            return style;
+        }
+        /// <summary>
+        /// 建立有底色的表頭樣式
+        /// </summary>
+        private ICellStyle CreateExportColoredHeaderStyle(IWorkbook workbook, short fillColor)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+            font.IsBold = true;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Center;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.WrapText = true;
+            style.FillForegroundColor = fillColor;
+            style.FillPattern = FillPattern.SolidForeground;
+            style.SetFont(font);
+
+            return style;
+        }
+        /// <summary>
+        /// 建立一般文字樣式
+        /// </summary>
+        private ICellStyle CreateExportNormalStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Left;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.WrapText = true;
+            style.SetFont(font);
+
+            return style;
+        }
+        /// <summary>
+        /// 建立置中樣式
+        /// </summary>
+        private ICellStyle CreateExportCenterStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Center;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.WrapText = true;
+            style.SetFont(font);
+
+            return style;
+        }
+        #endregion
+
+        #region export_dayoff_status_pdf
+
+        /// <summary>
+        /// 匯出整個排休表的排休狀態 PDF
+        /// </summary>
+        /// <remarks>
+        /// 本 API 用於匯出指定排休表單的排休狀態總表 PDF。
+        /// 採 A4 橫式,日期整月同頁優先顯示;若人員過多則僅做人員垂直分頁。
+        /// </remarks>
+        /// <param name="returnData">需於 ValueAry 傳入 form_name。</param>
+        /// <returns>成功時回傳 PDF 檔案串流,失敗時回傳 JSON 錯誤訊息。</returns>
+        [HttpPost("export_dayoff_status_pdf")]
+        public IActionResult export_dayoff_status_pdf([FromBody] returnData returnData)
+        {
+            returnData.Method = "export_dayoff_status_pdf";
+
+            try
+            {
+                //CustomPdfSharpFontResolver.EnsurePdfSharpFontResolver();
+                GlobalFontSettings.FontResolver = new CustomFontResolver();
+                init(returnData);
+                string GetVal(string key) =>
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return new JsonResult(returnData);
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return new JsonResult(returnData);
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                List<DayOffScheduleDayClass> days = sql_dayOffScheduleDayClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .Where(x => x != null)
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                List<DayOffScheduleItemClass> items = sql_dayOffScheduleItemClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                var staffRows = items
+                    .Where(x => !x.staff_guid.StringIsEmpty())
+                    .GroupBy(x => x.staff_guid)
+                    .Select(g =>
+                    {
+                        DayOffScheduleItemClass first = g.First();
+                        return new ExportDayoffStaffRowPdf
+                        {
+                            staff_guid = g.Key,
+                            staff_id = first.staff_id ?? "",
+                            staff_name = first.staff_name ?? ""
+                        };
+                    })
+                    .OrderBy(x => x.staff_id)
+                    .ThenBy(x => x.staff_name)
+                    .ToList();
+
+                Dictionary<string, List<DayOffScheduleItemClass>> itemsByStaffDate = items
+                    .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime():yyyy-MM-dd}")
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                Dictionary<string, List<StaffDayOffOptionClass>> optionsByStaffDate = options
+                    .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime():yyyy-MM-dd}")
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                foreach (ExportDayoffStaffRowPdf staffRow in staffRows)
+                {
+                    foreach (DayOffScheduleDayClass day in days)
+                    {
+                        string dateKey = day.date.StringToDateTime().ToString("yyyy-MM-dd");
+                        string key = $"{staffRow.staff_guid}|{dateKey}";
+
+                        List<DayOffScheduleItemClass> dayItems =
+                            itemsByStaffDate.ContainsKey(key) ? itemsByStaffDate[key] : new List<DayOffScheduleItemClass>();
+
+                        List<StaffDayOffOptionClass> dayOptions =
+                            optionsByStaffDate.ContainsKey(key) ? optionsByStaffDate[key] : new List<StaffDayOffOptionClass>();
+
+                        staffRow.dayoffTextByDate[dateKey] = ResolveDayoffExportDisplayTextPdf(dayItems, dayOptions);
+                    }
+                }
+
+                PdfDocument document = new PdfDocument();
+                document.Info.Title = $"排休狀態總表_{form.form_name}";
+
+                XFont titleFont = new XFont("Noto Sans TC", 11, XFontStyleEx.Bold);
+                XFont infoFont = new XFont("Noto Sans TC", 7, XFontStyleEx.Regular);
+                XFont legendFont = new XFont("Noto Sans TC", 7, XFontStyleEx.Regular);
+
+                XFont headerTopFont = new XFont("Noto Sans TC", 7, XFontStyleEx.Bold);
+                XFont headerBottomFont = new XFont("Noto Sans TC", 7, XFontStyleEx.Bold);
+
+                XFont nameFont = new XFont("Noto Sans TC", 7, XFontStyleEx.Regular);
+                XFont idFont = new XFont("Noto Sans TC", 6.5, XFontStyleEx.Regular);
+                XFont statusFont = new XFont("Noto Sans TC", 7, XFontStyleEx.Bold);
+
+                double marginLeft = 10;
+                double marginRight = 8;
+                double marginTop = 10;
+                double marginBottom = 10;
+
+                double titleHeight = 16;
+                double infoHeight = 11;
+                double legendHeight = 11;
+                double headerHeight = 22;
+                double rowHeight = 16;
+
+                double staffColWidth = 75;
+
+                PdfPage measurePage = document.AddPage();
+                measurePage.Size = PdfSharp.PageSize.A4;
+                measurePage.Orientation = PdfSharp.PageOrientation.Landscape;
+
+                double pageWidth = measurePage.Width.Point;
+                double pageHeight = measurePage.Height.Point;
+
+                double availableWidth = pageWidth - marginLeft - marginRight - staffColWidth;
+                double dateColWidth = availableWidth / Math.Max(1, days.Count);
+
+                if (dateColWidth < 16)
+                    dateColWidth = 16;
+
+                double totalDateWidthMin = 16 * days.Count;
+                if (totalDateWidthMin > availableWidth)
+                {
+                    dateColWidth = availableWidth / Math.Max(1, days.Count);
+                }
+
+                int datesPerPage = days.Count;
+
+                double usedTopHeight = titleHeight + infoHeight + legendHeight + headerHeight + 6;
+                int rowsPerPage = Math.Max(1, (int)Math.Floor((pageHeight - marginTop - marginBottom - usedTopHeight) / rowHeight));
+                int rowPages = Math.Max(1, (int)Math.Ceiling(staffRows.Count / (double)rowsPerPage));
+
+                document.Pages.RemoveAt(document.Pages.Count - 1);
+
+                for (int rowPageIndex = 0; rowPageIndex < rowPages; rowPageIndex++)
+                {
+                    PdfPage page = document.AddPage();
+                    page.Size = PdfSharp.PageSize.A4;
+                    page.Orientation = PdfSharp.PageOrientation.Landscape;
+
+                    XGraphics gfx = XGraphics.FromPdfPage(page);
+
+                    double x = marginLeft;
+                    double y = marginTop;
+
+                    // 標題
+                    gfx.DrawString($"排休狀態總表 - {form.form_name}", titleFont, XBrushes.Black,
+                        new XRect(marginLeft, y, page.Width.Point - marginLeft - marginRight, titleHeight),
+                        XStringFormats.CenterLeft);
+                    y += titleHeight;
+
+                    // 資訊列
+                    gfx.DrawString($"匯出時間：{DateTime.Now:yyyy-MM-dd HH:mm:ss}", infoFont, XBrushes.Black,
+                        new XRect(marginLeft, y, 240, infoHeight), XStringFormats.CenterLeft);
+
+                    gfx.DrawString($"頁碼：{rowPageIndex + 1}/{rowPages}", infoFont, XBrushes.Black,
+                        new XRect(page.Width.Point - marginRight - 80, y, 80, infoHeight), XStringFormats.CenterRight);
+                    y += infoHeight;
+
+                    // 圖例
+                    gfx.DrawString("圖例 FF=強制休 NH=國定假 釋整/釋上/釋下=已釋出 應整/應上/應下=應休 整/上/下=一般已選",
+                        legendFont, XBrushes.Black,
+                        new XRect(marginLeft, y, page.Width.Point - marginLeft - marginRight, legendHeight),
+                        XStringFormats.CenterLeft);
+                    y += legendHeight + 3;
+
+                    double tableStartX = marginLeft;
+                    double tableStartY = y;
+
+                    List<ExportDayoffStaffRowPdf> currentStaffRows = staffRows
+                        .Skip(rowPageIndex * rowsPerPage)
+                        .Take(rowsPerPage)
+                        .ToList();
+
+                    // ========= 第一階段:先畫所有格子的背景與框線 =========
+
+                    // 左上表頭
+                    DrawPdfCellBackgroundAndBorder(gfx, tableStartX, tableStartY, staffColWidth, headerHeight, XBrushes.LightGray, true);
+
+                    // 日期表頭背景
+                    x = tableStartX + staffColWidth;
+                    foreach (DayOffScheduleDayClass day in days)
+                    {
+                        DateTime dt = day.date.StringToDateTime();
+                        bool isHoliday = IsNationalHolidayColumnPdf(day, items, options);
+
+                        XBrush bg = XBrushes.LightGray;
+                        if (isHoliday) bg = XBrushes.LightGoldenrodYellow;
+                        else if (dt.DayOfWeek == DayOfWeek.Sunday) bg = XBrushes.MistyRose;
+                        else if (dt.DayOfWeek == DayOfWeek.Saturday) bg = XBrushes.LightBlue;
+
+                        DrawPdfCellBackgroundAndBorder(gfx, x, tableStartY, dateColWidth, headerHeight, bg, true);
+                        x += dateColWidth;
+                    }
+
+                    // 資料列背景與框線
+                    double rowY = tableStartY + headerHeight;
+                    foreach (ExportDayoffStaffRowPdf staffRow in currentStaffRows)
+                    {
+                        DrawPdfCellBackgroundAndBorder(gfx, tableStartX, rowY, staffColWidth, rowHeight, XBrushes.White, true);
+
+                        x = tableStartX + staffColWidth;
+                        foreach (DayOffScheduleDayClass day in days)
+                        {
+                            string dateKey = day.date.StringToDateTime().ToString("yyyy-MM-dd");
+                            string text = staffRow.dayoffTextByDate.ContainsKey(dateKey)
+                                ? staffRow.dayoffTextByDate[dateKey]
+                                : "";
+
+                            XBrush cellBg = XBrushes.White;
+                            if (text == "FF") cellBg = XBrushes.Gainsboro;
+                            else if (text == "NH") cellBg = XBrushes.LightGoldenrodYellow;
+                            else if (text.StartsWith("釋")) cellBg = XBrushes.Moccasin;
+                            else if (text.StartsWith("應")) cellBg = XBrushes.LightCyan;
+
+                            DrawPdfCellBackgroundAndBorder(gfx, x, rowY, dateColWidth, rowHeight, cellBg, true);
+                            x += dateColWidth;
+                        }
+
+                        rowY += rowHeight;
+                    }
+
+                    // ========= 第二階段:再畫文字 =========
+
+                    // 左上表頭文字
+                    DrawPdfCellTwoLineText(
+                        gfx,
+                        tableStartX,
+                        tableStartY,
+                        staffColWidth,
+                        headerHeight,
+                        "姓名",
+                        "工號",
+                        headerTopFont,
+                        headerBottomFont);
+
+                    // 日期表頭文字
+                    x = tableStartX + staffColWidth;
+                    foreach (DayOffScheduleDayClass day in days)
+                    {
+                        DateTime dt = day.date.StringToDateTime();
+                        bool isHoliday = IsNationalHolidayColumnPdf(day, items, options);
+
+                        string topText = dt.ToString("dd");
+                        string bottomText = BuildPdfDayHeaderShortText(dt, isHoliday);
+
+                        DrawPdfCellTwoLineText(
+                            gfx,
+                            x,
+                            tableStartY,
+                            dateColWidth,
+                            headerHeight,
+                            topText,
+                            bottomText,
+                            headerTopFont,
+                            headerBottomFont);
+
+                        x += dateColWidth;
+                    }
+
+                    // 資料文字
+                    rowY = tableStartY + headerHeight;
+                    foreach (ExportDayoffStaffRowPdf staffRow in currentStaffRows)
+                    {
+                        DrawPdfCellTwoLineText(
+                            gfx,
+                            tableStartX,
+                            rowY,
+                            staffColWidth,
+                            rowHeight,
+                            staffRow.staff_name,
+                            staffRow.staff_id,
+                            nameFont,
+                            idFont);
+
+                        x = tableStartX + staffColWidth;
+                        foreach (DayOffScheduleDayClass day in days)
+                        {
+                            string dateKey = day.date.StringToDateTime().ToString("yyyy-MM-dd");
+                            string text = staffRow.dayoffTextByDate.ContainsKey(dateKey)
+                                ? staffRow.dayoffTextByDate[dateKey]
+                                : "";
+
+                            DrawPdfCellSingleLineText(
+                                gfx,
+                                x,
+                                rowY,
+                                dateColWidth,
+                                rowHeight,
+                                text,
+                                statusFont);
+
+                            x += dateColWidth;
+                        }
+
+                        rowY += rowHeight;
+                    }
+                }
+
+                byte[] pdfBytes;
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    document.Save(ms, false);
+                    pdfBytes = ms.ToArray();
+                }
+
+                Stream stream = new MemoryStream(pdfBytes);
+                string contentType = "application/pdf";
+
+                string downloadFileName = "dayoff_status.pdf";
+                string displayFileName = $"排休狀態總表_{form.form_name}.pdf";
+                string utf8FileName = Uri.EscapeDataString(displayFileName);
+
+                Response.Headers["Content-Disposition"] =
+                    $"attachment; filename=\"{downloadFileName}\"; filename*=UTF-8''{utf8FileName}";
+                Response.Headers["Access-Control-Expose-Headers"] =
+                    "Content-Disposition, Content-Length, Content-Type";
+
+                return File(stream, contentType);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return new JsonResult(returnData);
+            }
+        }
+
+        private class ExportDayoffStaffRowPdf
+        {
+            public string staff_guid { get; set; }
+            public string staff_id { get; set; }
+            public string staff_name { get; set; }
+            public Dictionary<string, string> dayoffTextByDate { get; set; } = new Dictionary<string, string>();
+        }
+
+        private string ResolveDayoffExportDisplayTextPdf(
+            List<DayOffScheduleItemClass> dayItems,
+            List<StaffDayOffOptionClass> dayOptions)
+        {
+            if (dayItems == null) dayItems = new List<DayOffScheduleItemClass>();
+            if (dayOptions == null) dayOptions = new List<StaffDayOffOptionClass>();
+
+            foreach (DayOffScheduleItemClass item in dayItems)
+            {
+                string selectedType = (item.selected_dayoff_type ?? "").Trim().ToUpper();
+                if (selectedType == "FF") return "FF";
+                if (selectedType == "NH") return "NH";
+            }
+
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                string sourceType = (option.dayoff_source_type ?? "").Trim().ToUpper();
+
+                if (option.is_force_ff == "true")
+                {
+                    if (sourceType == "NATIONAL_HOLIDAY") return "NH";
+                    return "FF";
+                }
+
+                if (sourceType == "NATIONAL_HOLIDAY") return "NH";
+            }
+
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_released == "true")
+                {
+                    string releasedType = (option.released_dayoff_type ?? "").Trim().ToUpper();
+                    if (releasedType == "FULL") return "釋整";
+                    if (releasedType == "HALF_AM") return "釋上";
+                    if (releasedType == "HALF_PM") return "釋下";
+                    return "釋整";
+                }
+            }
+
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    if (option.selected_full == "true") return "應整";
+                    if (option.selected_half_am == "true") return "應上";
+                    if (option.selected_half_pm == "true") return "應下";
+                    return "應整";
+                }
+            }
+
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.selected_full == "true") return "整";
+                if (option.selected_half_am == "true") return "上";
+                if (option.selected_half_pm == "true") return "下";
+            }
+
+            return "";
+        }
+
+        private bool IsNationalHolidayColumnPdf(
+            DayOffScheduleDayClass day,
+            List<DayOffScheduleItemClass> items,
+            List<StaffDayOffOptionClass> options)
+        {
+            if (day == null) return false;
+
+            string dateKey = day.date.StringToDateTime().ToString("yyyy-MM-dd");
+
+            bool hasNHItem = items.Any(x =>
+                x != null &&
+                x.date.StringToDateTime().ToString("yyyy-MM-dd") == dateKey &&
+                (x.selected_dayoff_type ?? "").Trim().ToUpper() == "NH");
+
+            if (hasNHItem) return true;
+
+            bool hasNHOption = options.Any(x =>
+                x != null &&
+                x.date.StringToDateTime().ToString("yyyy-MM-dd") == dateKey &&
+                ((x.dayoff_source_type ?? "").Trim().ToUpper() == "NATIONAL_HOLIDAY"));
+
+            return hasNHOption;
+        }
+
+        private string BuildPdfDayHeaderShortText(DateTime dt, bool isHoliday)
+        {
+            if (isHoliday) return "國";
+
+            switch (dt.DayOfWeek)
+            {
+                case DayOfWeek.Monday: return "一";
+                case DayOfWeek.Tuesday: return "二";
+                case DayOfWeek.Wednesday: return "三";
+                case DayOfWeek.Thursday: return "四";
+                case DayOfWeek.Friday: return "五";
+                case DayOfWeek.Saturday: return "六";
+                case DayOfWeek.Sunday: return "日";
+                default: return "";
+            }
+        }
+
+        private void DrawPdfCellBackgroundAndBorder(
+            XGraphics gfx,
+            double x,
+            double y,
+            double width,
+            double height,
+            XBrush backgroundBrush,
+            bool drawBorder)
+        {
+            if (backgroundBrush != null)
+            {
+                gfx.DrawRectangle(backgroundBrush, x, y, width, height);
+            }
+
+            if (drawBorder)
+            {
+                gfx.DrawRectangle(XPens.Black, x, y, width, height);
+            }
+        }
+
+        // =====================================================
+        // 最終確定的解法
+        // =====================================================
+        // 經過診斷確認:
+        // - 字體完全正常 (font_debug.pdf 視覺上看得到)
+        // - FontResolver 正確 (Bold/Regular 各自載入正確檔案)
+        // - 但 XRect + XStringFormats.Center 在 PDFsharp + .otf
+        //   組合下會導致 glyph 渲染失敗 (寫入文字層但不可見)
+        //
+        // 修法:helper 改用 DrawString(text, font, brush, x, y) 座標版
+        // 用 MeasureString 自己算置中位置,完全避開 XStringFormats.Center
+        // =====================================================
+
+        private void DrawPdfCellSingleLineText(
+            XGraphics gfx,
+            double x,
+            double y,
+            double width,
+            double height,
+            string text,
+            XFont font)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+
+            XSize size = gfx.MeasureString(text, font);
+
+            // 水平置中
+            double drawX = x + (width - size.Width) / 2.0;
+            // 垂直置中:DrawString 的 y 是 baseline,需做基線修正
+            // baseline 在格子底端往上一點(避免文字貼底)
+            double drawY = y + (height - size.Height) / 2.0 + size.Height * 0.78;
+
+            gfx.DrawString(text, font, XBrushes.Black, drawX, drawY);
+        }
+
+        private void DrawPdfCellTwoLineText(
+            XGraphics gfx,
+            double x,
+            double y,
+            double width,
+            double height,
+            string topText,
+            string bottomText,
+            XFont topFont,
+            XFont bottomFont)
+        {
+            double halfHeight = height / 2.0;
+
+            if (!string.IsNullOrWhiteSpace(topText))
+            {
+                XSize size = gfx.MeasureString(topText, topFont);
+                double drawX = x + (width - size.Width) / 2.0;
+                double drawY = y + (halfHeight - size.Height) / 2.0 + size.Height * 0.78;
+                gfx.DrawString(topText, topFont, XBrushes.Black, drawX, drawY);
+            }
+
+            if (!string.IsNullOrWhiteSpace(bottomText))
+            {
+                XSize size = gfx.MeasureString(bottomText, bottomFont);
+                double drawX = x + (width - size.Width) / 2.0;
+                double drawY = y + halfHeight + (halfHeight - size.Height) / 2.0 + size.Height * 0.78;
+                gfx.DrawString(bottomText, bottomFont, XBrushes.Black, drawX, drawY);
+            }
+        }
+
+        #endregion
+
+        #region export_staff_dayoff_status_excel
+
+        /// <summary>
+        /// 匯出單一成員的排休狀態 Excel
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途
+        /// 本 API 用於匯出指定排休表單中，單一成員的排休狀態 Excel。
+        ///
+        /// 匯出內容包含：
+        /// 1. 上方摘要資訊
+        /// 2. 下方排休狀態明細清單
+        ///
+        /// 僅列出「有狀態的日期」，不列出純上班或完全空白日期。
+        ///
+        /// ---
+        ///
+        /// ## 🌐 URL
+        /// ```text
+        /// /phar_roster_api/dayOffSchedule/export_staff_dayoff_status_excel
+        /// ```
+        ///
+        /// ## Method
+        /// ```text
+        /// POST
+        /// ```
+        ///
+        /// ## Content-Type
+        /// ```text
+        /// application/json
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📥 Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "export_staff_dayoff_status_excel",
+        ///   "ValueAry": [
+        ///     "form_name=2026-04",
+        ///     "staff_id=1120468"
+        ///   ],
+        ///   "Data": {}
+        /// }
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 🔍 參數說明
+        /// | 參數名稱 | 類型 | 必填 | 說明 |
+        /// |------|------|------|------|
+        /// | form_name | string | ✅ | 排休表單名稱 |
+        /// | staff_id | string | ✅ | 員工工號 |
+        ///
+        /// ---
+        ///
+        /// ## 📑 匯出內容
+        /// ### 一、摘要區
+        /// - 表單名稱
+        /// - 工號
+        /// - 姓名
+        /// - 簡名
+        /// - 應休總額度
+        /// - 已用應休額度
+        /// - 剩餘應休額度
+        /// - 週六已用次數
+        /// - 下午已用次數
+        ///
+        /// ### 二、明細區
+        /// 欄位如下：
+        ///
+        /// | 日期 | 星期 | 日別 | 狀態 | 類型 | 來源 | 備註 |
+        /// |------|------|------|------|------|------|------|
+        ///
+        /// ---
+        ///
+        /// ## 📝 狀態定義
+        /// ### 狀態
+        /// - 強制休假
+        /// - 已釋出
+        /// - 應休排休
+        /// - 已選休假
+        ///
+        /// ### 類型
+        /// - FF
+        /// - NH
+        /// - 整日
+        /// - 上午
+        /// - 下午
+        ///
+        /// ### 來源
+        /// - 強制休假
+        /// - 國定假日
+        /// - 釋出
+        /// - 應休
+        /// - 一般選擇
+        ///
+        /// ### 日別
+        /// - 平日
+        /// - 星期六
+        /// - 星期日
+        /// - 國定假日
+        ///
+        /// 若同時為週末與國定假日，日別以「國定假日」優先。
+        ///
+        /// ---
+        ///
+        /// ## 📌 狀態優先順序
+        /// 同一人同一天若有多種狀態，顯示優先順序如下：
+        ///
+        /// 1. 強制休假
+        ///    - FF
+        ///    - NH
+        /// 2. 已釋出
+        /// 3. 應休排休
+        /// 4. 已選休假
+        ///
+        /// ---
+        ///
+        /// ## 📌 匯出規則
+        /// 1. 僅匯出指定 staff_id 的資料。
+        /// 2. 只列出有狀態的日期。
+        /// 3. 已釋出狀態顯示在原持有人資料中。
+        /// 4. 明細資料依日期升冪排序。
+        /// 5. 備註欄位第一版先保留空白，供未來擴充。
+        ///
+        /// ---
+        ///
+        /// ## 📤 Response 說明（成功）
+        /// 成功時回傳 Excel 檔案串流。
+        ///
+        /// ### 檔名格式
+        /// ```text
+        /// 單人成員排休狀態_{form_name}_{staff_id}.xlsx
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## ❌ Response JSON 範例（錯誤）
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "export_staff_dayoff_status_excel",
+        ///   "Result": "未輸入 form_name"
+        /// }
+        /// ```
+        ///
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "export_staff_dayoff_status_excel",
+        ///   "Result": "找不到 staff_id(1120468) 對應的表單資料"
+        /// }
+        /// ```
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容，需於 ValueAry 傳入 form_name、staff_id。</param>
+        /// <returns>成功時回傳 Excel 檔案串流，失敗時回傳 JSON 錯誤訊息。</returns>
+        [HttpPost("export_staff_dayoff_status_excel")]
+        public IActionResult export_staff_dayoff_status_excel([FromBody] returnData returnData)
+        {
+            returnData.Method = "export_staff_dayoff_status_excel";
+
+            try
+            {
+                init(returnData);
+
+                string GetVal(string key) =>
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_id = GetVal("staff_id");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return new JsonResult(returnData);
+                }
+
+                if (staff_id.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 staff_id";
+                    return new JsonResult(returnData);
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return new JsonResult(returnData);
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                List<DayOffScheduleDayClass> days = sql_dayOffScheduleDayClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .Where(x => x != null)
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                List<DayOffScheduleItemClass> items = sql_dayOffScheduleItemClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                List<DayOffScheduleItemClass> staffItems = items
+                    .Where(x => x.staff_id == staff_id)
+                    .ToList();
+
+                if (staffItems.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到 staff_id({staff_id}) 對應的表單資料";
+                    return new JsonResult(returnData);
+                }
+
+                DayOffScheduleItemClass staffBase = staffItems.First();
+                string staff_guid = staffBase.staff_guid ?? "";
+                string staff_name = staffBase.staff_name ?? "";
+                string staff_simple_name = staffBase.staff_simple_name ?? "";
+
+                Dictionary<string, List<DayOffScheduleItemClass>> itemsByDate = staffItems
+                    .GroupBy(x => x.date.StringToDateTime().ToString("yyyy-MM-dd"))
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                List<StaffDayOffOptionClass> staffOptions = options
+                    .Where(x => x.staff_guid == staff_guid)
+                    .ToList();
+
+                Dictionary<string, List<StaffDayOffOptionClass>> optionsByDate = staffOptions
+                    .GroupBy(x => x.date.StringToDateTime().ToString("yyyy-MM-dd"))
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                StaffQuotaExportSummaryExcel summary = BuildStaffQuotaExportSummaryExcel(staff_guid, staffOptions);
+
+                List<ExportStaffDayoffDetailRowExcel> detailRows = new List<ExportStaffDayoffDetailRowExcel>();
+
+                foreach (DayOffScheduleDayClass day in days)
+                {
+                    DateTime dt = day.date.StringToDateTime();
+                    if (dt == DateTime.MinValue) continue;
+
+                    string dateKey = dt.ToString("yyyy-MM-dd");
+
+                    List<DayOffScheduleItemClass> dayItems =
+                        itemsByDate.ContainsKey(dateKey) ? itemsByDate[dateKey] : new List<DayOffScheduleItemClass>();
+
+                    List<StaffDayOffOptionClass> dayOptions =
+                        optionsByDate.ContainsKey(dateKey) ? optionsByDate[dateKey] : new List<StaffDayOffOptionClass>();
+
+                    ExportStaffDayoffDetailRowExcel row = ResolveStaffDayoffDetailRowExcel(dt, dayItems, dayOptions, items, options);
+                    if (row != null)
+                    {
+                        detailRows.Add(row);
+                    }
+                }
+
+                detailRows = detailRows
+                    .OrderBy(x => x.date)
+                    .ToList();
+
+                IWorkbook workbook = new XSSFWorkbook();
+                ISheet sheet = workbook.CreateSheet("排休狀態");
+
+                ICellStyle titleStyle = CreateStaffDayoffExcelTitleStyle(workbook);
+                ICellStyle labelStyle = CreateStaffDayoffExcelLabelStyle(workbook);
+                ICellStyle valueStyle = CreateStaffDayoffExcelValueStyle(workbook);
+                ICellStyle headerStyle = CreateStaffDayoffExcelHeaderStyle(workbook);
+                ICellStyle normalStyle = CreateStaffDayoffExcelNormalStyle(workbook);
+
+                int rowIndex = 0;
+
+                // Title
+                IRow rowTitle = sheet.CreateRow(rowIndex++);
+                rowTitle.HeightInPoints = 24;
+                CreateCell(rowTitle, 0, $"單人成員排休狀態 - {form.form_name}", titleStyle);
+                sheet.AddMergedRegion(new NPOI.SS.Util.CellRangeAddress(0, 0, 0, 6));
+
+                // Summary
+                rowIndex = WriteStaffDayoffSummaryRow(sheet, rowIndex, "表單名稱", form.form_name, labelStyle, valueStyle);
+                rowIndex = WriteStaffDayoffSummaryRow(sheet, rowIndex, "工號", staff_id, labelStyle, valueStyle);
+                rowIndex = WriteStaffDayoffSummaryRow(sheet, rowIndex, "姓名", staff_name, labelStyle, valueStyle);
+                rowIndex = WriteStaffDayoffSummaryRow(sheet, rowIndex, "簡名", staff_simple_name, labelStyle, valueStyle);
+                rowIndex = WriteStaffDayoffSummaryRow(sheet, rowIndex, "應休總額度", summary.quota_total, labelStyle, valueStyle);
+                rowIndex = WriteStaffDayoffSummaryRow(sheet, rowIndex, "已用應休額度", summary.quota_used_total, labelStyle, valueStyle);
+                rowIndex = WriteStaffDayoffSummaryRow(sheet, rowIndex, "剩餘應休額度", summary.quota_remaining, labelStyle, valueStyle);
+                rowIndex = WriteStaffDayoffSummaryRow(sheet, rowIndex, "週六已用次數", summary.saturday_used_count, labelStyle, valueStyle);
+                rowIndex = WriteStaffDayoffSummaryRow(sheet, rowIndex, "下午已用次數", summary.pm_used_count, labelStyle, valueStyle);
+
+                rowIndex++;
+
+                // Detail header
+                IRow rowHeader = sheet.CreateRow(rowIndex++);
+                rowHeader.HeightInPoints = 20;
+                CreateCell(rowHeader, 0, "日期", headerStyle);
+                CreateCell(rowHeader, 1, "星期", headerStyle);
+                CreateCell(rowHeader, 2, "日別", headerStyle);
+                CreateCell(rowHeader, 3, "狀態", headerStyle);
+                CreateCell(rowHeader, 4, "類型", headerStyle);
+                CreateCell(rowHeader, 5, "來源", headerStyle);
+                CreateCell(rowHeader, 6, "備註", headerStyle);
+
+                // Detail rows
+                foreach (ExportStaffDayoffDetailRowExcel rowData in detailRows)
+                {
+                    IRow row = sheet.CreateRow(rowIndex++);
+                    row.HeightInPoints = 20;
+
+                    CreateCell(row, 0, rowData.date.ToString("yyyy-MM-dd"), normalStyle);
+                    CreateCell(row, 1, rowData.week_text, normalStyle);
+                    CreateCell(row, 2, rowData.day_type, normalStyle);
+                    CreateCell(row, 3, rowData.status_text, normalStyle);
+                    CreateCell(row, 4, rowData.type_text, normalStyle);
+                    CreateCell(row, 5, rowData.source_text, normalStyle);
+                    CreateCell(row, 6, rowData.note_text, normalStyle);
+                }
+
+                // Column widths
+                sheet.SetColumnWidth(0, 16 * 256);
+                sheet.SetColumnWidth(1, 10 * 256);
+                sheet.SetColumnWidth(2, 14 * 256);
+                sheet.SetColumnWidth(3, 16 * 256);
+                sheet.SetColumnWidth(4, 12 * 256);
+                sheet.SetColumnWidth(5, 16 * 256);
+                sheet.SetColumnWidth(6, 24 * 256);
+
+                byte[] excelBytes;
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    workbook.Write(ms);
+                    excelBytes = ms.ToArray();
+                }
+
+                Stream stream = new MemoryStream(excelBytes);
+                string contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+                string downloadFileName = "staff_dayoff_status.xlsx";
+                string displayFileName = $"單人成員排休狀態_{form.form_name}_{staff_id}.xlsx";
+                string utf8FileName = Uri.EscapeDataString(displayFileName);
+
+                Response.Headers["Content-Disposition"] =
+                    $"attachment; filename=\"{downloadFileName}\"; filename*=UTF-8''{utf8FileName}";
+                Response.Headers["Access-Control-Expose-Headers"] =
+                    "Content-Disposition, Content-Length, Content-Type";
+
+                return File(stream, contentType);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return new JsonResult(returnData);
+            }
+        }
+
+        private class ExportStaffDayoffDetailRowExcel
+        {
+            public DateTime date { get; set; }
+            public string week_text { get; set; }
+            public string day_type { get; set; }
+            public string status_text { get; set; }
+            public string type_text { get; set; }
+            public string source_text { get; set; }
+            public string note_text { get; set; }
+        }
+
+        private class StaffQuotaExportSummaryExcel
+        {
+            public string quota_total { get; set; } = "0";
+            public string quota_used_total { get; set; } = "0";
+            public string quota_remaining { get; set; } = "0";
+            public string saturday_used_count { get; set; } = "0";
+            public string pm_used_count { get; set; } = "0";
+        }
+
+        private StaffQuotaExportSummaryExcel BuildStaffQuotaExportSummaryExcel(string staff_guid, List<StaffDayOffOptionClass> staffOptions)
+        {
+            StaffQuotaExportSummaryExcel result = new StaffQuotaExportSummaryExcel();
+
+            if (staff_guid.StringIsEmpty()) return result;
+            if (staffOptions == null) return result;
+
+            double quotaTotal = 0;
+            double quotaUsedTotal = 0;
+            int saturdayUsedCount = 0;
+            int pmUsedCount = 0;
+
+            foreach (StaffDayOffOptionClass option in staffOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_released == "true")
+                {
+                    string releasedType = (option.released_dayoff_type ?? "").Trim().ToUpper();
+                    if (releasedType == "FULL") quotaTotal += 1;
+                    else if (releasedType == "HALF_AM" || releasedType == "HALF_PM") quotaTotal += 0.5;
+                }
+
+                if (option.is_any_date == "true")
+                {
+                    quotaTotal += 1;
+                }
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    double used = 0;
+                    double.TryParse(option.quota_used, out used);
+                    quotaUsedTotal += used;
+
+                    string quotaType = (option.quota_dayoff_type ?? "").Trim().ToUpper();
+                    if (quotaType == "SATURDAY_HALF_AM") saturdayUsedCount++;
+                    if (quotaType == "WEEKDAY_HALF_PM") pmUsedCount++;
+                }
+            }
+
+            double remaining = quotaTotal - quotaUsedTotal;
+            if (remaining < 0) remaining = 0;
+
+            result.quota_total = quotaTotal.ToString("0.##");
+            result.quota_used_total = quotaUsedTotal.ToString("0.##");
+            result.quota_remaining = remaining.ToString("0.##");
+            result.saturday_used_count = saturdayUsedCount.ToString();
+            result.pm_used_count = pmUsedCount.ToString();
+
+            return result;
+        }
+
+        private ExportStaffDayoffDetailRowExcel ResolveStaffDayoffDetailRowExcel(
+            DateTime dt,
+            List<DayOffScheduleItemClass> dayItems,
+            List<StaffDayOffOptionClass> dayOptions,
+            List<DayOffScheduleItemClass> allItems,
+            List<StaffDayOffOptionClass> allOptions)
+        {
+            if (dayItems == null) dayItems = new List<DayOffScheduleItemClass>();
+            if (dayOptions == null) dayOptions = new List<StaffDayOffOptionClass>();
+            if (allItems == null) allItems = new List<DayOffScheduleItemClass>();
+            if (allOptions == null) allOptions = new List<StaffDayOffOptionClass>();
+
+            string weekText = GetChineseWeekShortExcel(dt);
+            string dayType = GetDayTypeTextExcel(dt, allItems, allOptions);
+
+            // 1. 強制休假：item
+            foreach (DayOffScheduleItemClass item in dayItems)
+            {
+                string selectedType = (item.selected_dayoff_type ?? "").Trim().ToUpper();
+                if (selectedType == "FF")
+                {
+                    return new ExportStaffDayoffDetailRowExcel
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "強制休假",
+                        type_text = "FF",
+                        source_text = "強制休假",
+                        note_text = ""
+                    };
+                }
+                if (selectedType == "NH")
+                {
+                    return new ExportStaffDayoffDetailRowExcel
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "強制休假",
+                        type_text = "NH",
+                        source_text = "國定假日",
+                        note_text = ""
+                    };
+                }
+            }
+
+            // 2. 強制休假：option
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                string sourceType = (option.dayoff_source_type ?? "").Trim().ToUpper();
+                if (option.is_force_ff == "true")
+                {
+                    if (sourceType == "NATIONAL_HOLIDAY")
+                    {
+                        return new ExportStaffDayoffDetailRowExcel
+                        {
+                            date = dt,
+                            week_text = weekText,
+                            day_type = dayType,
+                            status_text = "強制休假",
+                            type_text = "NH",
+                            source_text = "國定假日",
+                            note_text = ""
+                        };
+                    }
+
+                    return new ExportStaffDayoffDetailRowExcel
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "強制休假",
+                        type_text = "FF",
+                        source_text = "強制休假",
+                        note_text = ""
+                    };
+                }
+
+                if (sourceType == "NATIONAL_HOLIDAY")
+                {
+                    return new ExportStaffDayoffDetailRowExcel
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "強制休假",
+                        type_text = "NH",
+                        source_text = "國定假日",
+                        note_text = ""
+                    };
+                }
+            }
+
+            // 3. 已釋出
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_released == "true")
+                {
+                    return new ExportStaffDayoffDetailRowExcel
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "已釋出",
+                        type_text = GetHalfDayTypeTextExcel(option.released_dayoff_type),
+                        source_text = "釋出",
+                        note_text = ""
+                    };
+                }
+            }
+
+            // 4. 應休排休
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    return new ExportStaffDayoffDetailRowExcel
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "應休排休",
+                        type_text = GetSelectedTypeTextExcel(option),
+                        source_text = "應休",
+                        note_text = ""
+                    };
+                }
+            }
+
+            // 5. 一般已選休假
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.selected_full == "true" || option.selected_half_am == "true" || option.selected_half_pm == "true")
+                {
+                    return new ExportStaffDayoffDetailRowExcel
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "已選休假",
+                        type_text = GetSelectedTypeTextExcel(option),
+                        source_text = "一般選擇",
+                        note_text = ""
+                    };
+                }
+            }
+
+            return null;
+        }
+
+        private string GetChineseWeekShortExcel(DateTime dt)
+        {
+            switch (dt.DayOfWeek)
+            {
+                case DayOfWeek.Monday: return "一";
+                case DayOfWeek.Tuesday: return "二";
+                case DayOfWeek.Wednesday: return "三";
+                case DayOfWeek.Thursday: return "四";
+                case DayOfWeek.Friday: return "五";
+                case DayOfWeek.Saturday: return "六";
+                case DayOfWeek.Sunday: return "日";
+                default: return "";
+            }
+        }
+
+        private string GetDayTypeTextExcel(DateTime dt, List<DayOffScheduleItemClass> allItems, List<StaffDayOffOptionClass> allOptions)
+        {
+            string dateKey = dt.ToString("yyyy-MM-dd");
+
+            bool isHoliday = allItems.Any(x =>
+                x != null &&
+                x.date.StringToDateTime().ToString("yyyy-MM-dd") == dateKey &&
+                (x.selected_dayoff_type ?? "").Trim().ToUpper() == "NH");
+
+            if (!isHoliday)
+            {
+                isHoliday = allOptions.Any(x =>
+                    x != null &&
+                    x.date.StringToDateTime().ToString("yyyy-MM-dd") == dateKey &&
+                    ((x.dayoff_source_type ?? "").Trim().ToUpper() == "NATIONAL_HOLIDAY"));
+            }
+
+            if (isHoliday) return "國定假日";
+            if (dt.DayOfWeek == DayOfWeek.Saturday) return "星期六";
+            if (dt.DayOfWeek == DayOfWeek.Sunday) return "星期日";
+            return "平日";
+        }
+
+        private string GetHalfDayTypeTextExcel(string sourceType)
+        {
+            string type = (sourceType ?? "").Trim().ToUpper();
+
+            if (type == "FULL") return "整日";
+            if (type == "HALF_AM") return "上午";
+            if (type == "HALF_PM") return "下午";
+
+            return "整日";
+        }
+
+        private string GetSelectedTypeTextExcel(StaffDayOffOptionClass option)
+        {
+            option.NormalizeSelection();
+
+            if (option.selected_full == "true") return "整日";
+            if (option.selected_half_am == "true") return "上午";
+            if (option.selected_half_pm == "true") return "下午";
+
+            return "整日";
+        }
+
+        private int WriteStaffDayoffSummaryRow(
+            ISheet sheet,
+            int rowIndex,
+            string labelText,
+            string valueText,
+            ICellStyle labelStyle,
+            ICellStyle valueStyle)
+        {
+            IRow row = sheet.CreateRow(rowIndex);
+            row.HeightInPoints = 20;
+
+            CreateCell(row, 0, labelText, labelStyle);
+            CreateCell(row, 1, valueText ?? "", valueStyle);
+            sheet.AddMergedRegion(new NPOI.SS.Util.CellRangeAddress(rowIndex, rowIndex, 1, 3));
+
+            return rowIndex + 1;
+        }
+
+        private ICell CreateCell(IRow row, int columnIndex, string text, ICellStyle style)
+        {
+            ICell cell = row.CreateCell(columnIndex);
+            cell.SetCellValue(text ?? "");
+            cell.CellStyle = style;
+            return cell;
+        }
+
+        private ICellStyle CreateStaffDayoffExcelTitleStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 14;
+            font.IsBold = true;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Left;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.SetFont(font);
+
+            return style;
+        }
+
+        private ICellStyle CreateStaffDayoffExcelLabelStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+            font.IsBold = true;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Center;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.FillForegroundColor = IndexedColors.Grey25Percent.Index;
+            style.FillPattern = FillPattern.SolidForeground;
+            style.SetFont(font);
+
+            return style;
+        }
+
+        private ICellStyle CreateStaffDayoffExcelValueStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Left;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.SetFont(font);
+
+            return style;
+        }
+
+        private ICellStyle CreateStaffDayoffExcelHeaderStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+            font.IsBold = true;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Center;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.FillForegroundColor = IndexedColors.Grey25Percent.Index;
+            style.FillPattern = FillPattern.SolidForeground;
+            style.SetFont(font);
+
+            return style;
+        }
+
+        private ICellStyle CreateStaffDayoffExcelNormalStyle(IWorkbook workbook)
+        {
+            IFont font = workbook.CreateFont();
+            font.FontName = "微軟正黑體";
+            font.FontHeightInPoints = 10;
+
+            ICellStyle style = workbook.CreateCellStyle();
+            style.Alignment = HorizontalAlignment.Center;
+            style.VerticalAlignment = VerticalAlignment.Center;
+            style.BorderTop = BorderStyle.Thin;
+            style.BorderBottom = BorderStyle.Thin;
+            style.BorderLeft = BorderStyle.Thin;
+            style.BorderRight = BorderStyle.Thin;
+            style.WrapText = true;
+            style.SetFont(font);
+
+            return style;
+        }
+
+        #endregion
+
+        #region export_staff_dayoff_status_pdf
+
+        /// <summary>
+        /// 匯出單一成員的排休狀態 PDF
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途
+        /// 本 API 用於匯出指定排休表單中，單一成員的排休狀態 PDF。
+        ///
+        /// 匯出內容包含：
+        /// 1. 上方摘要資訊
+        /// 2. 下方排休狀態明細清單
+        ///
+        /// 僅列出「有狀態的日期」，不列出純上班或完全空白日期。
+        ///
+        /// ---
+        ///
+        /// ## 🌐 URL
+        /// ```text
+        /// /phar_roster_api/dayOffSchedule/export_staff_dayoff_status_pdf
+        /// ```
+        ///
+        /// ## Method
+        /// ```text
+        /// POST
+        /// ```
+        ///
+        /// ## Content-Type
+        /// ```text
+        /// application/json
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 📥 Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "export_staff_dayoff_status_pdf",
+        ///   "ValueAry": [
+        ///     "form_name=2026-04",
+        ///     "staff_id=1120468"
+        ///   ],
+        ///   "Data": {}
+        /// }
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## 🔍 參數說明
+        /// | 參數名稱 | 類型 | 必填 | 說明 |
+        /// |------|------|------|------|
+        /// | form_name | string | ✅ | 排休表單名稱 |
+        /// | staff_id | string | ✅ | 員工工號 |
+        ///
+        /// ---
+        ///
+        /// ## 📑 匯出內容
+        /// ### 一、摘要區
+        /// - 表單名稱
+        /// - 工號
+        /// - 姓名
+        /// - 簡名
+        /// - 應休總額度
+        /// - 已用應休額度
+        /// - 剩餘應休額度
+        /// - 週六已用次數
+        /// - 下午已用次數
+        ///
+        /// ### 二、明細區
+        /// 欄位如下：
+        ///
+        /// | 日期 | 星期 | 日別 | 狀態 | 類型 | 來源 | 備註 |
+        /// |------|------|------|------|------|------|------|
+        ///
+        /// ---
+        ///
+        /// ## 📝 狀態定義
+        /// ### 狀態
+        /// - 強制休假
+        /// - 已釋出
+        /// - 應休排休
+        /// - 已選休假
+        ///
+        /// ### 類型
+        /// - FF
+        /// - NH
+        /// - 整日
+        /// - 上午
+        /// - 下午
+        ///
+        /// ### 來源
+        /// - 強制休假
+        /// - 國定假日
+        /// - 釋出
+        /// - 應休
+        /// - 一般選擇
+        ///
+        /// ### 日別
+        /// - 平日
+        /// - 星期六
+        /// - 星期日
+        /// - 國定假日
+        ///
+        /// 若同時為週末與國定假日，日別以「國定假日」優先。
+        ///
+        /// ---
+        ///
+        /// ## 📌 狀態優先順序
+        /// 同一人同一天若有多種狀態，顯示優先順序如下：
+        ///
+        /// 1. 強制休假
+        ///    - FF
+        ///    - NH
+        /// 2. 已釋出
+        /// 3. 應休排休
+        /// 4. 已選休假
+        ///
+        /// ---
+        ///
+        /// ## 📌 匯出規則
+        /// 1. 僅匯出指定 staff_id 的資料。
+        /// 2. 只列出有狀態的日期。
+        /// 3. 已釋出狀態顯示在原持有人資料中。
+        /// 4. 明細資料依日期升冪排序。
+        /// 5. 備註欄位第一版先保留空白，供未來擴充。
+        ///
+        /// ---
+        ///
+        /// ## 📤 Response 說明（成功）
+        /// 成功時回傳 PDF 檔案串流。
+        ///
+        /// ### 檔名格式
+        /// ```text
+        /// 單人成員排休狀態_{form_name}_{staff_id}.pdf
+        /// ```
+        ///
+        /// ---
+        ///
+        /// ## ❌ Response JSON 範例（錯誤）
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "export_staff_dayoff_status_pdf",
+        ///   "Result": "未輸入 form_name"
+        /// }
+        /// ```
+        ///
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "export_staff_dayoff_status_pdf",
+        ///   "Result": "找不到 staff_id(1120468) 對應的表單資料"
+        /// }
+        /// ```
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容，需於 ValueAry 傳入 form_name、staff_id。</param>
+        /// <returns>成功時回傳 PDF 檔案串流，失敗時回傳 JSON 錯誤訊息。</returns>
+        [HttpPost("export_staff_dayoff_status_pdf")]
+        public IActionResult export_staff_dayoff_status_pdf([FromBody] returnData returnData)
+        {
+            returnData.Method = "export_staff_dayoff_status_pdf";
+
+            try
+            {
+                CustomFontResolver.EnsurePdfSharpFontResolver();
+                init(returnData);
+
+                string GetVal(string key) =>
+                    returnData.ValueAry.FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                    ?.Split('=')[1];
+
+                string form_name = GetVal("form_name");
+                string staff_id = GetVal("staff_id");
+
+                if (form_name.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 form_name";
+                    return new JsonResult(returnData);
+                }
+
+                if (staff_id.StringIsEmpty())
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "未輸入 staff_id";
+                    return new JsonResult(returnData);
+                }
+
+                var sql_dayOffScheduleFormClass = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+
+                object[] obj_form = sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
+                if (obj_form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到表單名稱({form_name})";
+                    return new JsonResult(returnData);
+                }
+
+                DayOffScheduleFormClass form = obj_form.SQLToClass<DayOffScheduleFormClass>();
+
+                List<DayOffScheduleDayClass> days = sql_dayOffScheduleDayClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>()
+                    .Where(x => x != null)
+                    .OrderBy(x => x.date.StringToDateTime())
+                    .ToList();
+
+                List<DayOffScheduleItemClass> items = sql_dayOffScheduleItemClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleItemClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<StaffDayOffOptionClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                List<DayOffScheduleItemClass> staffItems = items
+                    .Where(x => x.staff_id == staff_id)
+                    .ToList();
+
+                if (staffItems.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"找不到 staff_id({staff_id}) 對應的表單資料";
+                    return new JsonResult(returnData);
+                }
+
+                DayOffScheduleItemClass staffBase = staffItems.First();
+                string staff_guid = staffBase.staff_guid ?? "";
+                string staff_name = staffBase.staff_name ?? "";
+                string staff_simple_name = staffBase.staff_simple_name ?? "";
+
+                Dictionary<string, List<DayOffScheduleItemClass>> itemsByDate = staffItems
+                    .GroupBy(x => x.date.StringToDateTime().ToString("yyyy-MM-dd"))
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                List<StaffDayOffOptionClass> staffOptions = options
+                    .Where(x => x.staff_guid == staff_guid)
+                    .ToList();
+
+                Dictionary<string, List<StaffDayOffOptionClass>> optionsByDate = staffOptions
+                    .GroupBy(x => x.date.StringToDateTime().ToString("yyyy-MM-dd"))
+                    .ToDictionary(g => g.Key, g => g.ToList());
+
+                StaffQuotaExportSummaryPdfSingle summary = BuildStaffQuotaExportSummaryPdfSingle(staff_guid, staffOptions);
+
+                List<ExportStaffDayoffDetailRowPdf> detailRows = new List<ExportStaffDayoffDetailRowPdf>();
+
+                foreach (DayOffScheduleDayClass day in days)
+                {
+                    DateTime dt = day.date.StringToDateTime();
+                    if (dt == DateTime.MinValue) continue;
+
+                    string dateKey = dt.ToString("yyyy-MM-dd");
+
+                    List<DayOffScheduleItemClass> dayItems =
+                        itemsByDate.ContainsKey(dateKey) ? itemsByDate[dateKey] : new List<DayOffScheduleItemClass>();
+
+                    List<StaffDayOffOptionClass> dayOptions =
+                        optionsByDate.ContainsKey(dateKey) ? optionsByDate[dateKey] : new List<StaffDayOffOptionClass>();
+
+                    ExportStaffDayoffDetailRowPdf row = ResolveStaffDayoffDetailRowPdf(dt, dayItems, dayOptions, items, options);
+                    if (row != null)
+                    {
+                        detailRows.Add(row);
+                    }
+                }
+
+                detailRows = detailRows
+                    .OrderBy(x => x.date)
+                    .ToList();
+
+                PdfDocument document = new PdfDocument();
+                document.Info.Title = $"單人成員排休狀態_{form.form_name}_{staff_id}";
+
+                PdfPage page = document.AddPage();
+                page.Size = PdfSharp.PageSize.A4;
+                page.Orientation = PdfSharp.PageOrientation.Portrait;
+
+                XGraphics gfx = XGraphics.FromPdfPage(page);
+
+                XFont titleFont = new XFont("Noto Sans TC", 14, XFontStyleEx.Bold);
+                XFont subFont = new XFont("Noto Sans TC", 8, XFontStyleEx.Regular);
+                XFont labelFont = new XFont("Noto Sans TC", 9, XFontStyleEx.Bold);
+                XFont valueFont = new XFont("Noto Sans TC", 9, XFontStyleEx.Regular);
+                XFont headerFont = new XFont("Noto Sans TC", 9, XFontStyleEx.Bold);
+                XFont rowFont = new XFont("Noto Sans TC", 9, XFontStyleEx.Regular);
+
+                double marginLeft = 28;
+                double marginTop = 28;
+                double marginRight = 28;
+                double marginBottom = 28;
+
+                double pageWidth = page.Width.Point;
+                double pageHeight = page.Height.Point;
+                double contentWidth = pageWidth - marginLeft - marginRight;
+
+                double y = marginTop;
+
+                // Title
+                gfx.DrawString($"單人成員排休狀態 - {form.form_name}", titleFont, XBrushes.Black,
+                    new XRect(marginLeft, y, contentWidth, 20), XStringFormats.CenterLeft);
+
+                gfx.DrawString($"匯出時間：{DateTime.Now:yyyy-MM-dd HH:mm:ss}", subFont, XBrushes.Black,
+                    new XRect(marginLeft, y + 4, contentWidth, 20), XStringFormats.CenterRight);
+
+                y += 28;
+
+                // Summary block
+                List<(string label, string value)> summaryRows = new List<(string label, string value)>
+        {
+            ("表單名稱", form.form_name),
+            ("工號", staff_id),
+            ("姓名", staff_name),
+            ("簡名", staff_simple_name),
+            ("應休總額度", summary.quota_total),
+            ("已用應休額度", summary.quota_used_total),
+            ("剩餘應休額度", summary.quota_remaining),
+            ("週六已用次數", summary.saturday_used_count),
+            ("下午已用次數", summary.pm_used_count)
+        };
+
+                double summaryLabelWidth = 90;
+                double summaryValueWidth = contentWidth - summaryLabelWidth;
+                double summaryRowHeight = 20;
+
+                foreach ((string label, string value) in summaryRows)
+                {
+                    DrawPdfRect(gfx, marginLeft, y, summaryLabelWidth, summaryRowHeight, XBrushes.LightGray, true);
+                    DrawPdfRect(gfx, marginLeft + summaryLabelWidth, y, summaryValueWidth, summaryRowHeight, XBrushes.White, true);
+
+                    DrawPdfText(gfx, label, labelFont, XBrushes.Black,
+                        new XRect(marginLeft, y, summaryLabelWidth, summaryRowHeight), XStringFormats.Center);
+
+                    DrawPdfText(gfx, value ?? "", valueFont, XBrushes.Black,
+                        new XRect(marginLeft + summaryLabelWidth + 4, y, summaryValueWidth - 8, summaryRowHeight), XStringFormats.CenterLeft);
+
+                    y += summaryRowHeight;
+                }
+
+                y += 16;
+
+                // Table header
+                double[] colWidths = new double[]
+                {
+            78, // 日期
+            40, // 星期
+            70, // 日別
+            78, // 狀態
+            55, // 類型
+            70, // 來源
+            contentWidth - (78 + 40 + 70 + 78 + 55 + 70) // 備註
+                };
+
+                string[] headers = new string[]
+                {
+            "日期", "星期", "日別", "狀態", "類型", "來源", "備註"
+                };
+
+                double tableHeaderHeight = 22;
+                double rowHeight = 22;
+
+                void DrawTableHeader()
+                {
+                    double x = marginLeft;
+                    for (int i = 0; i < headers.Length; i++)
+                    {
+                        DrawPdfRect(gfx, x, y, colWidths[i], tableHeaderHeight, XBrushes.LightGray, true);
+                        DrawPdfText(gfx, headers[i], headerFont, XBrushes.Black,
+                            new XRect(x, y, colWidths[i], tableHeaderHeight), XStringFormats.Center);
+                        x += colWidths[i];
+                    }
+                    y += tableHeaderHeight;
+                }
+
+                DrawTableHeader();
+
+                // Detail rows
+                foreach (ExportStaffDayoffDetailRowPdf row in detailRows)
+                {
+                    if (y + rowHeight > pageHeight - marginBottom)
+                    {
+                        page = document.AddPage();
+                        page.Size = PdfSharp.PageSize.A4;
+                        page.Orientation = PdfSharp.PageOrientation.Portrait;
+                        gfx = XGraphics.FromPdfPage(page);
+                        y = marginTop;
+
+                        gfx.DrawString($"單人成員排休狀態 - {form.form_name}", titleFont, XBrushes.Black,
+                            new XRect(marginLeft, y, contentWidth, 20), XStringFormats.CenterLeft);
+
+                        gfx.DrawString($"工號：{staff_id}  姓名：{staff_name}", subFont, XBrushes.Black,
+                            new XRect(marginLeft, y + 4, contentWidth, 20), XStringFormats.CenterRight);
+
+                        y += 28;
+                        DrawTableHeader();
+                    }
+
+                    string[] rowTexts = new string[]
+                    {
+                row.date.ToString("yyyy-MM-dd"),
+                row.week_text,
+                row.day_type,
+                row.status_text,
+                row.type_text,
+                row.source_text,
+                row.note_text
+                    };
+
+                    double x = marginLeft;
+                    for (int i = 0; i < rowTexts.Length; i++)
+                    {
+                        DrawPdfRect(gfx, x, y, colWidths[i], rowHeight, XBrushes.White, true);
+
+                        XStringFormat format = i == 6 ? XStringFormats.CenterLeft : XStringFormats.Center;
+                        XRect textRect = i == 6
+                            ? new XRect(x + 4, y, colWidths[i] - 8, rowHeight)
+                            : new XRect(x, y, colWidths[i], rowHeight);
+
+                        DrawPdfText(gfx, rowTexts[i] ?? "", rowFont, XBrushes.Black, textRect, format);
+
+                        x += colWidths[i];
+                    }
+
+                    y += rowHeight;
+                }
+
+                byte[] pdfBytes;
+                using (MemoryStream ms = new MemoryStream())
+                {
+                    document.Save(ms, false);
+                    pdfBytes = ms.ToArray();
+                }
+
+                Stream stream = new MemoryStream(pdfBytes);
+                string contentType = "application/pdf";
+
+                string downloadFileName = "staff_dayoff_status.pdf";
+                string displayFileName = $"單人成員排休狀態_{form.form_name}_{staff_id}.pdf";
+                string utf8FileName = Uri.EscapeDataString(displayFileName);
+
+                Response.Headers["Content-Disposition"] =
+                    $"attachment; filename=\"{downloadFileName}\"; filename*=UTF-8''{utf8FileName}";
+                Response.Headers["Access-Control-Expose-Headers"] =
+                    "Content-Disposition, Content-Length, Content-Type";
+
+                return File(stream, contentType);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return new JsonResult(returnData);
+            }
+        }
+
+        private class ExportStaffDayoffDetailRowPdf
+        {
+            public DateTime date { get; set; }
+            public string week_text { get; set; }
+            public string day_type { get; set; }
+            public string status_text { get; set; }
+            public string type_text { get; set; }
+            public string source_text { get; set; }
+            public string note_text { get; set; }
+        }
+
+        private class StaffQuotaExportSummaryPdfSingle
+        {
+            public string quota_total { get; set; } = "0";
+            public string quota_used_total { get; set; } = "0";
+            public string quota_remaining { get; set; } = "0";
+            public string saturday_used_count { get; set; } = "0";
+            public string pm_used_count { get; set; } = "0";
+        }
+
+        private StaffQuotaExportSummaryPdfSingle BuildStaffQuotaExportSummaryPdfSingle(string staff_guid, List<StaffDayOffOptionClass> staffOptions)
+        {
+            StaffQuotaExportSummaryPdfSingle result = new StaffQuotaExportSummaryPdfSingle();
+
+            if (staff_guid.StringIsEmpty()) return result;
+            if (staffOptions == null) return result;
+
+            double quotaTotal = 0;
+            double quotaUsedTotal = 0;
+            int saturdayUsedCount = 0;
+            int pmUsedCount = 0;
+
+            foreach (StaffDayOffOptionClass option in staffOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_released == "true")
+                {
+                    string releasedType = (option.released_dayoff_type ?? "").Trim().ToUpper();
+                    if (releasedType == "FULL") quotaTotal += 1;
+                    else if (releasedType == "HALF_AM" || releasedType == "HALF_PM") quotaTotal += 0.5;
+                }
+
+                if (option.is_any_date == "true")
+                {
+                    quotaTotal += 1;
+                }
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    double used = 0;
+                    double.TryParse(option.quota_used, out used);
+                    quotaUsedTotal += used;
+
+                    string quotaType = (option.quota_dayoff_type ?? "").Trim().ToUpper();
+                    if (quotaType == "SATURDAY_HALF_AM") saturdayUsedCount++;
+                    if (quotaType == "WEEKDAY_HALF_PM") pmUsedCount++;
+                }
+            }
+
+            double remaining = quotaTotal - quotaUsedTotal;
+            if (remaining < 0) remaining = 0;
+
+            result.quota_total = quotaTotal.ToString("0.##");
+            result.quota_used_total = quotaUsedTotal.ToString("0.##");
+            result.quota_remaining = remaining.ToString("0.##");
+            result.saturday_used_count = saturdayUsedCount.ToString();
+            result.pm_used_count = pmUsedCount.ToString();
+
+            return result;
+        }
+
+        private ExportStaffDayoffDetailRowPdf ResolveStaffDayoffDetailRowPdf(
+            DateTime dt,
+            List<DayOffScheduleItemClass> dayItems,
+            List<StaffDayOffOptionClass> dayOptions,
+            List<DayOffScheduleItemClass> allItems,
+            List<StaffDayOffOptionClass> allOptions)
+        {
+            if (dayItems == null) dayItems = new List<DayOffScheduleItemClass>();
+            if (dayOptions == null) dayOptions = new List<StaffDayOffOptionClass>();
+            if (allItems == null) allItems = new List<DayOffScheduleItemClass>();
+            if (allOptions == null) allOptions = new List<StaffDayOffOptionClass>();
+
+            string weekText = GetChineseWeekShortPdf(dt);
+            string dayType = GetDayTypeTextPdf(dt, allItems, allOptions);
+
+            // 1. 強制休假：item
+            foreach (DayOffScheduleItemClass item in dayItems)
+            {
+                string selectedType = (item.selected_dayoff_type ?? "").Trim().ToUpper();
+                if (selectedType == "FF")
+                {
+                    return new ExportStaffDayoffDetailRowPdf
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "強制休假",
+                        type_text = "FF",
+                        source_text = "強制休假",
+                        note_text = ""
+                    };
+                }
+                if (selectedType == "NH")
+                {
+                    return new ExportStaffDayoffDetailRowPdf
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "強制休假",
+                        type_text = "NH",
+                        source_text = "國定假日",
+                        note_text = ""
+                    };
+                }
+            }
+
+            // 2. 強制休假：option
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                string sourceType = (option.dayoff_source_type ?? "").Trim().ToUpper();
+                if (option.is_force_ff == "true")
+                {
+                    if (sourceType == "NATIONAL_HOLIDAY")
+                    {
+                        return new ExportStaffDayoffDetailRowPdf
+                        {
+                            date = dt,
+                            week_text = weekText,
+                            day_type = dayType,
+                            status_text = "強制休假",
+                            type_text = "NH",
+                            source_text = "國定假日",
+                            note_text = ""
+                        };
+                    }
+
+                    return new ExportStaffDayoffDetailRowPdf
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "強制休假",
+                        type_text = "FF",
+                        source_text = "強制休假",
+                        note_text = ""
+                    };
+                }
+
+                if (sourceType == "NATIONAL_HOLIDAY")
+                {
+                    return new ExportStaffDayoffDetailRowPdf
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "強制休假",
+                        type_text = "NH",
+                        source_text = "國定假日",
+                        note_text = ""
+                    };
+                }
+            }
+
+            // 3. 已釋出
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_released == "true")
+                {
+                    return new ExportStaffDayoffDetailRowPdf
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "已釋出",
+                        type_text = GetHalfDayTypeTextPdf(option.released_dayoff_type),
+                        source_text = "釋出",
+                        note_text = ""
+                    };
+                }
+            }
+
+            // 4. 應休排休
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.is_quota_dayoff == "true")
+                {
+                    return new ExportStaffDayoffDetailRowPdf
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "應休排休",
+                        type_text = GetSelectedTypeTextPdf(option),
+                        source_text = "應休",
+                        note_text = ""
+                    };
+                }
+            }
+
+            // 5. 一般已選休假
+            foreach (StaffDayOffOptionClass option in dayOptions)
+            {
+                option.NormalizeSelection();
+
+                if (option.selected_full == "true" || option.selected_half_am == "true" || option.selected_half_pm == "true")
+                {
+                    return new ExportStaffDayoffDetailRowPdf
+                    {
+                        date = dt,
+                        week_text = weekText,
+                        day_type = dayType,
+                        status_text = "已選休假",
+                        type_text = GetSelectedTypeTextPdf(option),
+                        source_text = "一般選擇",
+                        note_text = ""
+                    };
+                }
+            }
+
+            return null;
+        }
+
+        private string GetChineseWeekShortPdf(DateTime dt)
+        {
+            switch (dt.DayOfWeek)
+            {
+                case DayOfWeek.Monday: return "一";
+                case DayOfWeek.Tuesday: return "二";
+                case DayOfWeek.Wednesday: return "三";
+                case DayOfWeek.Thursday: return "四";
+                case DayOfWeek.Friday: return "五";
+                case DayOfWeek.Saturday: return "六";
+                case DayOfWeek.Sunday: return "日";
+                default: return "";
+            }
+        }
+
+        private string GetDayTypeTextPdf(DateTime dt, List<DayOffScheduleItemClass> allItems, List<StaffDayOffOptionClass> allOptions)
+        {
+            string dateKey = dt.ToString("yyyy-MM-dd");
+
+            bool isHoliday = allItems.Any(x =>
+                x != null &&
+                x.date.StringToDateTime().ToString("yyyy-MM-dd") == dateKey &&
+                (x.selected_dayoff_type ?? "").Trim().ToUpper() == "NH");
+
+            if (!isHoliday)
+            {
+                isHoliday = allOptions.Any(x =>
+                    x != null &&
+                    x.date.StringToDateTime().ToString("yyyy-MM-dd") == dateKey &&
+                    ((x.dayoff_source_type ?? "").Trim().ToUpper() == "NATIONAL_HOLIDAY"));
+            }
+
+            if (isHoliday) return "國定假日";
+            if (dt.DayOfWeek == DayOfWeek.Saturday) return "星期六";
+            if (dt.DayOfWeek == DayOfWeek.Sunday) return "星期日";
+            return "平日";
+        }
+
+        private string GetHalfDayTypeTextPdf(string sourceType)
+        {
+            string type = (sourceType ?? "").Trim().ToUpper();
+
+            if (type == "FULL") return "整日";
+            if (type == "HALF_AM") return "上午";
+            if (type == "HALF_PM") return "下午";
+
+            return "整日";
+        }
+
+        private void DrawPdfRect(
+            XGraphics gfx,
+            double x,
+            double y,
+            double width,
+            double height,
+            XBrush backgroundBrush,
+            bool drawBorder)
+        {
+            if (backgroundBrush != null)
+            {
+                gfx.DrawRectangle(backgroundBrush, x, y, width, height);
+            }
+
+            if (drawBorder)
+            {
+                gfx.DrawRectangle(XPens.Black, x, y, width, height);
+            }
+        }
+
+        private void DrawPdfText(
+            XGraphics gfx,
+            string text,
+            XFont font,
+            XBrush brush,
+            XRect rect,
+            XStringFormat format)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return;
+            gfx.DrawString(text, font, brush, rect, format);
+        }
+        private string GetSelectedTypeTextPdf(StaffDayOffOptionClass option)
+        {
+            if (option == null) return "整日";
+
+            option.NormalizeSelection();
+
+            if (option.selected_full == "true") return "整日";
+            if (option.selected_half_am == "true") return "上午";
+            if (option.selected_half_pm == "true") return "下午";
+
+            return "整日";
+        }
+        #endregion
 
         private Dictionary<string, DayOffDateQuotaUsageSummary> BuildDateQuotaUsageSummaryDict(List<DayOffScheduleDayClass> days, List<StaffDayOffOptionClass> allOptions)
         {

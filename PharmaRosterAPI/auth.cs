@@ -8,6 +8,7 @@ using MySql.Data.MySqlClient;
 using NPOI.SS.UserModel;
 using NPOI.XSSF.UserModel;
 using PharmaRosterLib;
+using PharmaRosterLib.DTOs.Auth;
 using SQLUI;
 using System;
 using System.Collections.Generic;
@@ -22,6 +23,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
+
 
 namespace PharmaRosterAPI
 {
@@ -113,6 +115,311 @@ namespace PharmaRosterAPI
                 returnData.Code = -200;
                 returnData.Result = $"Exception: {ex.Message}";
                 return returnData.JsonSerializationt(true);
+            }
+        }
+
+        /// <summary>
+        /// 取得所有已註冊人員清單（支援搜尋、排序、分頁）
+        /// </summary>
+        /// <remarks>
+        /// ## 📌 用途  
+        /// 本 API 用於查詢所有已完成帳號註冊的人員清單。  
+        /// 資料來源以 <c>StaffAuthClass</c> 為主，並串接 <c>StaffClass</c> 補齊人員基本資料，
+        /// 例如姓名、簡名、角色等欄位。
+        ///
+        /// ## ⚙️ 功能說明  
+        /// 1. 僅查詢「已註冊」人員，也就是 <c>staff_auth</c> 有資料者。  
+        /// 2. 支援依下列欄位搜尋：
+        ///    - <c>staff_id</c>（模糊搜尋）
+        ///    - <c>staff_name</c>（模糊搜尋）
+        ///    - <c>staff_simple_name</c>（模糊搜尋）
+        ///    - <c>account</c>（模糊搜尋）
+        ///    - <c>role</c>（模糊搜尋）
+        ///    - <c>is_locked</c>（精準搜尋，Y / N）
+        /// 3. 支援排序：
+        ///    - <c>staff_id</c>
+        ///    - <c>staff_name</c>
+        ///    - <c>account</c>
+        ///    - <c>created_at</c>
+        ///    - <c>updated_at</c>
+        /// 4. 支援分頁查詢。  
+        /// 5. 若 <c>staff_auth</c> 有資料但 <c>StaffClass</c> 找不到對應人員，仍會列出，
+        ///    但 <c>staff_name</c> / <c>staff_simple_name</c> / <c>role</c> 會回傳空字串。
+        ///
+        /// ## 🔐 權限要求  
+        /// 此 API 需通過 JWT 驗證，僅限已登入且有權限之使用者呼叫。
+        ///
+        /// ## 📥 Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "get_registered_staffs",
+        ///   "ValueAry": [
+        ///     "staff_id=112",
+        ///     "staff_name=陳",
+        ///     "staff_simple_name=姸",
+        ///     "account=pharma",
+        ///     "role=藥師",
+        ///     "is_locked=N",
+        ///     "page=1",
+        ///     "pageSize=200",
+        ///     "sortBy=staff_id",
+        ///     "sortOrder=asc"
+        ///   ],
+        ///   "Data": {}
+        /// }
+        /// ```
+        ///
+        /// ## 🔍 參數說明  
+        /// | 參數名稱 | 類型 | 必填 | 預設值 | 說明 |
+        /// |------------|------|------|--------|------|
+        /// | staff_id | string | 否 | 空 | 員工工號，模糊搜尋 |
+        /// | staff_name | string | 否 | 空 | 人員姓名，模糊搜尋 |
+        /// | staff_simple_name | string | 否 | 空 | 簡名，模糊搜尋 |
+        /// | account | string | 否 | 空 | 登入帳號，模糊搜尋 |
+        /// | role | string | 否 | 空 | 角色，模糊搜尋 |
+        /// | is_locked | string | 否 | 空 | 是否鎖定，精準搜尋（Y / N） |
+        /// | page | int | 否 | 1 | 第幾頁，最小 1 |
+        /// | pageSize | int | 否 | 200 | 每頁筆數，最小 1 |
+        /// | sortBy | string | 否 | staff_id | 排序欄位，可用：staff_id / staff_name / account / created_at / updated_at |
+        /// | sortOrder | string | 否 | asc | 排序方向，可用：asc / desc |
+        ///
+        /// ## 📤 Response JSON 範例 (成功)
+        /// ```json
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "get_registered_staffs",
+        ///   "Result": "共取得(2)筆已註冊人員資料",
+        ///   "TimeTaken": "35ms",
+        ///   "Data": [
+        ///     {
+        ///       "GUID": "A1B2C3D4",
+        ///       "staff_id": "1120468",
+        ///       "staff_name": "陳姸臻",
+        ///       "staff_simple_name": "姸",
+        ///       "account": "pharma1120468",
+        ///       "role": "藥師",
+        ///       "is_locked": "N",
+        ///       "fail_count": "0",
+        ///       "last_login_at": "2026/05/10 08:30:15",
+        ///       "last_logout_at": "2026/05/10 17:10:02",
+        ///       "created_at": "2026/04/01 09:00:00",
+        ///       "updated_at": "2026/05/10 17:10:02"
+        ///     },
+        ///     {
+        ///       "GUID": "E5F6G7H8",
+        ///       "staff_id": "1120508",
+        ///       "staff_name": "許子鴻",
+        ///       "staff_simple_name": "鴻",
+        ///       "account": "pharma1120508",
+        ///       "role": "藥師",
+        ///       "is_locked": "Y",
+        ///       "fail_count": "5",
+        ///       "last_login_at": "2026/05/09 07:12:44",
+        ///       "last_logout_at": "2026/05/09 18:02:31",
+        ///       "created_at": "2026/04/01 09:05:00",
+        ///       "updated_at": "2026/05/10 10:22:11"
+        ///     }
+        ///   ],
+        ///   "TotalCount": 2,
+        ///   "TotalPages": 1,
+        ///   "CurrentPage": 1,
+        ///   "PageSize": 200
+        /// }
+        /// ```
+        ///
+        /// ## ❌ Response JSON 範例 (錯誤)
+        /// ```json
+        /// {
+        ///   "Code": -200,
+        ///   "Method": "get_registered_staffs",
+        ///   "Result": "Exception : 無法連線至資料庫"
+        /// }
+        /// ```
+        ///
+        /// ## 📑 注意事項  
+        /// - 本 API 僅查詢已註冊帳號，不包含未註冊人員。  
+        /// - 若 <c>staff_auth</c> 有資料但 <c>StaffClass</c> 缺資料，仍會列出該筆已註冊帳號。  
+        /// - 前端若用於選人下拉，可搭配 <c>staff_id</c> / <c>staff_name</c> / <c>staff_simple_name</c> 模糊搜尋。  
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求與回應內容，包含查詢條件、分頁與排序設定</param>
+        /// <returns>JSON 格式字串，包含已註冊人員清單、分頁資訊與執行結果</returns>
+        [Authorize]
+        [HttpPost("get_registered_staffs")]
+        public string get_registered_staffs([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "get_registered_staffs";
+
+            try
+            {
+                if (returnData.Data == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "Data 不能為空";
+                    return returnData.JsonSerializationt();
+                }
+
+                string GetVal(string key) =>
+                    returnData.ValueAry
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string staff_id = GetVal("staff_id") ?? "";
+                string staff_name = GetVal("staff_name") ?? "";
+                string staff_simple_name = GetVal("staff_simple_name") ?? "";
+                string account = GetVal("account") ?? "";
+                string role = GetVal("role") ?? "";
+                string is_locked = GetVal("is_locked") ?? "";
+
+                int page = GetVal("page").StringToInt32();
+                int pageSize = GetVal("pageSize").StringToInt32();
+                string sortBy = GetVal("sortBy") ?? "staff_id";
+                string sortOrder = GetVal("sortOrder") ?? "asc";
+
+                if (page <= 0) page = 1;
+                if (pageSize <= 0) pageSize = 200;
+
+                sortOrder = sortOrder.ToLower() == "desc" ? "desc" : "asc";
+
+                var sql_staffAuthClass = MethodClass.GetSQLControl<StaffAuthClass>();
+
+                DataTable dtAuth = sql_staffAuthClass.WtrteCommandAndExecuteReader(
+                    $"select * from {sql_staffAuthClass.Database}.{sql_staffAuthClass.TableName}"
+                );
+
+                List<StaffAuthClass> staffAuthClasses = dtAuth.SQLToClass<StaffAuthClass>();
+
+                List<RegisteredStaffView> registeredStaffViews = new List<RegisteredStaffView>();
+
+                foreach (StaffAuthClass authClass in staffAuthClasses)
+                {
+                    if (authClass == null) continue;
+
+                    StaffClass staffClass = staff
+                        .GetStaffs(new List<string>() { $"staff_id={authClass.staff_id}" })
+                        .staffClasses
+                        .FirstOrDefault();
+
+                    RegisteredStaffView view = new RegisteredStaffView
+                    {
+                        GUID = authClass.GUID ?? "",
+                        staff_id = authClass.staff_id ?? "",
+                        staff_name = staffClass?.staff_name ?? "",
+                        staff_simple_name = staffClass?.staff_simple_name ?? "",
+                        account = authClass.account ?? "",
+                        role = staffClass?.role ?? "",
+                        is_locked = authClass.is_locked ?? "",
+                        fail_count = authClass.fail_count ?? "",
+                        last_login_at = authClass.last_login_at ?? "",
+                        last_logout_at = authClass.last_logout_at ?? "",
+                        created_at = authClass.created_at ?? "",
+                        updated_at = authClass.updated_at ?? ""
+                    };
+
+                    registeredStaffViews.Add(view);
+                }
+
+                // 搜尋
+                if (staff_id.StringIsEmpty() == false)
+                {
+                    registeredStaffViews = registeredStaffViews
+                        .Where(x => (x.staff_id ?? "").Contains(staff_id, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+
+                if (staff_name.StringIsEmpty() == false)
+                {
+                    registeredStaffViews = registeredStaffViews
+                        .Where(x => (x.staff_name ?? "").Contains(staff_name, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+
+                if (staff_simple_name.StringIsEmpty() == false)
+                {
+                    registeredStaffViews = registeredStaffViews
+                        .Where(x => (x.staff_simple_name ?? "").Contains(staff_simple_name, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+
+                if (account.StringIsEmpty() == false)
+                {
+                    registeredStaffViews = registeredStaffViews
+                        .Where(x => (x.account ?? "").Contains(account, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+
+                if (role.StringIsEmpty() == false)
+                {
+                    registeredStaffViews = registeredStaffViews
+                        .Where(x => (x.role ?? "").Contains(role, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+
+                if (is_locked.StringIsEmpty() == false)
+                {
+                    registeredStaffViews = registeredStaffViews
+                        .Where(x => string.Equals(x.is_locked ?? "", is_locked, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+                }
+
+                // 排序
+                switch (sortBy.ToLower())
+                {
+                    case "staff_name":
+                        registeredStaffViews = sortOrder == "desc"
+                            ? registeredStaffViews.OrderByDescending(x => x.staff_name).ToList()
+                            : registeredStaffViews.OrderBy(x => x.staff_name).ToList();
+                        break;
+
+                    case "account":
+                        registeredStaffViews = sortOrder == "desc"
+                            ? registeredStaffViews.OrderByDescending(x => x.account).ToList()
+                            : registeredStaffViews.OrderBy(x => x.account).ToList();
+                        break;
+
+                    case "created_at":
+                        registeredStaffViews = sortOrder == "desc"
+                            ? registeredStaffViews.OrderByDescending(x => x.created_at.StringToDateTime()).ToList()
+                            : registeredStaffViews.OrderBy(x => x.created_at.StringToDateTime()).ToList();
+                        break;
+
+                    case "updated_at":
+                        registeredStaffViews = sortOrder == "desc"
+                            ? registeredStaffViews.OrderByDescending(x => x.updated_at.StringToDateTime()).ToList()
+                            : registeredStaffViews.OrderBy(x => x.updated_at.StringToDateTime()).ToList();
+                        break;
+
+                    default:
+                        registeredStaffViews = sortOrder == "desc"
+                            ? registeredStaffViews.OrderByDescending(x => x.staff_id).ToList()
+                            : registeredStaffViews.OrderBy(x => x.staff_id).ToList();
+                        break;
+                }
+
+                int totalCount = registeredStaffViews.Count;
+                int totalPages = (int)Math.Ceiling(totalCount / (double)pageSize);
+
+                registeredStaffViews = registeredStaffViews
+                    .Skip((page - 1) * pageSize)
+                    .Take(pageSize)
+                    .ToList();
+
+                returnData.Code = 200;
+                returnData.Data = registeredStaffViews;
+                returnData.Result = $"共取得({registeredStaffViews.Count})筆已註冊人員資料";
+                returnData.TimeTaken = $"{timer}";
+                returnData.AddExtra("TotalCount", totalCount.ToString());
+                returnData.AddExtra("TotalPages", totalPages.ToString());
+                returnData.AddExtra("CurrentPage", page.ToString());
+                returnData.AddExtra("PageSize", pageSize.ToString());
+
+                return returnData.JsonSerializationt();
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = $"Exception : {ex.Message}";
+                return returnData.JsonSerializationt();
             }
         }
 
@@ -806,7 +1113,7 @@ namespace PharmaRosterAPI
         /// <remarks>
         /// ## 📌 用途  
         /// 由授權使用者（例如管理員或系統帳號）重設指定員工的登入密碼。  
-        /// 系統會自動產生一組臨時密碼 (temporary password)，並更新資料庫雜湊與 Salt。  
+        /// 系統會自動產生一組臨時密碼 (temporary password)，並更新資料庫中的密碼雜湊與 Salt。  
         /// 目的是協助使用者忘記密碼或帳號鎖定時重新登入。
         ///
         /// ## ⚙️ 功能說明  
@@ -814,14 +1121,14 @@ namespace PharmaRosterAPI
         /// 2. 接收查詢條件 (`staff_id` 或 `account`)。  
         /// 3. 查詢 <c>StaffAuthClass</c> 取得授權資料。  
         /// 4. 產生隨機臨時密碼，並以新 Salt + Hash 儲存至資料庫。  
-        /// 5. 重設後自動解除鎖定 (`is_locked = N`)、清除錯誤計數 (`fail_count = 0`)、更新時間。  
-        /// 6. 回傳臨時密碼，使用者應於首次登入後強制修改密碼。  
+        /// 5. 重設後自動解除鎖定 (`is_locked = N`)、清除錯誤計數 (`fail_count = 0`)、更新 `updated_at`。  
+        /// 6. 回傳臨時密碼，使用者應於首次登入後儘速自行修改密碼。
         ///
         /// ## 🔐 安全機制  
         /// - 僅限具有 JWT 權杖的授權人員呼叫 (通常為管理員)。  
         /// - 所有密碼皆以 Salt + SHA256 雜湊儲存。  
         /// - 系統不回傳原密碼，僅提供隨機產生的臨時密碼。  
-        /// - 呼叫後原 Token 會失效，需重新登入。  
+        /// - 建議前端於重設成功後，通知使用者重新登入。  
         /// - 建議搭配操作日誌紀錄 (Audit Trail)。
         ///
         /// ## 📥 Request JSON 範例
@@ -834,6 +1141,7 @@ namespace PharmaRosterAPI
         ///   "Data": {}
         /// }
         /// ```
+        ///
         /// 或使用帳號查詢：
         /// ```json
         /// {
@@ -854,8 +1162,8 @@ namespace PharmaRosterAPI
         /// **備註：** `staff_id` 與 `account` 至少需擇一提供。  
         ///
         /// ## 🔑 Header 範例  
-        /// ```
-        /// Authorization: Bearer <JWT Token>
+        /// ```text
+        /// Authorization: Bearer JWT Token
         /// ```
         ///
         /// ## 📤 Response JSON 範例 (成功)
@@ -874,19 +1182,24 @@ namespace PharmaRosterAPI
         /// ```
         ///
         /// ## ❌ Response JSON 範例 (錯誤)
+        /// - Data 為空：  
+        /// ```json
+        /// { "Code": -200, "Method": "reset_password", "Result": "Data 不能為空" }
+        /// ```
+        ///
         /// - 未提供任何條件：  
         /// ```json
-        /// { "Code": -200, "Result": "請提供 staff_id 或 account" }
+        /// { "Code": -200, "Method": "reset_password", "Result": "請提供 staff_id 或 account" }
         /// ```
         ///
         /// - 查無帳號：  
         /// ```json
-        /// { "Code": -200, "Result": "帳號授權資料不存在" }
+        /// { "Code": -200, "Method": "reset_password", "Result": "帳號授權資料不存在" }
         /// ```
         ///
         /// - 系統例外：  
         /// ```json
-        /// { "Code": -200, "Result": "Exception : 資料庫連線失敗" }
+        /// { "Code": -200, "Method": "reset_password", "Result": "Exception : 資料庫連線失敗" }
         /// ```
         ///
         /// ## 🔒 安全建議  
@@ -896,11 +1209,10 @@ namespace PharmaRosterAPI
         /// - 此動作應納入「帳號異動紀錄」或「安全稽核表」中。  
         /// </remarks>
         /// <param name="returnData">封裝 API 請求與回應內容，包含 JWT Token、查詢條件與回傳結果</param>
-        /// <returns>JSON 格式字串，包含密碼重設結果與臨時密碼</returns>
-        [Authorize]
+        /// <returns>JSON 格式字串，包含密碼重設結果與臨時密碼</returns>    
         [HttpPost]
         [Route("reset_password")]
-        public string reset_password(returnData returnData)
+        public string reset_password([FromBody] returnData returnData)
         {
             var timer = new MyTimerBasic();
             returnData.Method = "reset_password";
@@ -914,10 +1226,18 @@ namespace PharmaRosterAPI
                     return returnData.JsonSerializationt();
                 }
 
-                string GetVal(string key) =>
-                    returnData.ValueAry
-                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
-                        ?.Split('=')[1];
+                string GetVal(string key)
+                {
+                    string raw = returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase));
+
+                    if (string.IsNullOrWhiteSpace(raw)) return "";
+
+                    int idx = raw.IndexOf('=');
+                    if (idx < 0 || idx == raw.Length - 1) return "";
+
+                    return raw.Substring(idx + 1);
+                }
 
                 string staffId = GetVal("staff_id");
                 string account = GetVal("account");
@@ -929,11 +1249,15 @@ namespace PharmaRosterAPI
                     return returnData.JsonSerializationt();
                 }
 
+                // 基本跳脫，降低 SQL Injection 風險
+                string staffIdSafe = (staffId ?? "").Replace("'", "''");
+                string accountSafe = (account ?? "").Replace("'", "''");
+
                 var sql = MethodClass.GetSQLControl<StaffAuthClass>();
 
                 string where = !staffId.StringIsEmpty()
-                    ? $"staff_id = '{staffId}'"
-                    : $"account = '{account}'";
+                    ? $"staff_id = '{staffIdSafe}'"
+                    : $"account = '{accountSafe}'";
 
                 DataTable dt = sql.WtrteCommandAndExecuteReader(
                     $"select * from {sql.Database}.{sql.TableName} where {where}"
@@ -948,7 +1272,7 @@ namespace PharmaRosterAPI
                     return returnData.JsonSerializationt();
                 }
 
-                // === 產生臨時密碼 ===
+                // 產生臨時密碼
                 string tempPassword = GenerateTempPassword();
 
                 string salt = PasswordHashHelper.GenerateSalt();
@@ -957,22 +1281,23 @@ namespace PharmaRosterAPI
                 auth.password_salt = salt;
                 auth.password_hash = hash;
 
-                // 強制登出
-                auth.last_login_at = DateTime.Now.ToDateTimeString();
-                auth.updated_at = DateTime.Now.ToDateTimeString();
+                // 解除鎖定並重置錯誤次數
                 auth.fail_count = "0";
                 auth.is_locked = "N";
+                auth.updated_at = DateTime.Now.ToDateTimeString();
 
                 sql.UpdateByDefulteExtra(null, auth.ClassToSQL<StaffAuthClass>());
 
                 returnData.Code = 200;
                 returnData.Result = "密碼已重設";
-                returnData.Data = new
+                ResetPasswordResponse response = new ResetPasswordResponse
                 {
                     staff_id = auth.staff_id,
                     account = auth.account,
                     temp_password = tempPassword
                 };
+
+                returnData.Data = response;
                 returnData.TimeTaken = $"{timer}";
                 return returnData.JsonSerializationt();
             }
