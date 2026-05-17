@@ -55,6 +55,7 @@ namespace PharmaRosterAPI
                 tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<DayOffGroupMemberClass>());
                 tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<StaffDayOffOptionLogClass>());
                 tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<DayOffReleasePoolClass>());
+                tables.Add(PharmaRosterLib.MethodClass.CheckCreatTable<DayOffScheduleLeaveClass>());
 
 
                 returnData.Code = 200;
@@ -68,6 +69,762 @@ namespace PharmaRosterAPI
                 returnData.Code = -200;
                 returnData.Result = $"Exception: {ex.Message}";
                 return returnData.JsonSerializationt(true);
+            }
+        }
+
+        /// <summary>
+        /// 查詢排休表單專用請假清單（get_dayoff_schedule_leaves）
+        /// </summary>
+        /// <remarks>
+        /// ## API URL
+        /// `POST /phar_roster_api/dayOffSchedule/get_dayoff_schedule_leaves`
+        ///
+        /// ## 功能說明
+        /// 查詢指定排休表單中的專用請假資料。此資料與一般 `leave_requests` 分開管理，
+        /// 用於排休流程中判斷人員不可選假日期，以及後續扣減每日可休名額。
+        ///
+        /// ## Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "get_dayoff_schedule_leaves",
+        ///   "ValueAry": [
+        ///     "form_name=2026-06排休",
+        ///     "staff_id=STAFF001",
+        ///     "start_date=2026-06-01",
+        ///     "end_date=2026-06-30"
+        ///   ],
+        ///   "Data": {}
+        /// }
+        /// ```
+        ///
+        /// ## 參數說明
+        /// | 參數名稱 | 類型 | 必填 | 範例 | 說明 |
+        /// |----------|------|------|------|------|
+        /// | form_guid | string | 否 | FORM-GUID | 排休表單 GUID |
+        /// | form_name | string | 否 | 2026-06排休 | 排休表單名稱 |
+        /// | staff_guid | string | 否 | STAFF-GUID | 人員 GUID |
+        /// | staff_id | string | 否 | STAFF001 | 人員工號 |
+        /// | start_date | string | 否 | 2026-06-01 | 查詢起始日期 |
+        /// | end_date | string | 否 | 2026-06-30 | 查詢結束日期 |
+        ///
+        /// ## 回傳範例
+        /// ```json
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "get_dayoff_schedule_leaves",
+        ///   "Result": "共取得(1)筆資料",
+        ///   "Data": [
+        ///     {
+        ///       "GUID": "LEAVE-GUID",
+        ///       "form_guid": "FORM-GUID",
+        ///       "staff_id": "STAFF001",
+        ///       "staff_name": "王小明",
+        ///       "leave_type": "LONG_LEAVE",
+        ///       "leave_period": "FULL",
+        ///       "start_date": "2026-06-03",
+        ///       "end_date": "2026-06-05",
+        ///       "source_type": "MANUAL"
+        ///     }
+        ///   ]
+        /// }
+        /// ```
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容的物件，查詢條件放在 ValueAry。</param>
+        /// <returns>JSON 格式的排休專用請假清單。</returns>
+        [HttpPost("get_dayoff_schedule_leaves")]
+        public string get_dayoff_schedule_leaves([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "get_dayoff_schedule_leaves";
+
+            try
+            {
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string formGuid = GetVal("form_guid") ?? "";
+                string formName = GetVal("form_name") ?? "";
+                string staffGuid = GetVal("staff_guid") ?? "";
+                string staffId = GetVal("staff_id") ?? "";
+                string startDateText = GetVal("start_date") ?? "";
+                string endDateText = GetVal("end_date") ?? "";
+
+                var sql_form = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_leave = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
+                var sql_staff = MethodClass.GetSQLControl<StaffClass>();
+
+                DayOffScheduleFormClass form = ResolveDayOffForm(sql_form, formGuid, formName, out string formError);
+                if (!formGuid.StringIsEmpty() || !formName.StringIsEmpty())
+                {
+                    if (form == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = formError;
+                        return returnData.JsonSerializationt();
+                    }
+                    formGuid = form.GUID;
+                }
+
+                DateTime? filterStart = ParseNullableDate(startDateText);
+                DateTime? filterEnd = ParseNullableDate(endDateText);
+                if (filterStart.HasValue && filterEnd.HasValue && filterStart.Value.Date > filterEnd.Value.Date)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "start_date 不可大於 end_date";
+                    return returnData.JsonSerializationt();
+                }
+
+                List<DayOffScheduleLeaveClass> leaves = sql_leave.GetAllRows(null)
+                    .SQLToClass<DayOffScheduleLeaveClass>() ?? new List<DayOffScheduleLeaveClass>();
+
+                if (!formGuid.StringIsEmpty()) leaves = leaves.Where(x => x.form_guid == formGuid).ToList();
+                if (!staffGuid.StringIsEmpty()) leaves = leaves.Where(x => x.staff_guid == staffGuid).ToList();
+                if (!staffId.StringIsEmpty()) leaves = leaves.Where(x => x.staff_id == staffId).ToList();
+
+                if (filterStart.HasValue || filterEnd.HasValue)
+                {
+                    DateTime rangeStart = filterStart ?? DateTime.MinValue.Date;
+                    DateTime rangeEnd = filterEnd ?? DateTime.MaxValue.Date;
+                    leaves = leaves.Where(x =>
+                    {
+                        if (!TryGetLeaveRange(x, out DateTime leaveStart, out DateTime leaveEnd)) return false;
+                        return DateRangesOverlap(leaveStart, leaveEnd, rangeStart, rangeEnd);
+                    }).ToList();
+                }
+
+                List<StaffClass> staffs = sql_staff.GetAllRows(null).SQLToClass<StaffClass>() ?? new List<StaffClass>();
+                Dictionary<string, StaffClass> staffByGuid = staffs
+                    .Where(x => x != null && !x.GUID.StringIsEmpty())
+                    .GroupBy(x => x.GUID)
+                    .ToDictionary(g => g.Key, g => g.First());
+
+                foreach (var leave in leaves)
+                {
+                    if (leave != null && !leave.staff_guid.StringIsEmpty() && staffByGuid.ContainsKey(leave.staff_guid))
+                    {
+                        leave.staff_info = staffByGuid[leave.staff_guid];
+                    }
+                }
+
+                leaves = leaves
+                    .OrderBy(x => x.start_date.StringToDateTime())
+                    .ThenBy(x => x.staff_id)
+                    .ToList();
+
+                returnData.Code = 200;
+                returnData.Result = $"共取得({leaves.Count})筆資料";
+                returnData.Data = leaves;
+                returnData.TimeTaken = $"{timer}";
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 新增或更新排休表單專用請假（add_and_update_dayoff_schedule_leaves）
+        /// </summary>
+        /// <remarks>
+        /// ## API URL
+        /// `POST /phar_roster_api/dayOffSchedule/add_and_update_dayoff_schedule_leaves`
+        ///
+        /// ## 功能說明
+        /// 批次新增或更新排休專用請假。系統會檢查：
+        /// 1. 表單與人員是否存在。
+        /// 2. 假別與請假時段是否合法。
+        /// 3. 同一人同一張排休表中，請假日期與時段不可重疊。
+        /// 4. 若請假日期與時段已經選擇排休，會阻擋新增或更新。
+        ///
+        /// ## Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "add_and_update_dayoff_schedule_leaves",
+        ///   "ValueAry": [
+        ///     "form_name=2026-06排休"
+        ///   ],
+        ///   "Data": [
+        ///     {
+        ///       "GUID": "",
+        ///       "staff_id": "STAFF001",
+        ///       "leave_type": "LONG_LEAVE",
+        ///       "leave_period": "FULL",
+        ///       "start_date": "2026-06-03",
+        ///       "end_date": "2026-06-05",
+        ///       "reason": "長假",
+        ///       "source_type": "MANUAL"
+        ///     }
+        ///   ]
+        /// }
+        /// ```
+        ///
+        /// ## 欄位說明
+        /// | 欄位名稱 | 類型 | 必填 | 範例 | 說明 |
+        /// |----------|------|------|------|------|
+        /// | GUID | string | 否 | LEAVE-GUID | 空白代表新增，有值代表更新 |
+        /// | form_guid | string | 否 | FORM-GUID | 可由 ValueAry 的 form_name 代替 |
+        /// | staff_guid | string | 否 | STAFF-GUID | 可由 staff_id 代替 |
+        /// | staff_id | string | 否 | STAFF001 | 人員工號 |
+        /// | leave_type | string | 是 | LONG_LEAVE | LONG_LEAVE / MARRIAGE / FUNERAL / SPECIAL / OTHER |
+        /// | leave_period | string | 是 | FULL | FULL / AM / PM |
+        /// | start_date | string | 是 | 2026-06-03 | 請假開始日期 |
+        /// | end_date | string | 是 | 2026-06-05 | 請假結束日期 |
+        /// | reason | string | 否 | 長假 | 備註 |
+        /// | source_type | string | 否 | MANUAL | MANUAL / LEAVE_REQUEST |
+        ///
+        /// ## 回傳範例
+        /// ```json
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "add_and_update_dayoff_schedule_leaves",
+        ///   "Result": "新增(1)筆資料,修改(0)筆資料",
+        ///   "Data": []
+        /// }
+        /// ```
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容的物件，Data 為 DayOffScheduleLeaveClass 陣列。</param>
+        /// <returns>JSON 格式的新增或更新結果。</returns>
+        [HttpPost("add_and_update_dayoff_schedule_leaves")]
+        public string add_and_update_dayoff_schedule_leaves([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "add_and_update_dayoff_schedule_leaves";
+
+            try
+            {
+                if (returnData.Data == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "Data 不能為空";
+                    return returnData.JsonSerializationt();
+                }
+
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string requestFormGuid = GetVal("form_guid") ?? "";
+                string requestFormName = GetVal("form_name") ?? "";
+
+                List<DayOffScheduleLeaveClass> input = returnData.Data.ObjToClass<List<DayOffScheduleLeaveClass>>();
+                if (input == null || input.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "Data 格式錯誤或無有效資料";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_form = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_staff = MethodClass.GetSQLControl<StaffClass>();
+                var sql_leave = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
+                var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_item = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+
+                List<DayOffScheduleLeaveClass> existingLeaves = sql_leave.GetAllRows(null)
+                    .SQLToClass<DayOffScheduleLeaveClass>() ?? new List<DayOffScheduleLeaveClass>();
+
+                var datasAdd = new List<DayOffScheduleLeaveClass>();
+                var datasUpdate = new List<DayOffScheduleLeaveClass>();
+                string now = DateTime.Now.ToDateTimeString_6();
+
+                foreach (var leave in input)
+                {
+                    DayOffScheduleFormClass form = ResolveDayOffForm(
+                        sql_form,
+                        leave.form_guid.StringIsEmpty() ? requestFormGuid : leave.form_guid,
+                        requestFormName,
+                        out string formError);
+
+                    if (form == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = formError;
+                        return returnData.JsonSerializationt();
+                    }
+                    leave.form_guid = form.GUID;
+
+                    StaffClass staffInfo = ResolveStaff(sql_staff, leave.staff_guid, leave.staff_id, out string staffError);
+                    if (staffInfo == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = staffError;
+                        return returnData.JsonSerializationt();
+                    }
+                    leave.staff_guid = staffInfo.GUID;
+                    leave.staff_id = staffInfo.staff_id;
+                    leave.staff_name = staffInfo.staff_name;
+
+                    leave.leave_type = NormalizeLeaveType(leave.leave_type);
+                    if (!IsValidLeaveType(leave.leave_type))
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "leave_type 必須為 LONG_LEAVE / MARRIAGE / FUNERAL / SPECIAL / OTHER";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    leave.leave_period = NormalizeLeavePeriod(leave.leave_period);
+                    if (!IsValidLeavePeriod(leave.leave_period))
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "leave_period 必須為 FULL / AM / PM";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (!TryNormalizeLeaveDates(leave, out DateTime leaveStart, out DateTime leaveEnd, out string dateError))
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = dateError;
+                        return returnData.JsonSerializationt();
+                    }
+
+                    string overlapError = FindDayOffLeaveOverlap(existingLeaves, leave, leaveStart, leaveEnd);
+                    if (!overlapError.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = overlapError;
+                        return returnData.JsonSerializationt();
+                    }
+
+                    string scheduledConflict = FindScheduledWorkConflict(sql_item, leave, leaveStart, leaveEnd);
+                    if (!scheduledConflict.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = scheduledConflict;
+                        return returnData.JsonSerializationt();
+                    }
+
+                    string selectedConflict = FindSelectedDayoffConflict(sql_option, leave, leaveStart, leaveEnd);
+                    if (!selectedConflict.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = selectedConflict;
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (leave.source_type.StringIsEmpty()) leave.source_type = "MANUAL";
+                    leave.source_type = leave.source_type.Trim().ToUpperInvariant();
+                    leave.updated_at = now;
+
+                    List<object[]> rows = leave.GUID.StringIsEmpty()
+                        ? new List<object[]>()
+                        : sql_leave.GetRowsByDefult(null, "GUID", leave.GUID);
+
+                    if (rows.Count == 0)
+                    {
+                        leave.GUID = Guid.NewGuid().ToString();
+                        leave.created_at = now;
+                        datasAdd.Add(leave);
+                        existingLeaves.Add(leave);
+                    }
+                    else
+                    {
+                        DayOffScheduleLeaveClass dbLeave = rows[0].SQLToClass<DayOffScheduleLeaveClass>();
+                        leave.GUID = dbLeave.GUID;
+                        leave.created_at = dbLeave.created_at.StringIsEmpty() ? now : dbLeave.created_at;
+                        datasUpdate.Add(leave);
+
+                        int index = existingLeaves.FindIndex(x => x.GUID == leave.GUID);
+                        if (index >= 0) existingLeaves[index] = leave;
+                    }
+                }
+
+                if (datasAdd.Count > 0) sql_leave.AddRows(null, datasAdd.ClassToSQL<DayOffScheduleLeaveClass>());
+                if (datasUpdate.Count > 0) sql_leave.UpdateByDefulteExtra(null, datasUpdate.ClassToSQL<DayOffScheduleLeaveClass>());
+
+                returnData.Code = 200;
+                returnData.Result = $"新增({datasAdd.Count})筆資料,修改({datasUpdate.Count})筆資料";
+                returnData.Data = datasAdd.Concat(datasUpdate).ToList();
+                returnData.TimeTaken = $"{timer}";
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 刪除排休表單專用請假（delete_dayoff_schedule_leaves）
+        /// </summary>
+        /// <remarks>
+        /// ## API URL
+        /// `POST /phar_roster_api/dayOffSchedule/delete_dayoff_schedule_leaves`
+        ///
+        /// ## 功能說明
+        /// 依 GUID 批次刪除排休專用請假資料。刪除後不會影響原本的一般 `leave_requests`。
+        ///
+        /// ## Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "delete_dayoff_schedule_leaves",
+        ///   "Data": [
+        ///     { "GUID": "LEAVE-GUID" }
+        ///   ]
+        /// }
+        /// ```
+        ///
+        /// ## 回傳範例
+        /// ```json
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "delete_dayoff_schedule_leaves",
+        ///   "Result": "刪除(1)筆資料",
+        ///   "Data": []
+        /// }
+        /// ```
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容的物件，Data 需包含欲刪除資料的 GUID。</param>
+        /// <returns>JSON 格式的刪除結果。</returns>
+        [HttpPost("delete_dayoff_schedule_leaves")]
+        public string delete_dayoff_schedule_leaves([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "delete_dayoff_schedule_leaves";
+
+            try
+            {
+                if (returnData.Data == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "Data 不能為空";
+                    return returnData.JsonSerializationt();
+                }
+
+                List<DayOffScheduleLeaveClass> input = returnData.Data.ObjToClass<List<DayOffScheduleLeaveClass>>();
+                if (input == null || input.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "Data 格式錯誤或無有效資料";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_leave = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
+                var rowsDelete = new List<object[]>();
+
+                foreach (var leave in input)
+                {
+                    if (leave.GUID.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "GUID 為必填";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    List<object[]> rows = sql_leave.GetRowsByDefult(null, "GUID", leave.GUID);
+                    if (rows.Count > 0) rowsDelete.Add(rows[0]);
+                }
+
+                if (rowsDelete.Count > 0) sql_leave.DeleteExtra(null, rowsDelete);
+
+                returnData.Code = 200;
+                returnData.Result = $"刪除({rowsDelete.Count})筆資料";
+                returnData.Data = new List<DayOffScheduleLeaveClass>();
+                returnData.TimeTaken = $"{timer}";
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
+            }
+        }
+
+        /// <summary>
+        /// 從一般請假資料匯入排休表單專用請假（import_dayoff_schedule_leaves_from_leave_requests）
+        /// </summary>
+        /// <remarks>
+        /// ## API URL
+        /// `POST /phar_roster_api/dayOffSchedule/import_dayoff_schedule_leaves_from_leave_requests`
+        ///
+        /// ## 功能說明
+        /// 從原本的 `leave_requests` 選擇資料匯入到指定排休表單的 `dayoff_schedule_leave`。
+        /// 匯入後不會與原始 `leave_requests` 自動同步；同一張排休表單中同一筆來源請假重複匯入時，會更新既有排休專用請假。
+        ///
+        /// ## 匯入規則
+        /// 1. 前端每筆需指定來源 leaveRequest GUID、排休用假別與請假時段。
+        /// 2. 來源請假日期若超出排休表單日期範圍，只匯入落在表單內的日期區間。
+        /// 3. 若來源請假日期完全不在排休表單日期範圍內，該筆會略過不匯入。
+        /// 4. 匯入時會檢查同人同日請假時段不可重疊。
+        /// 5. 匯入時會檢查該日期若已有排班或已選排休，則阻擋匯入。
+        ///
+        /// ## Request JSON 範例
+        /// ```json
+        /// {
+        ///   "Method": "import_dayoff_schedule_leaves_from_leave_requests",
+        ///   "ValueAry": [
+        ///     "form_name=2026-06排休"
+        ///   ],
+        ///   "Data": [
+        ///     {
+        ///       "source_ref_guid": "LEAVE-REQUEST-GUID",
+        ///       "leave_type": "LONG_LEAVE",
+        ///       "leave_period": "FULL"
+        ///     }
+        ///   ]
+        /// }
+        /// ```
+        ///
+        /// ## Data 欄位說明
+        /// | 欄位名稱 | 類型 | 必填 | 範例 | 說明 |
+        /// |----------|------|------|------|------|
+        /// | source_ref_guid | string | 是 | LEAVE-REQUEST-GUID | 原本 leave_requests.GUID |
+        /// | leave_type | string | 是 | LONG_LEAVE | LONG_LEAVE / MARRIAGE / FUNERAL / SPECIAL / OTHER |
+        /// | leave_period | string | 是 | FULL | FULL / AM / PM |
+        ///
+        /// ## 回傳範例
+        /// ```json
+        /// {
+        ///   "Code": 200,
+        ///   "Method": "import_dayoff_schedule_leaves_from_leave_requests",
+        ///   "Result": "匯入完成：新增(1)筆,修改(0)筆,略過(0)筆",
+        ///   "Data": []
+        /// }
+        /// ```
+        /// </remarks>
+        /// <param name="returnData">封裝 API 請求內容的物件，ValueAry 指定表單，Data 指定來源請假與假別/時段。</param>
+        /// <returns>JSON 格式的匯入結果。</returns>
+        [HttpPost("import_dayoff_schedule_leaves_from_leave_requests")]
+        public string import_dayoff_schedule_leaves_from_leave_requests([FromBody] returnData returnData)
+        {
+            var timer = new MyTimerBasic();
+            returnData.Method = "import_dayoff_schedule_leaves_from_leave_requests";
+
+            try
+            {
+                if (returnData.Data == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "Data 不能為空";
+                    return returnData.JsonSerializationt();
+                }
+
+                string GetVal(string key) =>
+                    returnData.ValueAry?
+                        .FirstOrDefault(x => x.StartsWith($"{key}=", StringComparison.OrdinalIgnoreCase))
+                        ?.Split('=')[1];
+
+                string formGuid = GetVal("form_guid") ?? "";
+                string formName = GetVal("form_name") ?? "";
+
+                List<DayOffScheduleLeaveClass> importRequests = returnData.Data.ObjToClass<List<DayOffScheduleLeaveClass>>();
+                if (importRequests == null || importRequests.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = "Data 格式錯誤或無有效資料";
+                    return returnData.JsonSerializationt();
+                }
+
+                var sql_form = MethodClass.GetSQLControl<DayOffScheduleFormClass>();
+                var sql_day = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
+                var sql_staff = MethodClass.GetSQLControl<StaffClass>();
+                var sql_leaveRequest = MethodClass.GetSQLControl<LeaveRequestClass>();
+                var sql_dayoffLeave = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
+                var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_item = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+
+                DayOffScheduleFormClass form = ResolveDayOffForm(sql_form, formGuid, formName, out string formError);
+                if (form == null)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = formError;
+                    return returnData.JsonSerializationt();
+                }
+
+                List<DayOffScheduleDayClass> formDays = sql_day
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleDayClass>() ?? new List<DayOffScheduleDayClass>();
+
+                List<DateTime> formDates = formDays
+                    .Where(x => x != null && !x.date.StringIsEmpty())
+                    .Select(x => x.date.StringToDateTime().Date)
+                    .Where(x => x != DateTime.MinValue.Date)
+                    .Distinct()
+                    .OrderBy(x => x)
+                    .ToList();
+
+                if (formDates.Count == 0)
+                {
+                    returnData.Code = -200;
+                    returnData.Result = $"表單({form.form_name})沒有可匯入的日期資料";
+                    return returnData.JsonSerializationt();
+                }
+
+                DateTime formStart = formDates.First();
+                DateTime formEnd = formDates.Last();
+
+                List<DayOffScheduleLeaveClass> existingLeaves = sql_dayoffLeave.GetAllRows(null)
+                    .SQLToClass<DayOffScheduleLeaveClass>() ?? new List<DayOffScheduleLeaveClass>();
+
+                var datasAdd = new List<DayOffScheduleLeaveClass>();
+                var datasUpdate = new List<DayOffScheduleLeaveClass>();
+                var skipped = new List<object>();
+                string now = DateTime.Now.ToDateTimeString_6();
+
+                foreach (var request in importRequests)
+                {
+                    if (request.source_ref_guid.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "source_ref_guid 為必填";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    request.leave_type = NormalizeLeaveType(request.leave_type);
+                    if (!IsValidLeaveType(request.leave_type))
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "leave_type 必須為 LONG_LEAVE / MARRIAGE / FUNERAL / SPECIAL / OTHER";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    request.leave_period = NormalizeLeavePeriod(request.leave_period);
+                    if (!IsValidLeavePeriod(request.leave_period))
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = "leave_period 必須為 FULL / AM / PM";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    object[] objLeaveRequest = sql_leaveRequest
+                        .GetRowsByDefult(null, "GUID", request.source_ref_guid)
+                        .FirstOrDefault();
+
+                    if (objLeaveRequest == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"找不到 leaveRequest GUID={request.source_ref_guid}";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    LeaveRequestClass sourceLeave = objLeaveRequest.SQLToClass<LeaveRequestClass>();
+                    if (!DateTime.TryParse(sourceLeave.start_date, out DateTime sourceStart) ||
+                        !DateTime.TryParse(sourceLeave.end_date, out DateTime sourceEnd))
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"來源請假日期格式錯誤 GUID={request.source_ref_guid}";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    sourceStart = sourceStart.Date;
+                    sourceEnd = sourceEnd.Date;
+                    if (sourceStart > sourceEnd)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"來源請假 start_date 不可大於 end_date GUID={request.source_ref_guid}";
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (!DateRangesOverlap(sourceStart, sourceEnd, formStart, formEnd))
+                    {
+                        skipped.Add(new
+                        {
+                            source_ref_guid = request.source_ref_guid,
+                            reason = "來源請假日期不在排休表單日期範圍內"
+                        });
+                        continue;
+                    }
+
+                    StaffClass staffInfo = ResolveStaff(sql_staff, sourceLeave.staff_guid, "", out string staffError);
+                    if (staffInfo == null)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = staffError;
+                        return returnData.JsonSerializationt();
+                    }
+
+                    DateTime clippedStart = sourceStart < formStart ? formStart : sourceStart;
+                    DateTime clippedEnd = sourceEnd > formEnd ? formEnd : sourceEnd;
+
+                    DayOffScheduleLeaveClass leave = existingLeaves.FirstOrDefault(x =>
+                        x != null &&
+                        x.form_guid == form.GUID &&
+                        (x.source_type ?? "").Trim().ToUpperInvariant() == "LEAVE_REQUEST" &&
+                        x.source_ref_guid == request.source_ref_guid);
+
+                    bool isUpdate = leave != null;
+                    if (!isUpdate)
+                    {
+                        leave = new DayOffScheduleLeaveClass
+                        {
+                            GUID = Guid.NewGuid().ToString(),
+                            created_at = now
+                        };
+                    }
+
+                    leave.form_guid = form.GUID;
+                    leave.staff_guid = staffInfo.GUID;
+                    leave.staff_id = staffInfo.staff_id;
+                    leave.staff_name = staffInfo.staff_name;
+                    leave.leave_type = request.leave_type;
+                    leave.leave_period = request.leave_period;
+                    leave.start_date = clippedStart.ToDateString('-');
+                    leave.end_date = clippedEnd.ToDateString('-');
+                    leave.reason = sourceLeave.reason;
+                    leave.source_type = "LEAVE_REQUEST";
+                    leave.source_ref_guid = request.source_ref_guid;
+                    leave.updated_at = now;
+
+                    string overlapError = FindDayOffLeaveOverlap(existingLeaves, leave, clippedStart, clippedEnd);
+                    if (!overlapError.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = overlapError;
+                        return returnData.JsonSerializationt();
+                    }
+
+                    string scheduledConflict = FindScheduledWorkConflict(sql_item, leave, clippedStart, clippedEnd);
+                    if (!scheduledConflict.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = scheduledConflict;
+                        return returnData.JsonSerializationt();
+                    }
+
+                    string selectedConflict = FindSelectedDayoffConflict(sql_option, leave, clippedStart, clippedEnd);
+                    if (!selectedConflict.StringIsEmpty())
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = selectedConflict;
+                        return returnData.JsonSerializationt();
+                    }
+
+                    if (isUpdate)
+                    {
+                        datasUpdate.Add(leave);
+                        int index = existingLeaves.FindIndex(x => x.GUID == leave.GUID);
+                        if (index >= 0) existingLeaves[index] = leave;
+                    }
+                    else
+                    {
+                        datasAdd.Add(leave);
+                        existingLeaves.Add(leave);
+                    }
+                }
+
+                if (datasAdd.Count > 0) sql_dayoffLeave.AddRows(null, datasAdd.ClassToSQL<DayOffScheduleLeaveClass>());
+                if (datasUpdate.Count > 0) sql_dayoffLeave.UpdateByDefulteExtra(null, datasUpdate.ClassToSQL<DayOffScheduleLeaveClass>());
+
+                returnData.Code = 200;
+                returnData.Result = $"匯入完成：新增({datasAdd.Count})筆,修改({datasUpdate.Count})筆,略過({skipped.Count})筆";
+                returnData.Data = datasAdd.Concat(datasUpdate).ToList();
+                returnData.AddExtra("Skipped", skipped);
+                returnData.TimeTaken = $"{timer}";
+                return returnData.JsonSerializationt(true);
+            }
+            catch (Exception ex)
+            {
+                returnData.Code = -200;
+                returnData.Result = ex.Message;
+                return returnData.JsonSerializationt();
             }
         }
 
@@ -2387,6 +3144,7 @@ namespace PharmaRosterAPI
                 var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
                 var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffScheduleLeaveClass = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
                 object[] objForm = sql_dayOffScheduleFormClass
                     .GetRowsByDefult(null, "form_name", form_name)
@@ -2412,6 +3170,12 @@ namespace PharmaRosterAPI
                 List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
                     .GetRowsByDefult(null, "form_guid", form.GUID)
                     .SQLToClass<StaffDayOffOptionClass>();
+
+                List<DayOffScheduleLeaveClass> leaves = sql_dayOffScheduleLeaveClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleLeaveClass>() ?? new List<DayOffScheduleLeaveClass>();
+
+                Dictionary<string, int[]> leaveUsageByDate = BuildDayOffLeaveUsageByDate(form.GUID, leaves);
 
                 // item 依 day_guid 分組
                 Dictionary<string, List<DayOffScheduleItemClass>> itemsByDayGuid = items
@@ -2503,6 +3267,8 @@ namespace PharmaRosterAPI
                     int amSelected = 0;
                     int pmSelected = 0;
                     int ffSelected = 0;
+                    int amLeaveUsed = 0;
+                    int pmLeaveUsed = 0;
 
                     // ---------------------------
                     // Selected：用當天 items + option
@@ -2562,6 +3328,14 @@ namespace PharmaRosterAPI
                     else
                     {
                         day.items = new List<DayOffScheduleItemClass>();
+                    }
+
+                    if (leaveUsageByDate.TryGetValue(dt, out var leaveUsage))
+                    {
+                        amLeaveUsed = leaveUsage[0];
+                        pmLeaveUsed = leaveUsage[1];
+                        amSelected += amLeaveUsed;
+                        pmSelected += pmLeaveUsed;
                     }
 
                     // ---------------------------
@@ -3187,6 +3961,7 @@ namespace PharmaRosterAPI
                 var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
                 var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffScheduleLeaveClass = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
                 object[] obj_form = sql_dayOffScheduleFormClass
                     .GetRowsByDefult(null, "form_name", form_name)
@@ -3221,6 +3996,10 @@ namespace PharmaRosterAPI
                 List<StaffDayOffOptionClass> options = sql_staffDayOffOptionClass
                     .GetRowsByDefult(null, "form_guid", form.GUID)
                     .SQLToClass<StaffDayOffOptionClass>();
+
+                List<DayOffScheduleLeaveClass> leaves = sql_dayOffScheduleLeaveClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleLeaveClass>() ?? new List<DayOffScheduleLeaveClass>();
 
                 // 方便從 option 找回 staff_id / staff_name
                 Dictionary<string, DayOffScheduleItemClass> itemByGuid = items
@@ -3257,6 +4036,22 @@ namespace PharmaRosterAPI
                         dayoff_source_type = option?.dayoff_source_type ?? "",
                         option_guid = option?.GUID ?? "",
                         item_guid = option?.item_guid ?? ""
+                    };
+                }
+
+                DayoffDatePersonStatusDto BuildLeavePersonDto(DayOffScheduleLeaveClass leave, string dayoffType)
+                {
+                    return new DayoffDatePersonStatusDto
+                    {
+                        staff_guid = leave?.staff_guid ?? "",
+                        staff_id = leave?.staff_id ?? "",
+                        staff_name = leave?.staff_name ?? "",
+                        status_type = "LEAVE",
+                        dayoff_type = dayoffType,
+                        is_any_date = "false",
+                        dayoff_source_type = "DAYOFF_SCHEDULE_LEAVE",
+                        option_guid = "",
+                        item_guid = leave?.GUID ?? ""
                     };
                 }
 
@@ -3361,6 +4156,30 @@ namespace PharmaRosterAPI
               
                         dto.reserved_not_selected_count = (dto.reserved_not_selected_count.StringToInt32() + 1).ToString();
                         dto.reserved_not_selected_list.Add(BuildPersonDto(option, "RESERVED_NOT_SELECTED", "NONE"));
+                    }
+                }
+
+                foreach (var leave in leaves)
+                {
+                    if (leave == null) continue;
+                    if (!TryGetLeaveRange(leave, out DateTime leaveStart, out DateTime leaveEnd)) continue;
+                    if (targetDateTime.Date < leaveStart || targetDateTime.Date > leaveEnd) continue;
+
+                    string leavePeriod = NormalizeLeavePeriod(leave.leave_period);
+                    if (leavePeriod == "FULL")
+                    {
+                        dto.selected_full_count = (dto.selected_full_count.StringToInt32() + 1).ToString();
+                        dto.selected_full_list.Add(BuildLeavePersonDto(leave, "FULL"));
+                    }
+                    else if (leavePeriod == "AM")
+                    {
+                        dto.selected_half_am_count = (dto.selected_half_am_count.StringToInt32() + 1).ToString();
+                        dto.selected_half_am_list.Add(BuildLeavePersonDto(leave, "HALF_AM"));
+                    }
+                    else if (leavePeriod == "PM")
+                    {
+                        dto.selected_half_pm_count = (dto.selected_half_pm_count.StringToInt32() + 1).ToString();
+                        dto.selected_half_pm_list.Add(BuildLeavePersonDto(leave, "HALF_PM"));
                     }
                 }
 
@@ -8669,6 +9488,7 @@ namespace PharmaRosterAPI
                 var sql_day = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
                 var sql_item = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
+                var sql_leave = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
                 object[] obj_form = sql_form.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
                 if (obj_form == null)
@@ -8708,6 +9528,18 @@ namespace PharmaRosterAPI
                     .SQLToClass<DayOffScheduleItemClass>()
                     .Where(x => x != null && x.staff_guid == staff.GUID)
                     .ToList();
+
+                List<DayOffScheduleLeaveClass> leaves = sql_leave
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleLeaveClass>() ?? new List<DayOffScheduleLeaveClass>();
+
+                leaves = leaves
+                    .Where(x => x != null && x.staff_guid == staff.GUID)
+                    .ToList();
+
+                Dictionary<string, List<string>> leavePeriodsByDate = BuildDayOffLeavePeriodsByStaffDate(form.GUID, leaves)
+                    .Where(x => x.Key.StartsWith($"{staff.GUID}|", StringComparison.OrdinalIgnoreCase))
+                    .ToDictionary(x => x.Key.Split('|')[1], x => x.Value);
 
                 Dictionary<string, DayOffScheduleItemClass> itemByDate = items
                     .Where(x => x != null && x.date.StringIsEmpty() == false)
@@ -8902,6 +9734,9 @@ namespace PharmaRosterAPI
 
                     bool AllowByAM(int add) => (amUsed + add) <= amMax;
                     bool AllowByPM(int add) => (pmUsed + add) <= pmMax;
+                    List<string> leavePeriods = leavePeriodsByDate.TryGetValue(option.date.StringToDateTime().ToDateString('-'), out var periods)
+                        ? periods
+                        : new List<string>();
 
                     if (!canSelect)
                     {
@@ -8965,6 +9800,27 @@ namespace PharmaRosterAPI
                             }
 
                             canSelect = false;
+                        }
+                    }
+
+                    if (leavePeriods.Count > 0)
+                    {
+                        bool leaveBlocksFull = leavePeriods.Any(x => LeavePeriodsOverlap(x, "FULL"));
+                        bool leaveBlocksAM = leavePeriods.Any(x => LeavePeriodsOverlap(x, "AM"));
+                        bool leaveBlocksPM = leavePeriods.Any(x => LeavePeriodsOverlap(x, "PM"));
+
+                        if (leaveBlocksFull) canFull = false;
+                        if (leaveBlocksAM) canHalfAm = false;
+                        if (leaveBlocksPM) canHalfPm = false;
+
+                        if (!canFull && !canHalfAm && !canHalfPm)
+                        {
+                            canSelect = false;
+                            blockReason = "該日已有請假，不可選擇對應時段排休";
+                        }
+                        else if (blockReason.StringIsEmpty())
+                        {
+                            blockReason = "該日已有半日請假，僅可選擇未請假的時段";
                         }
                     }
 
@@ -9253,6 +10109,7 @@ namespace PharmaRosterAPI
                 var sql_day = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_item = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
                 var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_leave = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
                 object[] obj_form = sql_form.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
                 if (obj_form == null)
@@ -9279,8 +10136,13 @@ namespace PharmaRosterAPI
                     .GetRowsByDefult(null, "form_guid", form.GUID)
                     .SQLToClass<StaffDayOffOptionClass>();
 
+                List<DayOffScheduleLeaveClass> allLeaves = sql_leave
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleLeaveClass>();
+
                 allItems = allItems ?? new List<DayOffScheduleItemClass>();
                 allOptions = allOptions ?? new List<StaffDayOffOptionClass>();
+                allLeaves = allLeaves ?? new List<DayOffScheduleLeaveClass>();
 
                 List<string> staffIdFilter = new List<string>();
                 if (!staff_ids_text.StringIsEmpty())
@@ -9327,7 +10189,10 @@ namespace PharmaRosterAPI
                     .ToList();
 
                 Dictionary<string, DayOffDateQuotaUsageSummary> dateQuotaDict =
-                    BuildDateQuotaUsageSummaryDict(days, allOptions);
+                    BuildDateQuotaUsageSummaryDict(days, allOptions, allLeaves);
+
+                Dictionary<string, List<string>> leavePeriodsByStaffDate =
+                    BuildDayOffLeavePeriodsByStaffDate(form.GUID, allLeaves);
 
                 Dictionary<string, DayOffScheduleItemClass> itemsByStaffDate = allItems
                     .Where(x =>
@@ -9464,6 +10329,8 @@ namespace PharmaRosterAPI
                         itemsByStaffDate.TryGetValue(staffDateKey, out var item);
                         optionsByStaffDate.TryGetValue(staffDateKey, out var option);
                         dateQuotaDict.TryGetValue(dateKey, out var dateSummary);
+                        leavePeriodsByStaffDate.TryGetValue(staffDateKey, out var leavePeriods);
+                        leavePeriods = leavePeriods ?? new List<string>();
 
                         QuotaDayoffRosterCellDto cell = new QuotaDayoffRosterCellDto();
                         cell.date = dateKey;
@@ -9488,6 +10355,19 @@ namespace PharmaRosterAPI
                             cell.display_type = "SCHEDULE";
                             cell.display_text = item?.workShiftRequirement?.shift_type ?? "班";
                             cell.block_reason = "該日已有排班，不可選擇應休排休";
+                            row.cells.Add(cell);
+                            continue;
+                        }
+
+                        bool leaveBlocksFull = leavePeriods.Any(x => LeavePeriodsOverlap(x, "FULL"));
+                        bool leaveBlocksAM = leavePeriods.Any(x => LeavePeriodsOverlap(x, "AM"));
+                        bool leaveBlocksPM = leavePeriods.Any(x => LeavePeriodsOverlap(x, "PM"));
+
+                        if (leaveBlocksFull && leaveBlocksAM && leaveBlocksPM)
+                        {
+                            cell.display_type = "LEAVE";
+                            cell.display_text = "請假";
+                            cell.block_reason = "該日已有請假，不可選擇排休";
                             row.cells.Add(cell);
                             continue;
                         }
@@ -9595,6 +10475,13 @@ namespace PharmaRosterAPI
                             canHalfPM = false;
                         }
 
+                        if (leavePeriods.Count > 0)
+                        {
+                            if (leaveBlocksFull) canFull = false;
+                            if (leaveBlocksAM) canHalfAM = false;
+                            if (leaveBlocksPM) canHalfPM = false;
+                        }
+
                         cell.can_select_full = canFull ? "true" : "false";
                         cell.can_select_half_am = canHalfAM ? "true" : "false";
                         cell.can_select_half_pm = canHalfPM ? "true" : "false";
@@ -9606,13 +10493,21 @@ namespace PharmaRosterAPI
                         {
                             cell.display_type = "AVAILABLE";
                             cell.display_text = "";
+                            if (leavePeriods.Count > 0)
+                            {
+                                cell.block_reason = "該日已有半日請假，僅可選擇未請假的時段";
+                            }
                         }
                         else
                         {
                             cell.display_type = "BLOCKED";
                             cell.display_text = "-";
 
-                            if (quotaRemaining < 0.5)
+                            if (leavePeriods.Count > 0)
+                            {
+                                cell.block_reason = "該日已有請假，不可選擇對應時段排休";
+                            }
+                            else if (quotaRemaining < 0.5)
                             {
                                 cell.block_reason = "剩餘應休額度不足";
                             }
@@ -9729,6 +10624,7 @@ namespace PharmaRosterAPI
                 var sql_day = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_item = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
                 var sql_option = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_leave = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
                 object[] obj_form = sql_form.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
                 if (obj_form == null)
@@ -9763,6 +10659,12 @@ namespace PharmaRosterAPI
                 List<StaffDayOffOptionClass> options = sql_option
                     .GetRowsByDefult(null, "form_guid", form.GUID)
                     .SQLToClass<StaffDayOffOptionClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
+                List<DayOffScheduleLeaveClass> leaves = sql_leave
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleLeaveClass>()
                     .Where(x => x != null)
                     .ToList();
 
@@ -9899,6 +10801,38 @@ namespace PharmaRosterAPI
                     if (!dayoffTextByDate[dateKey].Contains(displayText))
                     {
                         dayoffTextByDate[dateKey].Add(displayText);
+                    }
+                }
+
+                foreach (var leave in leaves)
+                {
+                    if (leave == null) continue;
+                    if (!TryGetLeaveRange(leave, out DateTime leaveStart, out DateTime leaveEnd)) continue;
+
+                    staffSimpleNameDict.TryGetValue(leave.staff_guid, out string simpleName);
+                    if (simpleName.StringIsEmpty())
+                    {
+                        simpleName = !leave.staff_name.StringIsEmpty()
+                            ? leave.staff_name.Substring(leave.staff_name.Length - 1, 1)
+                            : "未知";
+                    }
+
+                    for (DateTime dt = leaveStart.Date; dt <= leaveEnd.Date; dt = dt.AddDays(1))
+                    {
+                        if (dt < firstDayOfMonth || dt > lastDayOfMonth) continue;
+
+                        string displayText = $"{simpleName}{GetDayOffLeaveCalendarSuffix(leave)}";
+                        string dateKey = dt.ToDateString('-');
+
+                        if (!dayoffTextByDate.ContainsKey(dateKey))
+                        {
+                            dayoffTextByDate[dateKey] = new List<string>();
+                        }
+
+                        if (!dayoffTextByDate[dateKey].Contains(displayText))
+                        {
+                            dayoffTextByDate[dateKey].Add(displayText);
+                        }
                     }
                 }
 
@@ -10171,6 +11105,7 @@ namespace PharmaRosterAPI
                 var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
                 var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffScheduleLeaveClass = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
                 object[] obj_form = sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
                 if (obj_form == null)
@@ -10201,6 +11136,12 @@ namespace PharmaRosterAPI
                     .Where(x => x != null)
                     .ToList();
 
+                List<DayOffScheduleLeaveClass> leaves = sql_dayOffScheduleLeaveClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleLeaveClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
                 // 只列出這張表 item 內出現過的人
                 var staffRows = items
                     .Where(x => !x.staff_guid.StringIsEmpty())
@@ -10216,6 +11157,17 @@ namespace PharmaRosterAPI
                             staff_simple_name = first.staff_simple_name ?? ""
                         };
                     })
+                    .Concat(leaves
+                        .Where(x => x != null && !x.staff_guid.StringIsEmpty())
+                        .Select(x => new
+                        {
+                            staff_guid = x.staff_guid,
+                            staff_id = x.staff_id ?? "",
+                            staff_name = x.staff_name ?? "",
+                            staff_simple_name = ""
+                        }))
+                    .GroupBy(x => x.staff_guid)
+                    .Select(g => g.First())
                     .OrderBy(x => x.staff_id)
                     .ThenBy(x => x.staff_name)
                     .ToList();
@@ -10227,6 +11179,9 @@ namespace PharmaRosterAPI
                 Dictionary<string, List<StaffDayOffOptionClass>> optionsByStaffDate = options
                     .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime().ToString("yyyy-MM-dd")}")
                     .ToDictionary(g => g.Key, g => g.ToList());
+
+                Dictionary<string, List<DayOffScheduleLeaveClass>> leavesByStaffDate =
+                    BuildDayOffLeavesByStaffDate(form.GUID, leaves);
 
                 XSSFWorkbook workbook = new XSSFWorkbook();
                 ISheet sheet = workbook.CreateSheet("排休狀態總表");
@@ -10333,7 +11288,10 @@ namespace PharmaRosterAPI
                         List<StaffDayOffOptionClass> dayOptions =
                             optionsByStaffDate.ContainsKey(key) ? optionsByStaffDate[key] : new List<StaffDayOffOptionClass>();
 
-                        string displayText = ResolveDayoffExportDisplayText(dayItems, dayOptions);
+                        List<DayOffScheduleLeaveClass> dayLeaves =
+                            leavesByStaffDate.ContainsKey(key) ? leavesByStaffDate[key] : new List<DayOffScheduleLeaveClass>();
+
+                        string displayText = ResolveDayoffExportDisplayText(dayItems, dayOptions, dayLeaves);
                         SetCell(row, i + fixedHeaders.Length, displayText, centerStyle);
                     }
                 }
@@ -10464,10 +11422,12 @@ namespace PharmaRosterAPI
         /// </summary>
         private string ResolveDayoffExportDisplayText(
             List<DayOffScheduleItemClass> dayItems,
-            List<StaffDayOffOptionClass> dayOptions)
+            List<StaffDayOffOptionClass> dayOptions,
+            List<DayOffScheduleLeaveClass> dayLeaves = null)
         {
             if (dayItems == null) dayItems = new List<DayOffScheduleItemClass>();
             if (dayOptions == null) dayOptions = new List<StaffDayOffOptionClass>();
+            if (dayLeaves == null) dayLeaves = new List<DayOffScheduleLeaveClass>();
 
             foreach (DayOffScheduleItemClass item in dayItems)
             {
@@ -10487,6 +11447,12 @@ namespace PharmaRosterAPI
                     return "FF";
                 }
                 if (sourceType == "NATIONAL_HOLIDAY") return "NH";
+            }
+
+            DayOffScheduleLeaveClass leave = dayLeaves.FirstOrDefault(x => x != null);
+            if (leave != null)
+            {
+                return $"請假-{GetDayOffLeavePeriodText(leave)}";
             }
 
             foreach (StaffDayOffOptionClass option in dayOptions)
@@ -10713,6 +11679,7 @@ namespace PharmaRosterAPI
                 var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
                 var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffScheduleLeaveClass = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
                 object[] obj_form = sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
                 if (obj_form == null)
@@ -10743,6 +11710,12 @@ namespace PharmaRosterAPI
                     .Where(x => x != null)
                     .ToList();
 
+                List<DayOffScheduleLeaveClass> leaves = sql_dayOffScheduleLeaveClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleLeaveClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
                 var staffRows = items
                     .Where(x => !x.staff_guid.StringIsEmpty())
                     .GroupBy(x => x.staff_guid)
@@ -10756,6 +11729,16 @@ namespace PharmaRosterAPI
                             staff_name = first.staff_name ?? ""
                         };
                     })
+                    .Concat(leaves
+                        .Where(x => x != null && !x.staff_guid.StringIsEmpty())
+                        .Select(x => new ExportDayoffStaffRowPdf
+                        {
+                            staff_guid = x.staff_guid,
+                            staff_id = x.staff_id ?? "",
+                            staff_name = x.staff_name ?? ""
+                        }))
+                    .GroupBy(x => x.staff_guid)
+                    .Select(g => g.First())
                     .OrderBy(x => x.staff_id)
                     .ThenBy(x => x.staff_name)
                     .ToList();
@@ -10767,6 +11750,9 @@ namespace PharmaRosterAPI
                 Dictionary<string, List<StaffDayOffOptionClass>> optionsByStaffDate = options
                     .GroupBy(x => $"{x.staff_guid}|{x.date.StringToDateTime():yyyy-MM-dd}")
                     .ToDictionary(g => g.Key, g => g.ToList());
+
+                Dictionary<string, List<DayOffScheduleLeaveClass>> leavesByStaffDate =
+                    BuildDayOffLeavesByStaffDate(form.GUID, leaves);
 
                 foreach (ExportDayoffStaffRowPdf staffRow in staffRows)
                 {
@@ -10781,7 +11767,10 @@ namespace PharmaRosterAPI
                         List<StaffDayOffOptionClass> dayOptions =
                             optionsByStaffDate.ContainsKey(key) ? optionsByStaffDate[key] : new List<StaffDayOffOptionClass>();
 
-                        staffRow.dayoffTextByDate[dateKey] = ResolveDayoffExportDisplayTextPdf(dayItems, dayOptions);
+                        List<DayOffScheduleLeaveClass> dayLeaves =
+                            leavesByStaffDate.ContainsKey(key) ? leavesByStaffDate[key] : new List<DayOffScheduleLeaveClass>();
+
+                        staffRow.dayoffTextByDate[dateKey] = ResolveDayoffExportDisplayTextPdf(dayItems, dayOptions, dayLeaves);
                     }
                 }
 
@@ -11043,10 +12032,12 @@ namespace PharmaRosterAPI
 
         private string ResolveDayoffExportDisplayTextPdf(
             List<DayOffScheduleItemClass> dayItems,
-            List<StaffDayOffOptionClass> dayOptions)
+            List<StaffDayOffOptionClass> dayOptions,
+            List<DayOffScheduleLeaveClass> dayLeaves = null)
         {
             if (dayItems == null) dayItems = new List<DayOffScheduleItemClass>();
             if (dayOptions == null) dayOptions = new List<StaffDayOffOptionClass>();
+            if (dayLeaves == null) dayLeaves = new List<DayOffScheduleLeaveClass>();
 
             foreach (DayOffScheduleItemClass item in dayItems)
             {
@@ -11068,6 +12059,16 @@ namespace PharmaRosterAPI
                 }
 
                 if (sourceType == "NATIONAL_HOLIDAY") return "NH";
+            }
+
+            DayOffScheduleLeaveClass leave = dayLeaves.FirstOrDefault(x => x != null);
+            if (leave != null)
+            {
+                string period = NormalizeLeavePeriod(leave.leave_period);
+                if (period == "FULL") return "請整";
+                if (period == "AM") return "請上";
+                if (period == "PM") return "請下";
+                return "請假";
             }
 
             foreach (StaffDayOffOptionClass option in dayOptions)
@@ -11428,6 +12429,7 @@ namespace PharmaRosterAPI
                 var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
                 var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffScheduleLeaveClass = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
                 object[] obj_form = sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
                 if (obj_form == null)
@@ -11458,21 +12460,35 @@ namespace PharmaRosterAPI
                     .Where(x => x != null)
                     .ToList();
 
+                List<DayOffScheduleLeaveClass> leaves = sql_dayOffScheduleLeaveClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleLeaveClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
                 List<DayOffScheduleItemClass> staffItems = items
+                    .Where(x => x.staff_id == staff_id)
+                    .ToList();
+
+                List<DayOffScheduleLeaveClass> staffLeavesById = leaves
                     .Where(x => x.staff_id == staff_id)
                     .ToList();
 
                 if (staffItems.Count == 0)
                 {
-                    returnData.Code = -200;
-                    returnData.Result = $"找不到 staff_id({staff_id}) 對應的表單資料";
-                    return new JsonResult(returnData);
+                    if (staffLeavesById.Count == 0)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"找不到 staff_id({staff_id}) 對應的表單資料";
+                        return new JsonResult(returnData);
+                    }
                 }
 
-                DayOffScheduleItemClass staffBase = staffItems.First();
-                string staff_guid = staffBase.staff_guid ?? "";
-                string staff_name = staffBase.staff_name ?? "";
-                string staff_simple_name = staffBase.staff_simple_name ?? "";
+                DayOffScheduleItemClass staffBase = staffItems.FirstOrDefault();
+                DayOffScheduleLeaveClass leaveBase = staffLeavesById.FirstOrDefault();
+                string staff_guid = staffBase?.staff_guid ?? leaveBase?.staff_guid ?? "";
+                string staff_name = staffBase?.staff_name ?? leaveBase?.staff_name ?? "";
+                string staff_simple_name = staffBase?.staff_simple_name ?? "";
 
                 Dictionary<string, List<DayOffScheduleItemClass>> itemsByDate = staffItems
                     .GroupBy(x => x.date.StringToDateTime().ToString("yyyy-MM-dd"))
@@ -11485,6 +12501,15 @@ namespace PharmaRosterAPI
                 Dictionary<string, List<StaffDayOffOptionClass>> optionsByDate = staffOptions
                     .GroupBy(x => x.date.StringToDateTime().ToString("yyyy-MM-dd"))
                     .ToDictionary(g => g.Key, g => g.ToList());
+
+                List<DayOffScheduleLeaveClass> staffLeaves = leaves
+                    .Where(x => x.staff_guid == staff_guid)
+                    .ToList();
+
+                Dictionary<string, List<DayOffScheduleLeaveClass>> leavesByDate =
+                    BuildDayOffLeavesByStaffDate(form.GUID, staffLeaves)
+                        .Where(x => x.Key.StartsWith($"{staff_guid}|", StringComparison.OrdinalIgnoreCase))
+                        .ToDictionary(x => x.Key.Split('|')[1], x => x.Value);
 
                 StaffQuotaExportSummaryExcel summary = BuildStaffQuotaExportSummaryExcel(staff_guid, staffOptions);
 
@@ -11503,7 +12528,10 @@ namespace PharmaRosterAPI
                     List<StaffDayOffOptionClass> dayOptions =
                         optionsByDate.ContainsKey(dateKey) ? optionsByDate[dateKey] : new List<StaffDayOffOptionClass>();
 
-                    ExportStaffDayoffDetailRowExcel row = ResolveStaffDayoffDetailRowExcel(dt, dayItems, dayOptions, items, options);
+                    List<DayOffScheduleLeaveClass> dayLeaves =
+                        leavesByDate.ContainsKey(dateKey) ? leavesByDate[dateKey] : new List<DayOffScheduleLeaveClass>();
+
+                    ExportStaffDayoffDetailRowExcel row = ResolveStaffDayoffDetailRowExcel(dt, dayItems, dayOptions, items, options, dayLeaves);
                     if (row != null)
                     {
                         detailRows.Add(row);
@@ -11685,12 +12713,14 @@ namespace PharmaRosterAPI
             List<DayOffScheduleItemClass> dayItems,
             List<StaffDayOffOptionClass> dayOptions,
             List<DayOffScheduleItemClass> allItems,
-            List<StaffDayOffOptionClass> allOptions)
+            List<StaffDayOffOptionClass> allOptions,
+            List<DayOffScheduleLeaveClass> dayLeaves = null)
         {
             if (dayItems == null) dayItems = new List<DayOffScheduleItemClass>();
             if (dayOptions == null) dayOptions = new List<StaffDayOffOptionClass>();
             if (allItems == null) allItems = new List<DayOffScheduleItemClass>();
             if (allOptions == null) allOptions = new List<StaffDayOffOptionClass>();
+            if (dayLeaves == null) dayLeaves = new List<DayOffScheduleLeaveClass>();
 
             string weekText = GetChineseWeekShortExcel(dt);
             string dayType = GetDayTypeTextExcel(dt, allItems, allOptions);
@@ -11774,6 +12804,21 @@ namespace PharmaRosterAPI
                         note_text = ""
                     };
                 }
+            }
+
+            DayOffScheduleLeaveClass leave = dayLeaves.FirstOrDefault(x => x != null);
+            if (leave != null)
+            {
+                return new ExportStaffDayoffDetailRowExcel
+                {
+                    date = dt,
+                    week_text = weekText,
+                    day_type = dayType,
+                    status_text = "請假",
+                    type_text = GetDayOffLeavePeriodText(leave),
+                    source_text = "排休請假",
+                    note_text = leave.reason ?? ""
+                };
             }
 
             // 3. 已釋出
@@ -12213,6 +13258,7 @@ namespace PharmaRosterAPI
                 var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
                 var sql_dayOffScheduleItemClass = MethodClass.GetSQLControl<DayOffScheduleItemClass>();
                 var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+                var sql_dayOffScheduleLeaveClass = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
                 object[] obj_form = sql_dayOffScheduleFormClass.GetRowsByDefult(null, "form_name", form_name).FirstOrDefault();
                 if (obj_form == null)
@@ -12243,21 +13289,35 @@ namespace PharmaRosterAPI
                     .Where(x => x != null)
                     .ToList();
 
+                List<DayOffScheduleLeaveClass> leaves = sql_dayOffScheduleLeaveClass
+                    .GetRowsByDefult(null, "form_guid", form.GUID)
+                    .SQLToClass<DayOffScheduleLeaveClass>()
+                    .Where(x => x != null)
+                    .ToList();
+
                 List<DayOffScheduleItemClass> staffItems = items
+                    .Where(x => x.staff_id == staff_id)
+                    .ToList();
+
+                List<DayOffScheduleLeaveClass> staffLeavesById = leaves
                     .Where(x => x.staff_id == staff_id)
                     .ToList();
 
                 if (staffItems.Count == 0)
                 {
-                    returnData.Code = -200;
-                    returnData.Result = $"找不到 staff_id({staff_id}) 對應的表單資料";
-                    return new JsonResult(returnData);
+                    if (staffLeavesById.Count == 0)
+                    {
+                        returnData.Code = -200;
+                        returnData.Result = $"找不到 staff_id({staff_id}) 對應的表單資料";
+                        return new JsonResult(returnData);
+                    }
                 }
 
-                DayOffScheduleItemClass staffBase = staffItems.First();
-                string staff_guid = staffBase.staff_guid ?? "";
-                string staff_name = staffBase.staff_name ?? "";
-                string staff_simple_name = staffBase.staff_simple_name ?? "";
+                DayOffScheduleItemClass staffBase = staffItems.FirstOrDefault();
+                DayOffScheduleLeaveClass leaveBase = staffLeavesById.FirstOrDefault();
+                string staff_guid = staffBase?.staff_guid ?? leaveBase?.staff_guid ?? "";
+                string staff_name = staffBase?.staff_name ?? leaveBase?.staff_name ?? "";
+                string staff_simple_name = staffBase?.staff_simple_name ?? "";
 
                 Dictionary<string, List<DayOffScheduleItemClass>> itemsByDate = staffItems
                     .GroupBy(x => x.date.StringToDateTime().ToString("yyyy-MM-dd"))
@@ -12270,6 +13330,15 @@ namespace PharmaRosterAPI
                 Dictionary<string, List<StaffDayOffOptionClass>> optionsByDate = staffOptions
                     .GroupBy(x => x.date.StringToDateTime().ToString("yyyy-MM-dd"))
                     .ToDictionary(g => g.Key, g => g.ToList());
+
+                List<DayOffScheduleLeaveClass> staffLeaves = leaves
+                    .Where(x => x.staff_guid == staff_guid)
+                    .ToList();
+
+                Dictionary<string, List<DayOffScheduleLeaveClass>> leavesByDate =
+                    BuildDayOffLeavesByStaffDate(form.GUID, staffLeaves)
+                        .Where(x => x.Key.StartsWith($"{staff_guid}|", StringComparison.OrdinalIgnoreCase))
+                        .ToDictionary(x => x.Key.Split('|')[1], x => x.Value);
 
                 StaffQuotaExportSummaryPdfSingle summary = BuildStaffQuotaExportSummaryPdfSingle(staff_guid, staffOptions);
 
@@ -12288,7 +13357,10 @@ namespace PharmaRosterAPI
                     List<StaffDayOffOptionClass> dayOptions =
                         optionsByDate.ContainsKey(dateKey) ? optionsByDate[dateKey] : new List<StaffDayOffOptionClass>();
 
-                    ExportStaffDayoffDetailRowPdf row = ResolveStaffDayoffDetailRowPdf(dt, dayItems, dayOptions, items, options);
+                    List<DayOffScheduleLeaveClass> dayLeaves =
+                        leavesByDate.ContainsKey(dateKey) ? leavesByDate[dateKey] : new List<DayOffScheduleLeaveClass>();
+
+                    ExportStaffDayoffDetailRowPdf row = ResolveStaffDayoffDetailRowPdf(dt, dayItems, dayOptions, items, options, dayLeaves);
                     if (row != null)
                     {
                         detailRows.Add(row);
@@ -12560,12 +13632,14 @@ namespace PharmaRosterAPI
             List<DayOffScheduleItemClass> dayItems,
             List<StaffDayOffOptionClass> dayOptions,
             List<DayOffScheduleItemClass> allItems,
-            List<StaffDayOffOptionClass> allOptions)
+            List<StaffDayOffOptionClass> allOptions,
+            List<DayOffScheduleLeaveClass> dayLeaves = null)
         {
             if (dayItems == null) dayItems = new List<DayOffScheduleItemClass>();
             if (dayOptions == null) dayOptions = new List<StaffDayOffOptionClass>();
             if (allItems == null) allItems = new List<DayOffScheduleItemClass>();
             if (allOptions == null) allOptions = new List<StaffDayOffOptionClass>();
+            if (dayLeaves == null) dayLeaves = new List<DayOffScheduleLeaveClass>();
 
             string weekText = GetChineseWeekShortPdf(dt);
             string dayType = GetDayTypeTextPdf(dt, allItems, allOptions);
@@ -12649,6 +13723,21 @@ namespace PharmaRosterAPI
                         note_text = ""
                     };
                 }
+            }
+
+            DayOffScheduleLeaveClass leave = dayLeaves.FirstOrDefault(x => x != null);
+            if (leave != null)
+            {
+                return new ExportStaffDayoffDetailRowPdf
+                {
+                    date = dt,
+                    week_text = weekText,
+                    day_type = dayType,
+                    status_text = "請假",
+                    type_text = GetDayOffLeavePeriodText(leave),
+                    source_text = "排休請假",
+                    note_text = leave.reason ?? ""
+                };
             }
 
             // 3. 已釋出
@@ -12808,12 +13897,17 @@ namespace PharmaRosterAPI
         }
         #endregion
 
-        private Dictionary<string, DayOffDateQuotaUsageSummary> BuildDateQuotaUsageSummaryDict(List<DayOffScheduleDayClass> days, List<StaffDayOffOptionClass> allOptions)
+        private Dictionary<string, DayOffDateQuotaUsageSummary> BuildDateQuotaUsageSummaryDict(
+            List<DayOffScheduleDayClass> days,
+            List<StaffDayOffOptionClass> allOptions,
+            List<DayOffScheduleLeaveClass> allLeaves = null)
         {
             var dict = new Dictionary<string, DayOffDateQuotaUsageSummary>();
 
             days = days ?? new List<DayOffScheduleDayClass>();
             allOptions = allOptions ?? new List<StaffDayOffOptionClass>();
+            allLeaves = allLeaves ?? new List<DayOffScheduleLeaveClass>();
+            Dictionary<string, int[]> leaveUsageByDate = BuildDayOffLeaveUsageByDate("", allLeaves);
 
             var optionByDate = allOptions
                 .Where(x => x != null && !x.date.StringIsEmpty())
@@ -12850,6 +13944,12 @@ namespace PharmaRosterAPI
                             if (option.selected_half_pm == "true") pmUsed++;
                         }
                     }
+                }
+
+                if (leaveUsageByDate.TryGetValue(dateKey, out var leaveUsage))
+                {
+                    amUsed += leaveUsage[0];
+                    pmUsed += leaveUsage[1];
                 }
 
                 int amMax = day.am_max_dayoff_count.StringToInt32();
@@ -16428,6 +17528,406 @@ WHERE GUID = @guid
             form.any_date_is_full = isFull ? "true" : "false";
         }
 
+        private static DayOffScheduleFormClass ResolveDayOffForm(SQLControl sqlForm, string formGuid, string formName, out string error)
+        {
+            error = "";
+
+            if (!formGuid.StringIsEmpty())
+            {
+                object[] objForm = sqlForm.GetRowsByDefult(null, "GUID", formGuid).FirstOrDefault();
+                if (objForm == null)
+                {
+                    error = $"找不到 form_guid={formGuid}";
+                    return null;
+                }
+                return objForm.SQLToClass<DayOffScheduleFormClass>();
+            }
+
+            if (!formName.StringIsEmpty())
+            {
+                object[] objForm = sqlForm.GetRowsByDefult(null, "form_name", formName).FirstOrDefault();
+                if (objForm == null)
+                {
+                    error = $"找不到表單名稱({formName})";
+                    return null;
+                }
+                return objForm.SQLToClass<DayOffScheduleFormClass>();
+            }
+
+            error = "未提供 form_guid 或 form_name";
+            return null;
+        }
+
+        private static StaffClass ResolveStaff(SQLControl sqlStaff, string staffGuid, string staffId, out string error)
+        {
+            error = "";
+
+            if (!staffGuid.StringIsEmpty())
+            {
+                object[] objStaff = sqlStaff.GetRowsByDefult(null, "GUID", staffGuid).FirstOrDefault();
+                if (objStaff == null)
+                {
+                    error = $"找不到 staff_guid={staffGuid}";
+                    return null;
+                }
+                return objStaff.SQLToClass<StaffClass>();
+            }
+
+            if (!staffId.StringIsEmpty())
+            {
+                object[] objStaff = sqlStaff.GetRowsByDefult(null, "staff_id", staffId).FirstOrDefault();
+                if (objStaff == null)
+                {
+                    error = $"找不到 staff_id={staffId}";
+                    return null;
+                }
+                return objStaff.SQLToClass<StaffClass>();
+            }
+
+            error = "未提供 staff_guid 或 staff_id";
+            return null;
+        }
+
+        private static string NormalizeLeaveType(string leaveType)
+        {
+            leaveType = (leaveType ?? "").Trim().ToUpperInvariant();
+
+            switch (leaveType)
+            {
+                case "長假":
+                    return "LONG_LEAVE";
+                case "婚假":
+                    return "MARRIAGE";
+                case "喪假":
+                    return "FUNERAL";
+                case "特殊假別":
+                    return "SPECIAL";
+                case "其他":
+                    return "OTHER";
+                default:
+                    return leaveType;
+            }
+        }
+
+        private static bool IsValidLeaveType(string leaveType)
+        {
+            return leaveType == "LONG_LEAVE" ||
+                   leaveType == "MARRIAGE" ||
+                   leaveType == "FUNERAL" ||
+                   leaveType == "SPECIAL" ||
+                   leaveType == "OTHER";
+        }
+
+        private static string NormalizeLeavePeriod(string leavePeriod)
+        {
+            leavePeriod = (leavePeriod ?? "").Trim().ToUpperInvariant();
+
+            switch (leavePeriod)
+            {
+                case "全天":
+                case "FULL_DAY":
+                    return "FULL";
+                case "上午":
+                case "HALF_AM":
+                    return "AM";
+                case "下午":
+                case "HALF_PM":
+                    return "PM";
+                default:
+                    return leavePeriod;
+            }
+        }
+
+        private static bool IsValidLeavePeriod(string leavePeriod)
+        {
+            return leavePeriod == "FULL" || leavePeriod == "AM" || leavePeriod == "PM";
+        }
+
+        private static DateTime? ParseNullableDate(string value)
+        {
+            if (value.StringIsEmpty()) return null;
+            if (!DateTime.TryParse(value, out DateTime dt)) return null;
+            return dt.Date;
+        }
+
+        private static bool TryNormalizeLeaveDates(DayOffScheduleLeaveClass leave, out DateTime start, out DateTime end, out string error)
+        {
+            start = DateTime.MinValue;
+            end = DateTime.MinValue;
+            error = "";
+
+            if (leave.start_date.StringIsEmpty())
+            {
+                error = "start_date 為必填";
+                return false;
+            }
+
+            if (leave.end_date.StringIsEmpty())
+            {
+                error = "end_date 為必填";
+                return false;
+            }
+
+            if (!DateTime.TryParse(leave.start_date, out start))
+            {
+                error = $"start_date 格式錯誤: {leave.start_date}";
+                return false;
+            }
+
+            if (!DateTime.TryParse(leave.end_date, out end))
+            {
+                error = $"end_date 格式錯誤: {leave.end_date}";
+                return false;
+            }
+
+            start = start.Date;
+            end = end.Date;
+            if (start > end)
+            {
+                error = "start_date 不可大於 end_date";
+                return false;
+            }
+
+            leave.start_date = start.ToDateString('-');
+            leave.end_date = end.ToDateString('-');
+            return true;
+        }
+
+        private static bool TryGetLeaveRange(DayOffScheduleLeaveClass leave, out DateTime start, out DateTime end)
+        {
+            start = DateTime.MinValue;
+            end = DateTime.MinValue;
+            if (leave == null) return false;
+            if (!DateTime.TryParse(leave.start_date, out start)) return false;
+            if (!DateTime.TryParse(leave.end_date, out end)) return false;
+            start = start.Date;
+            end = end.Date;
+            return start <= end;
+        }
+
+        private static bool DateRangesOverlap(DateTime startA, DateTime endA, DateTime startB, DateTime endB)
+        {
+            return startA.Date <= endB.Date && startB.Date <= endA.Date;
+        }
+
+        private static bool LeavePeriodsOverlap(string periodA, string periodB)
+        {
+            periodA = NormalizeLeavePeriod(periodA);
+            periodB = NormalizeLeavePeriod(periodB);
+
+            if (periodA == "FULL" || periodB == "FULL") return true;
+            return periodA == periodB;
+        }
+
+        /// <summary>
+        /// 將排休專用請假彙整為每日 AM / PM 佔用數，用於扣除每日可休名額。
+        /// </summary>
+        /// <param name="formGuid">表單 GUID；空字串代表不額外篩選。</param>
+        /// <param name="leaves">排休專用請假資料。</param>
+        /// <returns>key 為 yyyy-MM-dd，value[0] 為 AM 佔用數、value[1] 為 PM 佔用數。</returns>
+        private static Dictionary<string, int[]> BuildDayOffLeaveUsageByDate(string formGuid, List<DayOffScheduleLeaveClass> leaves)
+        {
+            var dict = new Dictionary<string, int[]>();
+            leaves = leaves ?? new List<DayOffScheduleLeaveClass>();
+
+            foreach (var leave in leaves)
+            {
+                if (leave == null) continue;
+                if (!formGuid.StringIsEmpty() && leave.form_guid != formGuid) continue;
+                if (!TryGetLeaveRange(leave, out DateTime start, out DateTime end)) continue;
+
+                string period = NormalizeLeavePeriod(leave.leave_period);
+                if (!IsValidLeavePeriod(period)) continue;
+
+                for (DateTime dt = start.Date; dt <= end.Date; dt = dt.AddDays(1))
+                {
+                    string dateKey = dt.ToDateString('-');
+                    if (!dict.ContainsKey(dateKey)) dict[dateKey] = new int[] { 0, 0 };
+
+                    if (period == "FULL" || period == "AM") dict[dateKey][0]++;
+                    if (period == "FULL" || period == "PM") dict[dateKey][1]++;
+                }
+            }
+
+            return dict;
+        }
+
+        /// <summary>
+        /// 將排休專用請假彙整為人員每日請假時段，用於阻擋該人員選擇同日排休。
+        /// </summary>
+        /// <param name="formGuid">表單 GUID；空字串代表不額外篩選。</param>
+        /// <param name="leaves">排休專用請假資料。</param>
+        /// <returns>key 為 staff_guid|yyyy-MM-dd，value 為請假時段清單。</returns>
+        private static Dictionary<string, List<string>> BuildDayOffLeavePeriodsByStaffDate(string formGuid, List<DayOffScheduleLeaveClass> leaves)
+        {
+            var dict = new Dictionary<string, List<string>>();
+            leaves = leaves ?? new List<DayOffScheduleLeaveClass>();
+
+            foreach (var leave in leaves)
+            {
+                if (leave == null) continue;
+                if (!formGuid.StringIsEmpty() && leave.form_guid != formGuid) continue;
+                if (leave.staff_guid.StringIsEmpty()) continue;
+                if (!TryGetLeaveRange(leave, out DateTime start, out DateTime end)) continue;
+
+                string period = NormalizeLeavePeriod(leave.leave_period);
+                if (!IsValidLeavePeriod(period)) continue;
+
+                for (DateTime dt = start.Date; dt <= end.Date; dt = dt.AddDays(1))
+                {
+                    string key = $"{leave.staff_guid}|{dt.ToDateString('-')}";
+                    if (!dict.ContainsKey(key)) dict[key] = new List<string>();
+                    dict[key].Add(period);
+                }
+            }
+
+            return dict;
+        }
+
+        /// <summary>
+        /// 將排休專用請假展開為人員每日請假資料，用於 PDF / Excel 報表顯示。
+        /// </summary>
+        /// <param name="formGuid">表單 GUID；空字串代表不額外篩選。</param>
+        /// <param name="leaves">排休專用請假資料。</param>
+        /// <returns>key 為 staff_guid|yyyy-MM-dd，value 為該日請假清單。</returns>
+        private static Dictionary<string, List<DayOffScheduleLeaveClass>> BuildDayOffLeavesByStaffDate(string formGuid, List<DayOffScheduleLeaveClass> leaves)
+        {
+            var dict = new Dictionary<string, List<DayOffScheduleLeaveClass>>();
+            leaves = leaves ?? new List<DayOffScheduleLeaveClass>();
+
+            foreach (var leave in leaves)
+            {
+                if (leave == null) continue;
+                if (!formGuid.StringIsEmpty() && leave.form_guid != formGuid) continue;
+                if (leave.staff_guid.StringIsEmpty()) continue;
+                if (!TryGetLeaveRange(leave, out DateTime start, out DateTime end)) continue;
+
+                for (DateTime dt = start.Date; dt <= end.Date; dt = dt.AddDays(1))
+                {
+                    string key = $"{leave.staff_guid}|{dt.ToDateString('-')}";
+                    if (!dict.ContainsKey(key)) dict[key] = new List<DayOffScheduleLeaveClass>();
+                    dict[key].Add(leave);
+                }
+            }
+
+            return dict;
+        }
+
+        /// <summary>
+        /// 取得排休專用請假的報表時段文字。
+        /// </summary>
+        /// <param name="leave">排休專用請假資料。</param>
+        /// <returns>整日 / 上午 / 下午。</returns>
+        private static string GetDayOffLeavePeriodText(DayOffScheduleLeaveClass leave)
+        {
+            string period = NormalizeLeavePeriod(leave?.leave_period);
+            if (period == "FULL") return "整日";
+            if (period == "AM") return "上午";
+            if (period == "PM") return "下午";
+            return "請假";
+        }
+
+        /// <summary>
+        /// 取得排休月曆中請假人員姓名後方的短文字。
+        /// </summary>
+        /// <param name="leave">排休專用請假資料。</param>
+        /// <returns>請 / AM請 / PM請。</returns>
+        private static string GetDayOffLeaveCalendarSuffix(DayOffScheduleLeaveClass leave)
+        {
+            string period = NormalizeLeavePeriod(leave?.leave_period);
+            if (period == "AM") return "AM請";
+            if (period == "PM") return "PM請";
+            return "請";
+        }
+
+        private static string FindDayOffLeaveOverlap(
+            List<DayOffScheduleLeaveClass> existingLeaves,
+            DayOffScheduleLeaveClass target,
+            DateTime targetStart,
+            DateTime targetEnd)
+        {
+            foreach (var existing in existingLeaves ?? new List<DayOffScheduleLeaveClass>())
+            {
+                if (existing == null) continue;
+                if (existing.GUID == target.GUID) continue;
+                if (existing.form_guid != target.form_guid) continue;
+                if (existing.staff_guid != target.staff_guid) continue;
+                if (!TryGetLeaveRange(existing, out DateTime existingStart, out DateTime existingEnd)) continue;
+                if (!DateRangesOverlap(existingStart, existingEnd, targetStart, targetEnd)) continue;
+                if (!LeavePeriodsOverlap(existing.leave_period, target.leave_period)) continue;
+
+                return $"該人員於指定日期已有排休請假，請假時段重疊 ({existing.start_date}~{existing.end_date}, {existing.leave_period})";
+            }
+
+            return "";
+        }
+
+        private static string FindScheduledWorkConflict(
+            SQLControl sqlItem,
+            DayOffScheduleLeaveClass target,
+            DateTime targetStart,
+            DateTime targetEnd)
+        {
+            List<DayOffScheduleItemClass> items = sqlItem
+                .GetRowsByDefult(null, "form_guid", target.form_guid)
+                .SQLToClass<DayOffScheduleItemClass>() ?? new List<DayOffScheduleItemClass>();
+
+            foreach (var item in items)
+            {
+                if (item == null) continue;
+                if (item.staff_guid != target.staff_guid) continue;
+                if (!DateTime.TryParse(item.date, out DateTime itemDate)) continue;
+
+                itemDate = itemDate.Date;
+                if (itemDate < targetStart.Date || itemDate > targetEnd.Date) continue;
+
+                return $"該人員於請假日期已有排班，不可新增請假 ({itemDate.ToDateString('-')})";
+            }
+
+            return "";
+        }
+
+        private static string FindSelectedDayoffConflict(
+            SQLControl sqlOption,
+            DayOffScheduleLeaveClass target,
+            DateTime targetStart,
+            DateTime targetEnd)
+        {
+            List<StaffDayOffOptionClass> options = sqlOption
+                .GetRowsByDefult(null, "form_guid", target.form_guid)
+                .SQLToClass<StaffDayOffOptionClass>() ?? new List<StaffDayOffOptionClass>();
+
+            options = options
+                .Where(x => x != null && x.staff_guid == target.staff_guid)
+                .ToList();
+
+            foreach (var option in options)
+            {
+                option.NormalizeSelection();
+
+                if (!DateTime.TryParse(option.date, out DateTime optionDate)) continue;
+                optionDate = optionDate.Date;
+                if (optionDate < targetStart.Date || optionDate > targetEnd.Date) continue;
+
+                if (option.selected_full == "true" && LeavePeriodsOverlap(target.leave_period, "FULL"))
+                {
+                    return $"該人員於請假日期已選擇排休，請先取消排休後再新增請假 ({optionDate.ToDateString('-')}, FULL)";
+                }
+
+                if (option.selected_half_am == "true" && LeavePeriodsOverlap(target.leave_period, "AM"))
+                {
+                    return $"該人員於請假日期已選擇排休，請先取消排休後再新增請假 ({optionDate.ToDateString('-')}, AM)";
+                }
+
+                if (option.selected_half_pm == "true" && LeavePeriodsOverlap(target.leave_period, "PM"))
+                {
+                    return $"該人員於請假日期已選擇排休，請先取消排休後再新增請假 ({optionDate.ToDateString('-')}, PM)";
+                }
+            }
+
+            return "";
+        }
+
         // =========================================================
         // Helper：取得 active form（保守版）
         // 規則：dayoff_group 內存在 status=1 或 status=3 的 form_guid 視為 active
@@ -17334,6 +18834,7 @@ WHERE GUID = @guid
         {
             var sql_dayOffScheduleDayClass = MethodClass.GetSQLControl<DayOffScheduleDayClass>();
             var sql_staffDayOffOptionClass = MethodClass.GetSQLControl<StaffDayOffOptionClass>();
+            var sql_dayOffScheduleLeaveClass = MethodClass.GetSQLControl<DayOffScheduleLeaveClass>();
 
             string targetDate = date.StringToDateTime().ToDateString('-');
 
@@ -17353,6 +18854,10 @@ WHERE GUID = @guid
                 .SQLToClass<StaffDayOffOptionClass>()
                 .Where(x => x != null && x.date.StringToDateTime().ToDateString('-') == targetDate)
                 .ToList();
+
+            List<DayOffScheduleLeaveClass> leaves = sql_dayOffScheduleLeaveClass
+                .GetRowsByDefult(null, "form_guid", form_guid)
+                .SQLToClass<DayOffScheduleLeaveClass>() ?? new List<DayOffScheduleLeaveClass>();
 
             int amUsed = 0;
             int pmUsed = 0;
@@ -17381,6 +18886,13 @@ WHERE GUID = @guid
                 {
                     pmUsed += 1;
                 }
+            }
+
+            Dictionary<string, int[]> leaveUsageByDate = BuildDayOffLeaveUsageByDate(form_guid, leaves);
+            if (leaveUsageByDate.TryGetValue(targetDate, out var leaveUsage))
+            {
+                amUsed += leaveUsage[0];
+                pmUsed += leaveUsage[1];
             }
 
             int amMax = day.am_max_dayoff_count.StringToInt32();

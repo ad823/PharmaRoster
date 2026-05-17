@@ -111,6 +111,7 @@
   <ItemGroup>
     <Compile Include="BasicClass.cs" />
     <Compile Include="DayOffGroupClass.cs" />
+    <Compile Include="DayOffScheduleLeaveClass.cs" />
     <Compile Include="DayOffScheduleClass.cs" />
     <Compile Include="DTOs\Auth\RegisteredStaffView.cs" />
     <Compile Include="DTOs\Auth\ResetPasswordResponse.cs" />
